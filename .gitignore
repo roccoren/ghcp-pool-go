@@ -2,3 +2,5 @@ ghcp-pool
 *.sqlite
 *.db
 runtime-home/
+__pycache__/
+*.pyc
