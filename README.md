@@ -54,4 +54,6 @@ Supported deployment environment overrides include `GHCP_HOST`, `GHCP_PORT`,
 Set `GHCP_BACKEND=copilot` plus `GHCP_COPILOT_TOKEN` to route through the real
 Copilot SDK backend. The Go gateway keeps HTTP compatibility, routing, cache,
 and metering in-process; real model calls are delegated to `copilot_worker.py`,
-which imports the official `github-copilot-sdk`.
+which imports the official `github-copilot-sdk`. Container images set `HOME`,
+`XDG_CACHE_HOME`, and `TMPDIR` to `/tmp` so the bundled Copilot CLI runtime has a
+writable extraction/cache directory under non-root execution.

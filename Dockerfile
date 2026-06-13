@@ -28,6 +28,9 @@ ENV GHCP_HOST=0.0.0.0 \
     GHCP_PORT=8000 \
     GHCP_BACKEND=fake \
     GHCP_USAGE_SQLITE_PATH=/data/usage.sqlite \
-    GHCP_COPILOT_WORKER=/app/copilot_worker.py
+    GHCP_COPILOT_WORKER=/app/copilot_worker.py \
+    HOME=/tmp \
+    XDG_CACHE_HOME=/tmp/.cache \
+    TMPDIR=/tmp
 
 ENTRYPOINT ["/app/ghcp-pool"]
