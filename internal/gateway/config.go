@@ -228,10 +228,17 @@ func LoadSettings(path string) (Settings, error) {
 	}
 	settings.Debug.Enabled = envBool("GHCP_DEBUG", settings.Debug.Enabled)
 	if settings.Accounts == nil {
+		models := []string{"gpt-4.1", "gpt-4o-mini"}
+		tokenEnv := ""
+		if settings.Backend == "copilot" {
+			models = nil
+			tokenEnv = "GHCP_COPILOT_TOKEN"
+		}
 		settings.Accounts = []AccountConfig{{
-			ID:     "acct_a",
-			Label:  "Default fake account",
-			Models: []string{"gpt-4.1", "gpt-4o-mini"},
+			ID:       "acct_a",
+			Label:    "Default account",
+			TokenEnv: tokenEnv,
+			Models:   models,
 		}}
 	}
 	if len(settings.Routes) == 0 {

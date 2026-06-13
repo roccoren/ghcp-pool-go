@@ -157,7 +157,7 @@ func (p *PoolManager) install(cfg *AccountConfig) (*Account, error) {
 			return nil, err
 		}
 	}
-	backend := buildBackend(cfg, p.Settings)
+	backend := buildBackend(cfg, p.Settings, home)
 	account := &Account{
 		Config:  cfg,
 		Backend: backend,
@@ -171,9 +171,18 @@ func (p *PoolManager) install(cfg *AccountConfig) (*Account, error) {
 	return account, nil
 }
 
-func buildBackend(cfg *AccountConfig, settings Settings) Backend {
+func buildBackend(cfg *AccountConfig, settings Settings, homeDir string) Backend {
 	if settings.Backend == "copilot" {
-		return NewCopilotBackend(cfg.ID)
+		token, _ := cfg.ResolveToken(settings.KeyVaultURL)
+		if token == "" && cfg.BaseDirectory == "" {
+			token = firstNonEmpty(
+				os.Getenv("GHCP_COPILOT_TOKEN"),
+				os.Getenv("COPILOT_GITHUB_TOKEN"),
+				os.Getenv("GH_TOKEN"),
+				os.Getenv("GITHUB_TOKEN"),
+			)
+		}
+		return NewCopilotBackend(cfg.ID, token, homeDir)
 	}
 	return NewFakeBackend(cfg.ID, cfg.Models)
 }
@@ -300,7 +309,7 @@ func (p *PoolManager) RebuildBackend(ctx context.Context, id string) (*Account, 
 		return nil, nil
 	}
 	_ = account.Backend.Close()
-	account.Backend = buildBackend(account.Config, p.Settings)
+	account.Backend = buildBackend(account.Config, p.Settings, account.HomeDir)
 	account.Started = false
 	if account.Enabled {
 		if err := p.StartAccount(ctx, id); err != nil {

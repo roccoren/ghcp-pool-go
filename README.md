@@ -50,3 +50,8 @@ docker run --rm -p 8000:8000 -e GHCP_API_KEY=sk-change-me ghcp-pool-go
 
 Supported deployment environment overrides include `GHCP_HOST`, `GHCP_PORT`,
 `GHCP_BACKEND`, `GHCP_CACHE_SALT`, and `GHCP_USAGE_SQLITE_PATH`.
+
+Set `GHCP_BACKEND=copilot` plus `GHCP_COPILOT_TOKEN` to route through the real
+Copilot SDK backend. The Go gateway keeps HTTP compatibility, routing, cache,
+and metering in-process; real model calls are delegated to `copilot_worker.py`,
+which imports the official `github-copilot-sdk`.

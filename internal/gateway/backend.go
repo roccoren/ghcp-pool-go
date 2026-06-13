@@ -1,11 +1,15 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -163,25 +167,137 @@ func (b *FakeBackend) render(model string, messages []NeutralMessage, effort str
 
 type CopilotBackend struct {
 	accountID string
+	token     string
+	homeDir   string
+	python    string
+	worker    string
 }
 
-func NewCopilotBackend(accountID string) *CopilotBackend {
-	return &CopilotBackend{accountID: accountID}
+func NewCopilotBackend(accountID, token, homeDir string) *CopilotBackend {
+	return &CopilotBackend{
+		accountID: accountID,
+		token:     token,
+		homeDir:   homeDir,
+		python:    firstNonEmpty(os.Getenv("GHCP_PYTHON"), "python3"),
+		worker:    copilotWorkerPath(),
+	}
 }
 
-func (b *CopilotBackend) ListModels(context.Context) ([]ModelSpec, error) {
-	return nil, fmt.Errorf("copilot backend is not implemented in the Go rewrite yet for account %s", b.accountID)
+func (b *CopilotBackend) ListModels(ctx context.Context) ([]ModelSpec, error) {
+	var out struct {
+		Models []string `json:"models"`
+	}
+	if err := b.runWorker(ctx, "models", nil, &out); err != nil {
+		return nil, err
+	}
+	specs := make([]ModelSpec, 0, len(out.Models))
+	for _, model := range out.Models {
+		specs = append(specs, ModelSpec{ID: model, Capabilities: map[string]any{"streaming": true}})
+	}
+	return specs, nil
 }
 
-func (b *CopilotBackend) Chat(context.Context, string, []NeutralMessage, map[string]any) (ChatResult, error) {
-	return ChatResult{}, fmt.Errorf("copilot backend is not implemented in the Go rewrite yet")
+func (b *CopilotBackend) Chat(ctx context.Context, model string, messages []NeutralMessage, params map[string]any) (ChatResult, error) {
+	var out ChatResult
+	payload := map[string]any{
+		"model":    model,
+		"messages": messages,
+		"params":   params,
+	}
+	if err := b.runWorker(ctx, "chat", payload, &out); err != nil {
+		return ChatResult{}, err
+	}
+	out.Usage = out.Usage.Normalized()
+	if out.Model == "" {
+		out.Model = model
+	}
+	if out.FinishReason == "" {
+		out.FinishReason = "stop"
+	}
+	return out, nil
 }
 
-func (b *CopilotBackend) ChatStream(context.Context, string, []NeutralMessage, map[string]any) (<-chan StreamItem, error) {
-	return nil, fmt.Errorf("copilot backend is not implemented in the Go rewrite yet")
+func (b *CopilotBackend) ChatStream(ctx context.Context, model string, messages []NeutralMessage, params map[string]any) (<-chan StreamItem, error) {
+	ch := make(chan StreamItem)
+	go func() {
+		defer close(ch)
+		result, err := b.Chat(ctx, model, messages, params)
+		if err != nil {
+			ch <- StreamItem{Kind: "error", Err: err}
+			return
+		}
+		for _, tc := range result.ToolCalls {
+			ch <- StreamItem{Kind: "tool_call", ToolCall: tc}
+		}
+		for _, piece := range charChunks(result.Content, 24) {
+			ch <- StreamItem{Kind: "delta", Text: piece}
+		}
+		ch <- StreamItem{Kind: "done", Usage: result.Usage, FinishReason: result.FinishReason}
+	}()
+	return ch, nil
 }
 
 func (b *CopilotBackend) Close() error { return nil }
+
+func (b *CopilotBackend) runWorker(ctx context.Context, op string, payload any, dest any) error {
+	req := map[string]any{
+		"op":             op,
+		"account_id":     b.accountID,
+		"github_token":   b.token,
+		"base_directory": b.homeDir,
+		"payload":        payload,
+	}
+	data, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, b.python, b.worker)
+	cmd.Stdin = bytes.NewReader(data)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = strings.TrimSpace(stdout.String())
+		}
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("copilot worker failed: %s", msg)
+	}
+	var envelope struct {
+		OK     bool            `json:"ok"`
+		Error  string          `json:"error"`
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+		return fmt.Errorf("decode copilot worker response: %w: %s", err, strings.TrimSpace(stdout.String()))
+	}
+	if !envelope.OK {
+		return fmt.Errorf("copilot worker error: %s", envelope.Error)
+	}
+	if dest == nil {
+		return nil
+	}
+	return json.Unmarshal(envelope.Result, dest)
+}
+
+func copilotWorkerPath() string {
+	if path := os.Getenv("GHCP_COPILOT_WORKER"); path != "" {
+		return path
+	}
+	candidates := []string{
+		"/app/copilot_worker.py",
+		filepath.Join("internal", "gateway", "copilot_worker.py"),
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return candidates[0]
+}
 
 func approxTokens(text string) int {
 	if strings.TrimSpace(text) == "" {
