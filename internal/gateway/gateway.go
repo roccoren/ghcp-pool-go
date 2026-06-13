@@ -1,0 +1,468 @@
+package gateway
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+)
+
+type Gateway struct {
+	Settings      Settings
+	Pool          *PoolManager
+	Registry      *ModelRegistry
+	Router        *Router
+	Cache         *CacheLayer
+	UsageStore    *UsageStore
+	Metrics       *Metrics
+	Meter         *Meter
+	LoginManager  *LoginManager
+	Authenticator *Authenticator
+
+	refreshCancel context.CancelFunc
+}
+
+func NewGateway(settings Settings) (*Gateway, error) {
+	pool, err := NewPoolManager(settings)
+	if err != nil {
+		return nil, err
+	}
+	registry := NewModelRegistry(pool)
+	store, err := NewUsageStore(settings.Usage.SQLitePath)
+	if err != nil {
+		return nil, err
+	}
+	metrics := &Metrics{}
+	gw := &Gateway{
+		Settings:      settings,
+		Pool:          pool,
+		Registry:      registry,
+		Router:        NewRouter(pool, registry, settings.Routes),
+		Cache:         NewCacheLayer(settings.Cache),
+		UsageStore:    store,
+		Metrics:       metrics,
+		Meter:         NewMeter(store, metrics),
+		Authenticator: NewAuthenticator(settings),
+	}
+	gw.LoginManager = NewLoginManager(settings, pool)
+	return gw, nil
+}
+
+func (g *Gateway) Startup(ctx context.Context) error {
+	if err := g.Pool.Start(ctx); err != nil {
+		return err
+	}
+	g.Registry.Refresh(ctx)
+	refreshCtx, cancel := context.WithCancel(context.Background())
+	g.refreshCancel = cancel
+	go g.Registry.RefreshLoop(refreshCtx, g.Settings.ModelRefreshSeconds)
+	return nil
+}
+
+func (g *Gateway) Shutdown() {
+	if g.refreshCancel != nil {
+		g.refreshCancel()
+	}
+	g.Pool.Close()
+	_ = g.UsageStore.Close()
+}
+
+func (g *Gateway) Prepare(req ChatCompletionRequest, principal Principal, control string) (Plan, error) {
+	model := req.Model
+	messages := req.NeutralMessages()
+	params := req.SamplingParams()
+	effort := stringParam(params, "reasoning_effort")
+	if effort == "" {
+		effort = resolveReasoningEffort(model, g.Settings.ReasoningEfforts)
+	}
+	if effort != "" {
+		if !ValidReasoningEfforts[effort] {
+			return Plan{}, fmt.Errorf("invalid reasoning_effort %q; valid: none, low, medium, high, xhigh, max", effort)
+		}
+		params["reasoning_effort"] = effort
+	} else {
+		params["reasoning_effort"] = nil
+	}
+	includeUsage := false
+	if v, ok := req.StreamOptions["include_usage"].(bool); ok {
+		includeUsage = v
+	}
+	namespace := principal.CacheNamespace()
+	key := g.Cache.MakeKey(namespace, model, messages, params)
+	if rec := g.Cache.Lookup(key, control, model); rec != nil {
+		return Plan{Model: model, Messages: messages, Params: params, CacheKey: key, Control: control, Namespace: namespace, CacheHit: rec, IncludeUsage: includeUsage}, nil
+	}
+	account, err := g.Router.Select(model)
+	if err != nil {
+		return Plan{}, err
+	}
+	return Plan{Model: model, Messages: messages, Params: params, CacheKey: key, Control: control, Namespace: namespace, Account: account, IncludeUsage: includeUsage}, nil
+}
+
+func (g *Gateway) PrepareWithWait(ctx context.Context, req ChatCompletionRequest, principal Principal, control string) (Plan, error) {
+	deadline := time.Now().Add(time.Duration(g.Settings.RouteBusyWaitSeconds * float64(time.Second)))
+	for {
+		plan, err := g.Prepare(req, principal, control)
+		if err == nil {
+			return plan, nil
+		}
+		var noAccount NoAccountForModel
+		if errors.As(err, &noAccount) {
+			return Plan{}, err
+		}
+		if time.Now().After(deadline) {
+			return Plan{}, err
+		}
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-ctx.Done():
+			return Plan{}, ctx.Err()
+		}
+	}
+}
+
+func (g *Gateway) CompleteResult(ctx context.Context, plan Plan) (ChatResult, string, error) {
+	if plan.CacheHit != nil {
+		rec := plan.CacheHit
+		g.Meter.Observe(nil, rec.Model, rec.Usage, "hit", true, "")
+		return ChatResult{Content: rec.Content, Model: rec.Model, Usage: rec.Usage, FinishReason: rec.FinishReason, ToolCalls: rec.ToolCalls}, "cache", nil
+	}
+	exclude := map[string]bool{}
+	current := plan.Account
+	var lastErr error
+	for current != nil {
+		result, err := current.Backend.Chat(ctx, plan.Model, plan.Messages, plan.Params)
+		if err != nil {
+			current.RecordFailure(err.Error())
+			current.Release()
+			exclude[current.ID()] = true
+			lastErr = err
+			current = g.Router.SelectExcluding(plan.Model, exclude)
+			continue
+		}
+		current.RecordSuccess()
+		current.Release()
+		result.Usage = result.Usage.Normalized()
+		g.Cache.Store(plan.CacheKey, CacheRecord{
+			Content:      result.Content,
+			Model:        result.Model,
+			FinishReason: result.FinishReason,
+			Usage:        result.Usage,
+			ToolCalls:    result.ToolCalls,
+		}, plan.Control)
+		id := current.ID()
+		g.Meter.Observe(&id, plan.Model, result.Usage, "miss", true, "")
+		return result, id, nil
+	}
+	if lastErr != nil {
+		return ChatResult{}, "", lastErr
+	}
+	return ChatResult{}, "", RoutingError{message: fmt.Sprintf("no account could serve model %q", plan.Model)}
+}
+
+func (g *Gateway) StreamChat(ctx context.Context, plan Plan) <-chan string {
+	out := make(chan string)
+	go func() {
+		defer close(out)
+		completionID := newID("chatcmpl")
+		if plan.CacheHit != nil {
+			rec := plan.CacheHit
+			out <- dataSSE(chunkResponse(completionID, rec.Model, map[string]any{"role": "assistant"}, nil))
+			for _, piece := range charChunks(rec.Content, 24) {
+				out <- dataSSE(chunkResponse(completionID, rec.Model, map[string]any{"content": piece}, nil))
+			}
+			for i, tc := range rec.ToolCalls {
+				out <- dataSSE(chunkResponse(completionID, rec.Model, map[string]any{"tool_calls": []any{chatToolCallDelta(i, tc)}}, nil))
+			}
+			out <- dataSSE(chunkResponse(completionID, rec.Model, map[string]any{}, rec.FinishReason))
+			if plan.IncludeUsage {
+				out <- dataSSE(usageChunkResponse(completionID, rec.Model, rec.Usage))
+			}
+			out <- "data: [DONE]\n\n"
+			g.Meter.Observe(nil, rec.Model, rec.Usage, "hit", true, "")
+			return
+		}
+		account := plan.Account
+		if account == nil {
+			out <- dataSSE(map[string]any{"error": map[string]any{"message": "no account selected", "type": "routing_error"}})
+			return
+		}
+		defer account.Release()
+		content := ""
+		toolCalls := []ToolCall{}
+		usage := Usage{}
+		finish := "stop"
+		out <- dataSSE(chunkResponse(completionID, plan.Model, map[string]any{"role": "assistant"}, nil))
+		stream, err := account.Backend.ChatStream(ctx, plan.Model, plan.Messages, plan.Params)
+		if err != nil {
+			account.RecordFailure(err.Error())
+			out <- dataSSE(map[string]any{"error": map[string]any{"message": err.Error(), "type": "backend_error"}})
+			id := account.ID()
+			g.Meter.Observe(&id, plan.Model, usage, "miss", false, "backend_error")
+			return
+		}
+		for item := range stream {
+			if item.Err != nil {
+				account.RecordFailure(item.Err.Error())
+				out <- dataSSE(map[string]any{"error": map[string]any{"message": item.Err.Error(), "type": "backend_error"}})
+				id := account.ID()
+				g.Meter.Observe(&id, plan.Model, usage, "miss", false, "backend_error")
+				return
+			}
+			switch item.Kind {
+			case "delta":
+				content += item.Text
+				out <- dataSSE(chunkResponse(completionID, plan.Model, map[string]any{"content": item.Text}, nil))
+			case "tool_call":
+				tc := item.ToolCall.normalized()
+				toolCalls = append(toolCalls, tc)
+				out <- dataSSE(chunkResponse(completionID, plan.Model, map[string]any{"tool_calls": []any{chatToolCallDelta(item.Index, tc)}}, nil))
+			case "done":
+				usage = item.Usage.Normalized()
+				finish = firstNonEmpty(item.FinishReason, finish)
+			}
+		}
+		if len(toolCalls) > 0 {
+			finish = "tool_calls"
+		}
+		out <- dataSSE(chunkResponse(completionID, plan.Model, map[string]any{}, finish))
+		if plan.IncludeUsage {
+			out <- dataSSE(usageChunkResponse(completionID, plan.Model, usage))
+		}
+		out <- "data: [DONE]\n\n"
+		account.RecordSuccess()
+		g.Cache.Store(plan.CacheKey, CacheRecord{Content: content, Model: plan.Model, FinishReason: finish, Usage: usage, ToolCalls: toolCalls}, plan.Control)
+		id := account.ID()
+		g.Meter.Observe(&id, plan.Model, usage, "miss", true, "")
+	}()
+	return out
+}
+
+func (g *Gateway) StreamResponses(ctx context.Context, plan Plan) <-chan string {
+	out := make(chan string)
+	go func() {
+		defer close(out)
+		responseID := newID("resp")
+		seq := 0
+		next := func() int { seq++; return seq }
+		options, _ := plan.Params["response_options"].(map[string]any)
+		out <- namedSSE(responseCreated(responseID, plan.Model, next(), options))
+		out <- namedSSE(responseInProgress(responseID, plan.Model, next(), options))
+		if plan.CacheHit != nil {
+			rec := plan.CacheHit
+			events, output := responseReplayEvents(rec.Content, rec.ToolCalls, &seq)
+			for _, event := range events {
+				out <- namedSSE(event)
+			}
+			finish := rec.FinishReason
+			if len(rec.ToolCalls) > 0 {
+				finish = "tool_calls"
+			}
+			out <- namedSSE(responseCompleted(responseID, rec.Model, output, rec.Content, finish, rec.Usage, next(), options, len(rec.ToolCalls) == 0))
+			g.Meter.Observe(nil, rec.Model, rec.Usage, "hit", true, "")
+			return
+		}
+		account := plan.Account
+		if account == nil {
+			out <- namedSSE(map[string]any{"type": "response.failed", "sequence_number": next(), "response": responseObject(responseID, plan.Model, "failed", []any{}, "", "", nil, options, nil), "error": map[string]any{"message": "no account selected"}})
+			return
+		}
+		defer account.Release()
+		content, toolCalls, usage, finish, err := consumeStream(ctx, account, plan)
+		if err != nil {
+			account.RecordFailure(err.Error())
+			out <- namedSSE(map[string]any{"type": "response.failed", "sequence_number": next(), "response": responseObject(responseID, plan.Model, "failed", []any{}, "", "", nil, options, nil), "error": map[string]any{"message": err.Error()}})
+			id := account.ID()
+			g.Meter.Observe(&id, plan.Model, usage, "miss", false, "backend_error")
+			return
+		}
+		events, output := responseReplayEvents(content, toolCalls, &seq)
+		for _, event := range events {
+			out <- namedSSE(event)
+		}
+		if len(toolCalls) > 0 {
+			finish = "tool_calls"
+		}
+		out <- namedSSE(responseCompleted(responseID, plan.Model, output, content, finish, usage, next(), options, len(toolCalls) == 0))
+		account.RecordSuccess()
+		g.Cache.Store(plan.CacheKey, CacheRecord{Content: content, Model: plan.Model, FinishReason: finish, Usage: usage, ToolCalls: toolCalls}, plan.Control)
+		id := account.ID()
+		g.Meter.Observe(&id, plan.Model, usage, "miss", true, "")
+	}()
+	return out
+}
+
+func (g *Gateway) StreamAnthropic(ctx context.Context, plan Plan) <-chan string {
+	out := make(chan string)
+	go func() {
+		defer close(out)
+		messageID := newID("msg")
+		options, _ := plan.Params["response_options"].(map[string]any)
+		if plan.CacheHit != nil {
+			rec := plan.CacheHit
+			out <- namedSSE(anthropicMessageStart(messageID, rec.Model, rec.Usage, options))
+			for _, event := range anthropicReplayEvents(rec.Content, rec.ToolCalls) {
+				out <- namedSSE(event)
+			}
+			finish := rec.FinishReason
+			if len(rec.ToolCalls) > 0 {
+				finish = "tool_calls"
+			}
+			out <- namedSSE(anthropicMessageDelta(finish, rec.Usage, options))
+			out <- namedSSE(map[string]any{"type": "message_stop"})
+			g.Meter.Observe(nil, rec.Model, rec.Usage, "hit", true, "")
+			return
+		}
+		account := plan.Account
+		if account == nil {
+			out <- namedSSE(map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": "no account selected"}})
+			return
+		}
+		defer account.Release()
+		out <- namedSSE(anthropicMessageStart(messageID, plan.Model, Usage{}, options))
+		content, toolCalls, usage, finish, err := consumeStream(ctx, account, plan)
+		if err != nil {
+			account.RecordFailure(err.Error())
+			out <- namedSSE(map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": err.Error()}})
+			id := account.ID()
+			g.Meter.Observe(&id, plan.Model, usage, "miss", false, "backend_error")
+			return
+		}
+		for _, event := range anthropicReplayEvents(content, toolCalls) {
+			out <- namedSSE(event)
+		}
+		if len(toolCalls) > 0 {
+			finish = "tool_calls"
+		}
+		out <- namedSSE(anthropicMessageDelta(finish, usage, options))
+		out <- namedSSE(map[string]any{"type": "message_stop"})
+		account.RecordSuccess()
+		g.Cache.Store(plan.CacheKey, CacheRecord{Content: content, Model: plan.Model, FinishReason: finish, Usage: usage, ToolCalls: toolCalls}, plan.Control)
+		id := account.ID()
+		g.Meter.Observe(&id, plan.Model, usage, "miss", true, "")
+	}()
+	return out
+}
+
+func consumeStream(ctx context.Context, account *Account, plan Plan) (string, []ToolCall, Usage, string, error) {
+	stream, err := account.Backend.ChatStream(ctx, plan.Model, plan.Messages, plan.Params)
+	if err != nil {
+		return "", nil, Usage{}, "stop", err
+	}
+	content := ""
+	toolCalls := []ToolCall{}
+	usage := Usage{}
+	finish := "stop"
+	for item := range stream {
+		if item.Err != nil {
+			return content, toolCalls, usage, finish, item.Err
+		}
+		switch item.Kind {
+		case "delta":
+			content += item.Text
+		case "tool_call":
+			toolCalls = append(toolCalls, item.ToolCall.normalized())
+		case "done":
+			usage = item.Usage.Normalized()
+			finish = firstNonEmpty(item.FinishReason, finish)
+		}
+	}
+	return content, toolCalls, usage, finish, nil
+}
+
+func dataSSE(obj any) string {
+	data, _ := json.Marshal(obj)
+	return "data: " + string(data) + "\n\n"
+}
+
+func namedSSE(obj map[string]any) string {
+	data, _ := json.Marshal(obj)
+	return "event: " + stringFromAny(obj["type"]) + "\ndata: " + string(data) + "\n\n"
+}
+
+func chatToolCallDelta(index int, tc ToolCall) map[string]any {
+	return map[string]any{"index": index, "id": tc.ID, "type": "function", "function": map[string]any{"name": tc.Name, "arguments": tc.Arguments}}
+}
+
+func responseReplayEvents(content string, toolCalls []ToolCall, seq *int) ([]map[string]any, []any) {
+	next := func() int { *seq++; return *seq }
+	events := []map[string]any{}
+	output := []any{}
+	outputIndex := 0
+	if content != "" {
+		itemID := newID("msg")
+		events = append(events,
+			map[string]any{"type": "response.output_item.added", "sequence_number": next(), "output_index": outputIndex, "item": map[string]any{"id": itemID, "type": "message", "status": "in_progress", "role": "assistant", "content": []any{}, "phase": "final_answer"}},
+			map[string]any{"type": "response.content_part.added", "sequence_number": next(), "item_id": itemID, "output_index": outputIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}},
+		)
+		for _, piece := range charChunks(content, 24) {
+			events = append(events, map[string]any{"type": "response.output_text.delta", "sequence_number": next(), "item_id": itemID, "output_index": outputIndex, "content_index": 0, "delta": piece})
+		}
+		events = append(events,
+			map[string]any{"type": "response.output_text.done", "sequence_number": next(), "item_id": itemID, "output_index": outputIndex, "content_index": 0, "text": content},
+			map[string]any{"type": "response.content_part.done", "sequence_number": next(), "item_id": itemID, "output_index": outputIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": content, "annotations": []any{}}},
+			map[string]any{"type": "response.output_item.done", "sequence_number": next(), "output_index": outputIndex, "item": responseMessageItem(itemID, content)},
+		)
+		output = append(output, responseMessageItem(itemID, content))
+		outputIndex++
+	}
+	for _, tc := range toolCalls {
+		itemID := newID("msg")
+		if tc.Kind == "custom" {
+			events = append(events,
+				map[string]any{"type": "response.output_item.added", "sequence_number": next(), "output_index": outputIndex, "item": map[string]any{"id": itemID, "type": "custom_tool_call", "status": "in_progress", "call_id": tc.ID, "name": tc.Name, "input": ""}},
+				map[string]any{"type": "response.custom_tool_call_input.delta", "sequence_number": next(), "item_id": itemID, "call_id": tc.ID, "output_index": outputIndex, "delta": tc.Arguments},
+				map[string]any{"type": "response.custom_tool_call_input.done", "sequence_number": next(), "item_id": itemID, "call_id": tc.ID, "output_index": outputIndex, "input": tc.Arguments},
+				map[string]any{"type": "response.output_item.done", "sequence_number": next(), "output_index": outputIndex, "item": map[string]any{"id": itemID, "type": "custom_tool_call", "status": "completed", "call_id": tc.ID, "name": tc.Name, "input": tc.Arguments}},
+			)
+			output = append(output, map[string]any{"id": itemID, "type": "custom_tool_call", "status": "completed", "call_id": tc.ID, "name": tc.Name, "input": tc.Arguments})
+		} else {
+			events = append(events,
+				map[string]any{"type": "response.output_item.added", "sequence_number": next(), "output_index": outputIndex, "item": map[string]any{"id": itemID, "type": "function_call", "status": "in_progress", "call_id": tc.ID, "name": tc.Name, "arguments": ""}},
+				map[string]any{"type": "response.function_call_arguments.delta", "sequence_number": next(), "item_id": itemID, "output_index": outputIndex, "delta": tc.Arguments},
+				map[string]any{"type": "response.function_call_arguments.done", "sequence_number": next(), "item_id": itemID, "output_index": outputIndex, "arguments": tc.Arguments},
+				map[string]any{"type": "response.output_item.done", "sequence_number": next(), "output_index": outputIndex, "item": map[string]any{"id": itemID, "type": "function_call", "status": "completed", "call_id": tc.ID, "name": tc.Name, "arguments": tc.Arguments}},
+			)
+			output = append(output, map[string]any{"id": itemID, "type": "function_call", "status": "completed", "call_id": tc.ID, "name": tc.Name, "arguments": tc.Arguments})
+		}
+		outputIndex++
+	}
+	if len(output) == 0 {
+		itemID := newID("msg")
+		events = append(events,
+			map[string]any{"type": "response.output_item.added", "sequence_number": next(), "output_index": 0, "item": map[string]any{"id": itemID, "type": "message", "status": "in_progress", "role": "assistant", "content": []any{}, "phase": "final_answer"}},
+			map[string]any{"type": "response.content_part.added", "sequence_number": next(), "item_id": itemID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}},
+			map[string]any{"type": "response.output_text.done", "sequence_number": next(), "item_id": itemID, "output_index": 0, "content_index": 0, "text": ""},
+			map[string]any{"type": "response.content_part.done", "sequence_number": next(), "item_id": itemID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}},
+			map[string]any{"type": "response.output_item.done", "sequence_number": next(), "output_index": 0, "item": responseMessageItem(itemID, "")},
+		)
+		output = append(output, responseMessageItem(itemID, ""))
+	}
+	return events, output
+}
+
+func anthropicReplayEvents(content string, toolCalls []ToolCall) []map[string]any {
+	events := []map[string]any{}
+	index := 0
+	if content != "" {
+		events = append(events, map[string]any{"type": "content_block_start", "index": index, "content_block": map[string]any{"type": "text", "text": ""}})
+		for _, piece := range charChunks(content, 24) {
+			events = append(events, map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "text_delta", "text": piece}})
+		}
+		events = append(events, map[string]any{"type": "content_block_stop", "index": index})
+		index++
+	}
+	for _, tc := range toolCalls {
+		events = append(events,
+			map[string]any{"type": "content_block_start", "index": index, "content_block": map[string]any{"type": "tool_use", "id": tc.ID, "name": tc.Name, "input": map[string]any{}}},
+			map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "input_json_delta", "partial_json": tc.Arguments}},
+			map[string]any{"type": "content_block_stop", "index": index},
+		)
+		index++
+	}
+	if index == 0 {
+		events = append(events, map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}, map[string]any{"type": "content_block_stop", "index": 0})
+	}
+	return events
+}
