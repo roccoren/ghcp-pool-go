@@ -1,0 +1,7 @@
+.git
+runtime-home
+usage.sqlite
+*.sqlite
+*.db
+tmp
+dist

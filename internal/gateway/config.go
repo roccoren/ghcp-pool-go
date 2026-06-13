@@ -209,12 +209,8 @@ func LoadSettings(path string) (Settings, error) {
 	if settings.Cache.MaxEntries == 0 {
 		settings.Cache.MaxEntries = 1000
 	}
-	if settings.Cache.Salt == "" {
-		settings.Cache.Salt = "change-me"
-	}
-	if settings.Usage.SQLitePath == "" {
-		settings.Usage.SQLitePath = "usage.sqlite"
-	}
+	settings.Cache.Salt = firstNonEmpty(os.Getenv("GHCP_CACHE_SALT"), settings.Cache.Salt, "change-me")
+	settings.Usage.SQLitePath = firstNonEmpty(os.Getenv("GHCP_USAGE_SQLITE_PATH"), settings.Usage.SQLitePath, "usage.sqlite")
 	if settings.Login.Scopes == "" {
 		settings.Login.Scopes = "read:user"
 	}
@@ -244,6 +240,19 @@ func LoadSettings(path string) (Settings, error) {
 			ids = append(ids, account.ID)
 		}
 		settings.Routes = []RouteConfig{{Model: "*", Accounts: ids, Strategy: "least_busy"}}
+	}
+	if len(settings.APIKeys) == 0 {
+		apiKey := os.Getenv("GHCP_API_KEY")
+		adminKey := os.Getenv("GHCP_ADMIN_API_KEY")
+		if apiKey != "" || adminKey != "" {
+			if apiKey == "" {
+				apiKey = adminKey
+			}
+			settings.APIKeys = []APIKeyConfig{{Key: apiKey, Scopes: []string{"admin", "inference"}, ModelAllow: []string{"*"}, CacheNamespace: "default"}}
+			if adminKey != "" && adminKey != apiKey {
+				settings.APIKeys = append(settings.APIKeys, APIKeyConfig{Key: adminKey, Scopes: []string{"admin", "inference"}, ModelAllow: []string{"*"}, CacheNamespace: "default"})
+			}
+		}
 	}
 	if len(settings.APIKeys) == 0 {
 		settings.APIKeys = []APIKeyConfig{{Key: "sk-local-dev", Scopes: []string{"admin", "inference"}, ModelAllow: []string{"*"}, CacheNamespace: "default"}}

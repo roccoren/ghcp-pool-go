@@ -101,6 +101,7 @@ func TestHealthAndAuth(t *testing.T) {
 	if rr := request(t, h, "GET", "/healthz", nil, nil); rr.Code != 200 {
 		t.Fatalf("healthz status %d", rr.Code)
 	}
+
 	if rr := request(t, h, "GET", "/v1/models", nil, nil); rr.Code != 401 {
 		t.Fatalf("models without auth status %d", rr.Code)
 	}
@@ -108,6 +109,17 @@ func TestHealthAndAuth(t *testing.T) {
 	body := decodeBody(t, rr)
 	if rr.Code != 200 || len(body["data"].([]any)) < 2 {
 		t.Fatalf("models response: status=%d body=%v", rr.Code, body)
+	}
+}
+
+func TestEnvAPIKeyOverridesDefaultKey(t *testing.T) {
+	t.Setenv("GHCP_API_KEY", "sk-env")
+	settings, err := LoadSettings("/does/not/exist.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := settings.APIKeys[0].Key; got != "sk-env" {
+		t.Fatalf("api key=%q", got)
 	}
 }
 

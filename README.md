@@ -37,3 +37,16 @@ curl -s localhost:8000/v1/chat/completions \
 Configuration defaults match the Python project: without `config.yaml`, the
 server starts on port 8000 with one fake account exposing `gpt-4.1` and
 `gpt-4o-mini`, and API key `sk-local-dev`.
+
+For public deployments, set `GHCP_API_KEY` (or `GHCP_ADMIN_API_KEY`) so the
+container does not expose the local-development default key.
+
+## Container
+
+```bash
+docker build -t ghcp-pool-go .
+docker run --rm -p 8000:8000 -e GHCP_API_KEY=sk-change-me ghcp-pool-go
+```
+
+Supported deployment environment overrides include `GHCP_HOST`, `GHCP_PORT`,
+`GHCP_BACKEND`, `GHCP_CACHE_SALT`, and `GHCP_USAGE_SQLITE_PATH`.
