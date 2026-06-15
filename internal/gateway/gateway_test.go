@@ -861,6 +861,118 @@ func TestSDKEligibilityRequiresSinglePlainUserMessage(t *testing.T) {
 	}
 }
 
+func TestCopilotListModelsFallsBackToPublicAPIBase(t *testing.T) {
+	oldClient := copilotHTTPClient
+	oldFallbacks := copilotModelListFallbackBaseURLs
+	defer func() {
+		copilotHTTPClient = oldClient
+		copilotModelListFallbackBaseURLs = oldFallbacks
+	}()
+
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusMisdirectedRequest, map[string]any{"error": "wrong host"}, nil)
+	}))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer cp-token" {
+			t.Fatalf("authorization=%q", got)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": []any{
+			map[string]any{"id": "gpt-5.5", "supported_endpoints": []string{"/chat/completions"}},
+			map[string]any{"id": "claude-haiku-4.5", "supported_endpoints": []string{"/v1/messages"}},
+		}}, nil)
+	}))
+	defer fallback.Close()
+
+	copilotModelListFallbackBaseURLs = []string{fallback.URL}
+	backend := NewCopilotBackend("acct", "", "")
+	backend.access = copilotAccessToken{Token: "cp-token", BaseURL: primary.URL, ExpiresAt: time.Now().Add(time.Hour)}
+	specs, err := backend.ListModels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{}
+	for _, spec := range specs {
+		ids = append(ids, spec.ID)
+	}
+	if strings.Join(ids, ",") != "gpt-5.5,claude-haiku-4.5" {
+		t.Fatalf("ids=%v", ids)
+	}
+}
+
+func TestCopilotListModelsMergesPublicAPIBase(t *testing.T) {
+	oldClient := copilotHTTPClient
+	oldFallbacks := copilotModelListFallbackBaseURLs
+	defer func() {
+		copilotHTTPClient = oldClient
+		copilotModelListFallbackBaseURLs = oldFallbacks
+	}()
+
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"data": []any{
+			map[string]any{"id": "gpt-4.1", "supported_endpoints": []string{"/chat/completions"}},
+		}}, nil)
+	}))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"data": []any{
+			map[string]any{"id": "gpt-4.1", "supported_endpoints": []string{"/chat/completions"}},
+			map[string]any{"id": "gpt-5.5", "supported_endpoints": []string{"/chat/completions"}},
+			map[string]any{"id": "claude-haiku-4.5", "supported_endpoints": []string{"/v1/messages"}},
+		}}, nil)
+	}))
+	defer fallback.Close()
+
+	copilotModelListFallbackBaseURLs = []string{fallback.URL}
+	backend := NewCopilotBackend("acct", "", "")
+	backend.access = copilotAccessToken{Token: "cp-token", BaseURL: primary.URL, ExpiresAt: time.Now().Add(time.Hour)}
+	specs, err := backend.ListModels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{}
+	for _, spec := range specs {
+		ids = append(ids, spec.ID)
+	}
+	if strings.Join(ids, ",") != "gpt-4.1,gpt-5.5,claude-haiku-4.5" {
+		t.Fatalf("ids=%v", ids)
+	}
+}
+
+func TestCopilotModelHeadersMatchKnownGoodModelDiscovery(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/models", nil)
+	addCopilotModelHeaders(req, "tok")
+	if got := req.Header.Get("Openai-Intent"); got != "conversation-agent" {
+		t.Fatalf("Openai-Intent=%q", got)
+	}
+	if got := req.Header.Get("X-Github-Api-Version"); got != "2025-04-01" {
+		t.Fatalf("X-Github-Api-Version=%q", got)
+	}
+	if got := req.Header.Get("x-initiator"); got != "" {
+		t.Fatalf("x-initiator should not be set for model discovery, got %q", got)
+	}
+}
+
+func TestMergeModelEndpointMetadata(t *testing.T) {
+	specs := []ModelSpec{{
+		ID:                 "gpt-5.5",
+		SupportedEndpoints: []string{endpointChatCompletions},
+		Capabilities:       map[string]any{"sdk": true},
+	}}
+	httpSpecs := []ModelSpec{{
+		ID:                 "gpt-5.5",
+		SupportedEndpoints: []string{endpointResponses, endpointChatCompletions},
+		Capabilities:       map[string]any{"streaming": true, "sdk": false},
+	}}
+	mergeModelEndpointMetadata(specs, httpSpecs)
+	if strings.Join(specs[0].SupportedEndpoints, ",") != endpointResponses+","+endpointChatCompletions {
+		t.Fatalf("endpoints=%v", specs[0].SupportedEndpoints)
+	}
+	if specs[0].Capabilities["sdk"] != true || specs[0].Capabilities["streaming"] != true {
+		t.Fatalf("capabilities=%v", specs[0].Capabilities)
+	}
+}
+
 func TestRateLimits(t *testing.T) {
 	settings := testSettings()
 	off := false

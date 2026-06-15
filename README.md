@@ -82,6 +82,9 @@ stack, see
 
 Useful admin controls:
 
+- [`docs/admin-operations.md`](docs/admin-operations.md) has copy/paste
+  workflows for managing Copilot users, viewing admin status/usage, and managing
+  models.
 - `GET/PUT /admin/model-aliases` maps friendly client model IDs to backend IDs.
   Requests resolve aliases before routing/cache; responses echo the requested ID
   and include `x-ghcp-upstream-model` when it differs. Updates are persisted to

@@ -40,6 +40,11 @@ var copilotHTTPClient = &http.Client{
 	},
 }
 
+var copilotModelListFallbackBaseURLs = []string{
+	"https://api.githubcopilot.com",
+	defaultCopilotAPIBaseURL,
+}
+
 type CopilotBackend struct {
 	accountID   string
 	githubToken string
@@ -104,15 +109,103 @@ func (b *CopilotBackend) Start(ctx context.Context) error {
 }
 
 func (b *CopilotBackend) ListModels(ctx context.Context) ([]ModelSpec, error) {
-	_, data, err := b.doCopilot(ctx, http.MethodGet, "/models", nil, false)
-	if err != nil {
-		if b.sdkGitHubToken() != "" {
-			if specs, sdkErr := b.listModelsSDK(ctx); sdkErr == nil {
-				return specs, nil
+	if b.sdkGitHubToken() != "" {
+		if specs, err := b.listModelsSDK(ctx); err == nil && len(specs) > 0 {
+			if httpSpecs, httpErr := b.listModelsDirect(ctx); httpErr == nil {
+				mergeModelEndpointMetadata(specs, httpSpecs)
 			}
+			return specs, nil
 		}
+	}
+	return b.listModelsDirect(ctx)
+}
+
+func (b *CopilotBackend) listModelsDirect(ctx context.Context) ([]ModelSpec, error) {
+	access, err := b.validAccessToken(ctx)
+	if err != nil {
 		return nil, err
 	}
+	merged := []ModelSpec{}
+	seen := map[string]bool{}
+	addSpecs := func(specs []ModelSpec) {
+		for _, spec := range specs {
+			if spec.ID == "" || seen[spec.ID] {
+				continue
+			}
+			seen[spec.ID] = true
+			merged = append(merged, spec)
+		}
+	}
+	specs, err := b.listModelsHTTP(ctx, access.BaseURL, access.Token)
+	directErr := err
+	if err == nil {
+		addSpecs(specs)
+	}
+	for _, baseURL := range copilotModelListFallbackBaseURLs {
+		baseURL = normalizeBaseURL(baseURL)
+		if baseURL == "" || baseURL == access.BaseURL {
+			continue
+		}
+		if fallbackSpecs, fallbackErr := b.listModelsHTTP(ctx, baseURL, access.Token); fallbackErr == nil {
+			addSpecs(fallbackSpecs)
+		}
+	}
+	if len(merged) > 0 {
+		return merged, nil
+	}
+	return nil, directErr
+}
+
+func mergeModelEndpointMetadata(specs []ModelSpec, httpSpecs []ModelSpec) {
+	byID := map[string]ModelSpec{}
+	for _, spec := range httpSpecs {
+		if spec.ID != "" {
+			byID[spec.ID] = spec
+		}
+	}
+	for i := range specs {
+		httpSpec := byID[specs[i].ID]
+		if len(httpSpec.SupportedEndpoints) > 0 {
+			specs[i].SupportedEndpoints = httpSpec.SupportedEndpoints
+		}
+		if len(httpSpec.Capabilities) > 0 {
+			if specs[i].Capabilities == nil {
+				specs[i].Capabilities = map[string]any{}
+			}
+			for key, value := range httpSpec.Capabilities {
+				if _, exists := specs[i].Capabilities[key]; !exists {
+					specs[i].Capabilities[key] = value
+				}
+			}
+		}
+	}
+}
+
+func (b *CopilotBackend) listModelsHTTP(ctx context.Context, baseURL, token string) ([]ModelSpec, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, normalizeBaseURL(baseURL)+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	addCopilotModelHeaders(req, token)
+	req.Header.Set("Accept", "application/json")
+	resp, err := copilotHTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("copilot models request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 50<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read copilot models response: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, &CopilotUpstreamError{StatusCode: resp.StatusCode, Body: data}
+	}
+	return parseCopilotModels(data)
+}
+
+func parseCopilotModels(data []byte) ([]ModelSpec, error) {
 	var payload struct {
 		Data []struct {
 			ID                 string   `json:"id"`
@@ -648,6 +741,18 @@ func addCopilotHeaders(req *http.Request, token, endpoint string, info copilotRe
 	if endpointMatches(endpoint, endpointMessages) {
 		req.Header.Set("anthropic-beta", "interleaved-thinking-2025-05-14")
 	}
+}
+
+func addCopilotModelHeaders(req *http.Request, token string) {
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", copilotUserAgent)
+	req.Header.Set("Editor-Version", copilotEditorVersion)
+	req.Header.Set("Editor-Plugin-Version", copilotPluginVersion)
+	req.Header.Set("Copilot-Integration-Id", "vscode-chat")
+	req.Header.Set("Openai-Intent", "conversation-agent")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Github-Api-Version", "2025-04-01")
+	req.Header.Set("X-Request-Id", newID("req"))
 }
 
 func copilotRequestMetadata(body any, endpoint string) copilotRequestInfo {
