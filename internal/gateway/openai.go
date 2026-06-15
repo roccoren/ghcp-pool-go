@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -183,6 +184,49 @@ type AnthropicMessagesRequest struct {
 	ReasoningEffort   string             `json:"reasoning_effort,omitempty"`
 }
 
+type EmbeddingsRequest struct {
+	Model          string `json:"model"`
+	Input          any    `json:"input"`
+	EncodingFormat string `json:"encoding_format,omitempty"`
+	Dimensions     *int   `json:"dimensions,omitempty"`
+	User           string `json:"user,omitempty"`
+}
+
+func (r EmbeddingsRequest) InputTexts() []string {
+	switch v := r.Input.(type) {
+	case nil:
+		return nil
+	case string:
+		return []string{v}
+	case []any:
+		if len(v) == 0 {
+			return nil
+		}
+		if allNumbers(v) {
+			return []string{numbersToText(v)}
+		}
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if tokens, ok := item.([]any); ok && allNumbers(tokens) {
+				out = append(out, numbersToText(tokens))
+			} else {
+				out = append(out, coerceText(item))
+			}
+		}
+		return out
+	default:
+		return []string{coerceText(v)}
+	}
+}
+
+func (r EmbeddingsRequest) Params() map[string]any {
+	return map[string]any{
+		"encoding_format": emptyToNilString(r.EncodingFormat),
+		"dimensions":      ptrValue(r.Dimensions),
+		"user":            emptyToNilString(r.User),
+	}
+}
+
 func (r AnthropicMessagesRequest) AnthropicOptions() map[string]any {
 	return map[string]any{
 		"cache_control":      nilIfEmptyMap(r.CacheControl),
@@ -291,6 +335,27 @@ func usageToOpenAI(usage Usage) map[string]any {
 		block["prompt_tokens_details"] = map[string]any{"cached_tokens": usage.CachedTokens}
 	}
 	return block
+}
+
+func embeddingResponse(model string, embeddings [][]float64, usage Usage) map[string]any {
+	data := make([]any, 0, len(embeddings))
+	for i, vector := range embeddings {
+		data = append(data, map[string]any{
+			"object":    "embedding",
+			"index":     i,
+			"embedding": vector,
+		})
+	}
+	usage = usage.Normalized()
+	return map[string]any{
+		"object": "list",
+		"data":   data,
+		"model":  model,
+		"usage": map[string]any{
+			"prompt_tokens": usage.InputTokens,
+			"total_tokens":  usage.TotalTokens,
+		},
+	}
 }
 
 func usageToResponses(usage Usage) map[string]any {
@@ -622,6 +687,28 @@ func anthropicReasoningEffort(effort string, outputConfig map[string]any) string
 		return stringFromAny(outputConfig["effort"])
 	}
 	return ""
+}
+
+func allNumbers(values []any) bool {
+	if len(values) == 0 {
+		return false
+	}
+	for _, value := range values {
+		switch value.(type) {
+		case float64, int, int64, json.Number:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func numbersToText(values []any) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, fmt.Sprint(value))
+	}
+	return stringsJoin(parts, " ")
 }
 
 func stringsJoin(parts []string, sep string) string {

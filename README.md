@@ -12,14 +12,21 @@ and there is no interpreter GIL limiting CPU-bound request coordination.
 The rewrite keeps the same core contract:
 
 - OpenAI Chat Completions: `POST /v1/chat/completions`
-- OpenAI Responses API for `gpt*`: `POST /v1/responses`
+- OpenAI Responses API: `POST /v1/responses`
 - Anthropic Messages API for `claude*`: `POST /v1/messages`
+- Anthropic token count estimates: `POST /v1/messages/count_tokens`
+- Gemini-compatible API: `GET /v1beta/models`,
+  `POST /v1beta/models/{model}:generateContent`,
+  `POST /v1beta/models/{model}:streamGenerateContent`, and
+  `POST /v1beta/models/{model}:countTokens`
+- OpenAI-compatible embeddings: `POST /v1/embeddings`
 - pooled accounts, routing, model registry, exact-match cache, usage accounting,
-  admin routes, user management, debug capture, health and metrics endpoints
+  admin routes, user management, debug capture, model aliases, RPM rate limits,
+  health and metrics endpoints
 
 The offline `fake` backend is fully implemented for local testing. The backend
-interface is isolated so a real Copilot SDK adapter can be added behind the same
-pool/router/cache/meter pipeline.
+interface is isolated so the Go-native Copilot HTTP backend can run behind the
+same pool/router/cache/meter pipeline.
 
 ## Run
 
@@ -32,6 +39,16 @@ curl -s localhost:8000/v1/chat/completions \
   -H 'Authorization: Bearer sk-local-dev' \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}]}'
+
+curl -s localhost:8000/v1/embeddings \
+  -H 'Authorization: Bearer sk-local-dev' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4.1","input":["hi"],"dimensions":8}'
+
+curl -s localhost:8000/v1beta/models/gpt-4.1:generateContent \
+  -H 'x-goog-api-key: sk-local-dev' \
+  -H 'Content-Type: application/json' \
+  -d '{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}'
 ```
 
 Configuration defaults match the Python project: without `config.yaml`, the
@@ -49,11 +66,24 @@ docker run --rm -p 8000:8000 -e GHCP_API_KEY=sk-change-me ghcp-pool-go
 ```
 
 Supported deployment environment overrides include `GHCP_HOST`, `GHCP_PORT`,
-`GHCP_BACKEND`, `GHCP_CACHE_SALT`, and `GHCP_USAGE_SQLITE_PATH`.
+`GHCP_BACKEND`, `GHCP_CACHE_SALT`, `GHCP_USAGE_SQLITE_PATH`,
+`GHCP_GLOBAL_RATE_LIMIT_RPM`, and `GHCP_PER_ACCOUNT_RATE_LIMIT_RPM`.
 
-Set `GHCP_BACKEND=copilot` plus `GHCP_COPILOT_TOKEN` to route through the real
-Copilot SDK backend. The Go gateway keeps HTTP compatibility, routing, cache,
-and metering in-process; real model calls are delegated to `copilot_worker.py`,
-which imports the official `github-copilot-sdk`. Container images set `HOME`,
-`XDG_CACHE_HOME`, and `TMPDIR` to `/tmp` so the bundled Copilot CLI runtime has a
-writable extraction/cache directory under non-root execution.
+Useful admin controls:
+
+- `GET/PUT /admin/model-aliases` maps friendly client model IDs to backend IDs.
+  Requests resolve aliases before routing/cache; responses echo the requested ID
+  and include `x-ghcp-upstream-model` when it differs.
+- `GET/PUT /admin/rate-limits` configures global and per-account RPM token
+  buckets. Exhausted buckets return HTTP 429 with `Retry-After`.
+
+Set `GHCP_BACKEND=copilot` plus `GHCP_COPILOT_TOKEN` to route through the
+Go-native Copilot HTTP backend. `GHCP_COPILOT_TOKEN` should be a GitHub OAuth
+token; the backend exchanges it for a Copilot API token, caches it until expiry,
+detects the Copilot API base URL from the token response, and proxies supported
+Copilot endpoints directly from Go.
+
+Model metadata from `/models` is retained per account, including
+`supported_endpoints`. The router uses those capabilities to choose between
+Chat Completions, Responses, Anthropic Messages, and embeddings endpoints when a
+model does not support the client-requested protocol directly.

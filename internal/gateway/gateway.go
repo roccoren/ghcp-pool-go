@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -69,9 +70,12 @@ func (g *Gateway) Shutdown() {
 }
 
 func (g *Gateway) Prepare(req ChatCompletionRequest, principal Principal, control string) (Plan, error) {
-	model := req.Model
+	requestedModel := req.Model
+	model := g.Settings.ResolveModelAlias(requestedModel)
 	messages := req.NeutralMessages()
 	params := req.SamplingParams()
+	endpoint := g.Router.PickEndpoint(model, req.EndpointPreferences())
+	params[internalEndpointParam] = endpoint
 	effort := stringParam(params, "reasoning_effort")
 	if effort == "" {
 		effort = resolveReasoningEffort(model, g.Settings.ReasoningEfforts)
@@ -91,13 +95,13 @@ func (g *Gateway) Prepare(req ChatCompletionRequest, principal Principal, contro
 	namespace := principal.CacheNamespace()
 	key := g.Cache.MakeKey(namespace, model, messages, params)
 	if rec := g.Cache.Lookup(key, control, model); rec != nil {
-		return Plan{Model: model, Messages: messages, Params: params, CacheKey: key, Control: control, Namespace: namespace, CacheHit: rec, IncludeUsage: includeUsage}, nil
+		return Plan{Model: model, ResponseModel: requestedModel, Endpoint: endpoint, Messages: messages, Params: params, CacheKey: key, Control: control, Namespace: namespace, CacheHit: rec, IncludeUsage: includeUsage}, nil
 	}
-	account, err := g.Router.Select(model)
+	account, err := g.Router.Select(model, endpoint)
 	if err != nil {
 		return Plan{}, err
 	}
-	return Plan{Model: model, Messages: messages, Params: params, CacheKey: key, Control: control, Namespace: namespace, Account: account, IncludeUsage: includeUsage}, nil
+	return Plan{Model: model, ResponseModel: requestedModel, Endpoint: endpoint, Messages: messages, Params: params, CacheKey: key, Control: control, Namespace: namespace, Account: account, IncludeUsage: includeUsage}, nil
 }
 
 func (g *Gateway) PrepareWithWait(ctx context.Context, req ChatCompletionRequest, principal Principal, control string) (Plan, error) {
@@ -109,6 +113,10 @@ func (g *Gateway) PrepareWithWait(ctx context.Context, req ChatCompletionRequest
 		}
 		var noAccount NoAccountForModel
 		if errors.As(err, &noAccount) {
+			return Plan{}, err
+		}
+		var rateLimit RateLimitExceeded
+		if errors.As(err, &rateLimit) {
 			return Plan{}, err
 		}
 		if time.Now().After(deadline) {
@@ -126,7 +134,7 @@ func (g *Gateway) CompleteResult(ctx context.Context, plan Plan) (ChatResult, st
 	if plan.CacheHit != nil {
 		rec := plan.CacheHit
 		g.Meter.Observe(nil, rec.Model, rec.Usage, "hit", true, "")
-		return ChatResult{Content: rec.Content, Model: rec.Model, Usage: rec.Usage, FinishReason: rec.FinishReason, ToolCalls: rec.ToolCalls}, "cache", nil
+		return ChatResult{Content: rec.Content, Model: plan.ResponseModel, Usage: rec.Usage, FinishReason: rec.FinishReason, ToolCalls: rec.ToolCalls}, "cache", nil
 	}
 	exclude := map[string]bool{}
 	current := plan.Account
@@ -138,7 +146,7 @@ func (g *Gateway) CompleteResult(ctx context.Context, plan Plan) (ChatResult, st
 			current.Release()
 			exclude[current.ID()] = true
 			lastErr = err
-			current = g.Router.SelectExcluding(plan.Model, exclude)
+			current = g.Router.SelectExcluding(plan.Model, exclude, plan.Endpoint)
 			continue
 		}
 		current.RecordSuccess()
@@ -153,12 +161,61 @@ func (g *Gateway) CompleteResult(ctx context.Context, plan Plan) (ChatResult, st
 		}, plan.Control)
 		id := current.ID()
 		g.Meter.Observe(&id, plan.Model, result.Usage, "miss", true, "")
+		result.Model = plan.ResponseModel
 		return result, id, nil
 	}
 	if lastErr != nil {
 		return ChatResult{}, "", lastErr
 	}
 	return ChatResult{}, "", RoutingError{message: fmt.Sprintf("no account could serve model %q", plan.Model)}
+}
+
+func (g *Gateway) EstimateInputTokens(req ChatCompletionRequest) (int, string) {
+	model := g.Settings.ResolveModelAlias(req.Model)
+	messages := req.NeutralMessages()
+	params := req.SamplingParams()
+	parts := []string{renderPrompt(messages)}
+	if tools := params["tools"]; tools != nil {
+		data, _ := json.Marshal(tools)
+		parts = append(parts, string(data))
+	}
+	return max(1, approxTokens(strings.Join(parts, "\n"))), model
+}
+
+func (g *Gateway) CreateEmbeddings(ctx context.Context, requestedModel string, inputs []string, params map[string]any) (EmbeddingResult, string, map[string]string, error) {
+	model := g.Settings.ResolveModelAlias(requestedModel)
+	account, err := g.Router.Select(model, endpointEmbeddings)
+	if err != nil {
+		return EmbeddingResult{}, "", nil, err
+	}
+	defer account.Release()
+	start := time.Now()
+	result, err := account.Backend.Embeddings(ctx, model, inputs, params)
+	if err != nil {
+		if errors.Is(err, ErrEmbeddingsUnsupported) {
+			return EmbeddingResult{}, "", nil, err
+		}
+		account.RecordFailure(err.Error())
+		return EmbeddingResult{}, "", nil, err
+	}
+	account.RecordSuccess()
+	result.Usage = result.Usage.Normalized()
+	id := account.ID()
+	g.Meter.Observe(&id, model, result.Usage, "miss", true, "")
+	result.Model = requestedModel
+	headers := map[string]string{
+		"x-ghcp-account":    id,
+		"x-ghcp-cache":      "bypass",
+		"x-ghcp-model":      requestedModel,
+		"openai-model":      requestedModel,
+		"x-openai-model":    requestedModel,
+		"request-id":        newID("req"),
+		"x-ghcp-latency-ms": fmt.Sprintf("%d", time.Since(start).Milliseconds()),
+	}
+	if requestedModel != model {
+		headers["x-ghcp-upstream-model"] = model
+	}
+	return result, id, headers, nil
 }
 
 func (g *Gateway) StreamChat(ctx context.Context, plan Plan) <-chan string {
@@ -168,24 +225,36 @@ func (g *Gateway) StreamChat(ctx context.Context, plan Plan) <-chan string {
 		completionID := newID("chatcmpl")
 		if plan.CacheHit != nil {
 			rec := plan.CacheHit
-			out <- dataSSE(chunkResponse(completionID, rec.Model, map[string]any{"role": "assistant"}, nil))
+			if !emitSSE(ctx, out, dataSSE(chunkResponse(completionID, plan.ResponseModel, map[string]any{"role": "assistant"}, nil))) {
+				return
+			}
 			for _, piece := range charChunks(rec.Content, 24) {
-				out <- dataSSE(chunkResponse(completionID, rec.Model, map[string]any{"content": piece}, nil))
+				if !emitSSE(ctx, out, dataSSE(chunkResponse(completionID, plan.ResponseModel, map[string]any{"content": piece}, nil))) {
+					return
+				}
 			}
 			for i, tc := range rec.ToolCalls {
-				out <- dataSSE(chunkResponse(completionID, rec.Model, map[string]any{"tool_calls": []any{chatToolCallDelta(i, tc)}}, nil))
+				if !emitSSE(ctx, out, dataSSE(chunkResponse(completionID, plan.ResponseModel, map[string]any{"tool_calls": []any{chatToolCallDelta(i, tc)}}, nil))) {
+					return
+				}
 			}
-			out <- dataSSE(chunkResponse(completionID, rec.Model, map[string]any{}, rec.FinishReason))
+			if !emitSSE(ctx, out, dataSSE(chunkResponse(completionID, plan.ResponseModel, map[string]any{}, rec.FinishReason))) {
+				return
+			}
 			if plan.IncludeUsage {
-				out <- dataSSE(usageChunkResponse(completionID, rec.Model, rec.Usage))
+				if !emitSSE(ctx, out, dataSSE(usageChunkResponse(completionID, plan.ResponseModel, rec.Usage))) {
+					return
+				}
 			}
-			out <- "data: [DONE]\n\n"
+			if !emitSSE(ctx, out, "data: [DONE]\n\n") {
+				return
+			}
 			g.Meter.Observe(nil, rec.Model, rec.Usage, "hit", true, "")
 			return
 		}
 		account := plan.Account
 		if account == nil {
-			out <- dataSSE(map[string]any{"error": map[string]any{"message": "no account selected", "type": "routing_error"}})
+			emitSSE(ctx, out, dataSSE(map[string]any{"error": map[string]any{"message": "no account selected", "type": "routing_error"}}))
 			return
 		}
 		defer account.Release()
@@ -193,11 +262,13 @@ func (g *Gateway) StreamChat(ctx context.Context, plan Plan) <-chan string {
 		toolCalls := []ToolCall{}
 		usage := Usage{}
 		finish := "stop"
-		out <- dataSSE(chunkResponse(completionID, plan.Model, map[string]any{"role": "assistant"}, nil))
+		if !emitSSE(ctx, out, dataSSE(chunkResponse(completionID, plan.ResponseModel, map[string]any{"role": "assistant"}, nil))) {
+			return
+		}
 		stream, err := account.Backend.ChatStream(ctx, plan.Model, plan.Messages, plan.Params)
 		if err != nil {
 			account.RecordFailure(err.Error())
-			out <- dataSSE(map[string]any{"error": map[string]any{"message": err.Error(), "type": "backend_error"}})
+			emitSSE(ctx, out, dataSSE(map[string]any{"error": map[string]any{"message": err.Error(), "type": "backend_error"}}))
 			id := account.ID()
 			g.Meter.Observe(&id, plan.Model, usage, "miss", false, "backend_error")
 			return
@@ -205,7 +276,7 @@ func (g *Gateway) StreamChat(ctx context.Context, plan Plan) <-chan string {
 		for item := range stream {
 			if item.Err != nil {
 				account.RecordFailure(item.Err.Error())
-				out <- dataSSE(map[string]any{"error": map[string]any{"message": item.Err.Error(), "type": "backend_error"}})
+				emitSSE(ctx, out, dataSSE(map[string]any{"error": map[string]any{"message": item.Err.Error(), "type": "backend_error"}}))
 				id := account.ID()
 				g.Meter.Observe(&id, plan.Model, usage, "miss", false, "backend_error")
 				return
@@ -213,11 +284,15 @@ func (g *Gateway) StreamChat(ctx context.Context, plan Plan) <-chan string {
 			switch item.Kind {
 			case "delta":
 				content += item.Text
-				out <- dataSSE(chunkResponse(completionID, plan.Model, map[string]any{"content": item.Text}, nil))
+				if !emitSSE(ctx, out, dataSSE(chunkResponse(completionID, plan.ResponseModel, map[string]any{"content": item.Text}, nil))) {
+					return
+				}
 			case "tool_call":
 				tc := item.ToolCall.normalized()
 				toolCalls = append(toolCalls, tc)
-				out <- dataSSE(chunkResponse(completionID, plan.Model, map[string]any{"tool_calls": []any{chatToolCallDelta(item.Index, tc)}}, nil))
+				if !emitSSE(ctx, out, dataSSE(chunkResponse(completionID, plan.ResponseModel, map[string]any{"tool_calls": []any{chatToolCallDelta(item.Index, tc)}}, nil))) {
+					return
+				}
 			case "done":
 				usage = item.Usage.Normalized()
 				finish = firstNonEmpty(item.FinishReason, finish)
@@ -226,11 +301,17 @@ func (g *Gateway) StreamChat(ctx context.Context, plan Plan) <-chan string {
 		if len(toolCalls) > 0 {
 			finish = "tool_calls"
 		}
-		out <- dataSSE(chunkResponse(completionID, plan.Model, map[string]any{}, finish))
-		if plan.IncludeUsage {
-			out <- dataSSE(usageChunkResponse(completionID, plan.Model, usage))
+		if !emitSSE(ctx, out, dataSSE(chunkResponse(completionID, plan.ResponseModel, map[string]any{}, finish))) {
+			return
 		}
-		out <- "data: [DONE]\n\n"
+		if plan.IncludeUsage {
+			if !emitSSE(ctx, out, dataSSE(usageChunkResponse(completionID, plan.ResponseModel, usage))) {
+				return
+			}
+		}
+		if !emitSSE(ctx, out, "data: [DONE]\n\n") {
+			return
+		}
 		account.RecordSuccess()
 		g.Cache.Store(plan.CacheKey, CacheRecord{Content: content, Model: plan.Model, FinishReason: finish, Usage: usage, ToolCalls: toolCalls}, plan.Control)
 		id := account.ID()
@@ -247,44 +328,56 @@ func (g *Gateway) StreamResponses(ctx context.Context, plan Plan) <-chan string 
 		seq := 0
 		next := func() int { seq++; return seq }
 		options, _ := plan.Params["response_options"].(map[string]any)
-		out <- namedSSE(responseCreated(responseID, plan.Model, next(), options))
-		out <- namedSSE(responseInProgress(responseID, plan.Model, next(), options))
+		if !emitSSE(ctx, out, namedSSE(responseCreated(responseID, plan.ResponseModel, next(), options))) {
+			return
+		}
+		if !emitSSE(ctx, out, namedSSE(responseInProgress(responseID, plan.ResponseModel, next(), options))) {
+			return
+		}
 		if plan.CacheHit != nil {
 			rec := plan.CacheHit
 			events, output := responseReplayEvents(rec.Content, rec.ToolCalls, &seq)
 			for _, event := range events {
-				out <- namedSSE(event)
+				if !emitSSE(ctx, out, namedSSE(event)) {
+					return
+				}
 			}
 			finish := rec.FinishReason
 			if len(rec.ToolCalls) > 0 {
 				finish = "tool_calls"
 			}
-			out <- namedSSE(responseCompleted(responseID, rec.Model, output, rec.Content, finish, rec.Usage, next(), options, len(rec.ToolCalls) == 0))
+			if !emitSSE(ctx, out, namedSSE(responseCompleted(responseID, plan.ResponseModel, output, rec.Content, finish, rec.Usage, next(), options, len(rec.ToolCalls) == 0))) {
+				return
+			}
 			g.Meter.Observe(nil, rec.Model, rec.Usage, "hit", true, "")
 			return
 		}
 		account := plan.Account
 		if account == nil {
-			out <- namedSSE(map[string]any{"type": "response.failed", "sequence_number": next(), "response": responseObject(responseID, plan.Model, "failed", []any{}, "", "", nil, options, nil), "error": map[string]any{"message": "no account selected"}})
+			emitSSE(ctx, out, namedSSE(map[string]any{"type": "response.failed", "sequence_number": next(), "response": responseObject(responseID, plan.ResponseModel, "failed", []any{}, "", "", nil, options, nil), "error": map[string]any{"message": "no account selected"}}))
 			return
 		}
 		defer account.Release()
 		content, toolCalls, usage, finish, err := consumeStream(ctx, account, plan)
 		if err != nil {
 			account.RecordFailure(err.Error())
-			out <- namedSSE(map[string]any{"type": "response.failed", "sequence_number": next(), "response": responseObject(responseID, plan.Model, "failed", []any{}, "", "", nil, options, nil), "error": map[string]any{"message": err.Error()}})
+			emitSSE(ctx, out, namedSSE(map[string]any{"type": "response.failed", "sequence_number": next(), "response": responseObject(responseID, plan.ResponseModel, "failed", []any{}, "", "", nil, options, nil), "error": map[string]any{"message": err.Error()}}))
 			id := account.ID()
 			g.Meter.Observe(&id, plan.Model, usage, "miss", false, "backend_error")
 			return
 		}
 		events, output := responseReplayEvents(content, toolCalls, &seq)
 		for _, event := range events {
-			out <- namedSSE(event)
+			if !emitSSE(ctx, out, namedSSE(event)) {
+				return
+			}
 		}
 		if len(toolCalls) > 0 {
 			finish = "tool_calls"
 		}
-		out <- namedSSE(responseCompleted(responseID, plan.Model, output, content, finish, usage, next(), options, len(toolCalls) == 0))
+		if !emitSSE(ctx, out, namedSSE(responseCompleted(responseID, plan.ResponseModel, output, content, finish, usage, next(), options, len(toolCalls) == 0))) {
+			return
+		}
 		account.RecordSuccess()
 		g.Cache.Store(plan.CacheKey, CacheRecord{Content: content, Model: plan.Model, FinishReason: finish, Usage: usage, ToolCalls: toolCalls}, plan.Control)
 		id := account.ID()
@@ -301,42 +394,58 @@ func (g *Gateway) StreamAnthropic(ctx context.Context, plan Plan) <-chan string 
 		options, _ := plan.Params["response_options"].(map[string]any)
 		if plan.CacheHit != nil {
 			rec := plan.CacheHit
-			out <- namedSSE(anthropicMessageStart(messageID, rec.Model, rec.Usage, options))
+			if !emitSSE(ctx, out, namedSSE(anthropicMessageStart(messageID, plan.ResponseModel, rec.Usage, options))) {
+				return
+			}
 			for _, event := range anthropicReplayEvents(rec.Content, rec.ToolCalls) {
-				out <- namedSSE(event)
+				if !emitSSE(ctx, out, namedSSE(event)) {
+					return
+				}
 			}
 			finish := rec.FinishReason
 			if len(rec.ToolCalls) > 0 {
 				finish = "tool_calls"
 			}
-			out <- namedSSE(anthropicMessageDelta(finish, rec.Usage, options))
-			out <- namedSSE(map[string]any{"type": "message_stop"})
+			if !emitSSE(ctx, out, namedSSE(anthropicMessageDelta(finish, rec.Usage, options))) {
+				return
+			}
+			if !emitSSE(ctx, out, namedSSE(map[string]any{"type": "message_stop"})) {
+				return
+			}
 			g.Meter.Observe(nil, rec.Model, rec.Usage, "hit", true, "")
 			return
 		}
 		account := plan.Account
 		if account == nil {
-			out <- namedSSE(map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": "no account selected"}})
+			emitSSE(ctx, out, namedSSE(map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": "no account selected"}}))
 			return
 		}
 		defer account.Release()
-		out <- namedSSE(anthropicMessageStart(messageID, plan.Model, Usage{}, options))
+		if !emitSSE(ctx, out, namedSSE(anthropicMessageStart(messageID, plan.ResponseModel, Usage{}, options))) {
+			return
+		}
 		content, toolCalls, usage, finish, err := consumeStream(ctx, account, plan)
 		if err != nil {
 			account.RecordFailure(err.Error())
-			out <- namedSSE(map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": err.Error()}})
+			emitSSE(ctx, out, namedSSE(map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": err.Error()}}))
 			id := account.ID()
 			g.Meter.Observe(&id, plan.Model, usage, "miss", false, "backend_error")
 			return
 		}
 		for _, event := range anthropicReplayEvents(content, toolCalls) {
-			out <- namedSSE(event)
+			if !emitSSE(ctx, out, namedSSE(event)) {
+				return
+			}
 		}
 		if len(toolCalls) > 0 {
 			finish = "tool_calls"
 		}
-		out <- namedSSE(anthropicMessageDelta(finish, usage, options))
-		out <- namedSSE(map[string]any{"type": "message_stop"})
+		if !emitSSE(ctx, out, namedSSE(anthropicMessageDelta(finish, usage, options))) {
+			return
+		}
+		if !emitSSE(ctx, out, namedSSE(map[string]any{"type": "message_stop"})) {
+			return
+		}
 		account.RecordSuccess()
 		g.Cache.Store(plan.CacheKey, CacheRecord{Content: content, Model: plan.Model, FinishReason: finish, Usage: usage, ToolCalls: toolCalls}, plan.Control)
 		id := account.ID()
@@ -379,6 +488,15 @@ func dataSSE(obj any) string {
 func namedSSE(obj map[string]any) string {
 	data, _ := json.Marshal(obj)
 	return "event: " + stringFromAny(obj["type"]) + "\ndata: " + string(data) + "\n\n"
+}
+
+func emitSSE(ctx context.Context, out chan<- string, chunk string) bool {
+	select {
+	case out <- chunk:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func chatToolCallDelta(index int, tc ToolCall) map[string]any {

@@ -2,24 +2,91 @@ package gateway
 
 import (
 	"context"
+	"math"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
 
+type TokenBucket struct {
+	RPM       int
+	tokens    float64
+	updatedAt time.Time
+	mu        sync.Mutex
+}
+
+func NewTokenBucket(rpm int) *TokenBucket {
+	if rpm <= 0 {
+		return nil
+	}
+	return &TokenBucket{RPM: rpm, tokens: float64(rpm), updatedAt: time.Now()}
+}
+
+func (b *TokenBucket) refillLocked(now time.Time) {
+	if b == nil || b.RPM <= 0 {
+		return
+	}
+	elapsed := now.Sub(b.updatedAt).Seconds()
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	b.tokens = math.Min(float64(b.RPM), b.tokens+elapsed*(float64(b.RPM)/60.0))
+	b.updatedAt = now
+}
+
+func (b *TokenBucket) Available() bool {
+	if b == nil {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.refillLocked(time.Now())
+	return b.tokens >= 1
+}
+
+func (b *TokenBucket) Consume() bool {
+	if b == nil {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.refillLocked(time.Now())
+	if b.tokens >= 1 {
+		b.tokens--
+		return true
+	}
+	return false
+}
+
+func (b *TokenBucket) RetryAfter() float64 {
+	if b == nil || b.RPM <= 0 {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.refillLocked(time.Now())
+	if b.tokens >= 1 {
+		return 0
+	}
+	return math.Ceil((1 - b.tokens) / (float64(b.RPM) / 60.0))
+}
+
 type Account struct {
-	Config      *AccountConfig
-	Backend     Backend
-	Enabled     bool
-	Models      []string
-	HomeDir     string
-	Started     bool
-	LastError   string
-	Cooldown    time.Time
-	Failures    int
-	InFlight    int
-	mu          sync.Mutex
-	maxParallel chan struct{}
+	Config            *AccountConfig
+	Backend           Backend
+	Enabled           bool
+	Models            []string
+	HomeDir           string
+	Started           bool
+	LastError         string
+	Cooldown          time.Time
+	Failures          int
+	InFlight          int
+	RateLimiter       *TokenBucket
+	LastRateLimitedAt time.Time
+	mu                sync.Mutex
+	maxParallel       chan struct{}
 }
 
 func (a *Account) ID() string { return a.Config.ID }
@@ -40,8 +107,20 @@ func (a *Account) Weight() int {
 
 func (a *Account) Available() bool {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.Enabled && time.Now().After(a.Cooldown) && a.InFlight < a.MaxConcurrency()
+	ok := a.Enabled && time.Now().After(a.Cooldown) && a.InFlight < a.MaxConcurrency()
+	a.mu.Unlock()
+	return ok && (a.RateLimiter == nil || a.RateLimiter.Available())
+}
+
+func (a *Account) RateRetryAfter() float64 {
+	if a.RateLimiter == nil {
+		return 0
+	}
+	return a.RateLimiter.RetryAfter()
+}
+
+func (a *Account) IsRateLimited() bool {
+	return a.RateRetryAfter() > 0
 }
 
 func (a *Account) AllowsModel(model string) bool {
@@ -67,6 +146,9 @@ func (a *Account) TryAcquire() bool {
 	if !a.Enabled || time.Now().Before(a.Cooldown) || a.InFlight >= a.MaxConcurrency() {
 		return false
 	}
+	if a.RateLimiter != nil && !a.RateLimiter.Consume() {
+		return false
+	}
 	a.InFlight++
 	return true
 }
@@ -90,7 +172,12 @@ func (a *Account) RecordFailure(message string) {
 	a.mu.Lock()
 	a.Failures++
 	a.LastError = message
-	backoff := time.Duration(min(a.Failures*30, 300)) * time.Second
+	base := 30
+	if isRateLimitError(message) {
+		base = 120
+		a.LastRateLimitedAt = time.Now()
+	}
+	backoff := time.Duration(min(a.Failures*base, 300)) * time.Second
 	a.Cooldown = time.Now().Add(backoff)
 	a.mu.Unlock()
 }
@@ -112,6 +199,10 @@ func (a *Account) Status() map[string]any {
 		"auth_method":          a.Config.AuthMethod(),
 		"authenticated":        a.authenticated(),
 		"started":              a.Started,
+		"rate_limit_rpm":       rateLimitRPM(a.RateLimiter),
+		"rate_limited":         a.IsRateLimited(),
+		"rate_retry_after":     a.RateRetryAfter(),
+		"last_rate_limited_at": nilIfZeroTime(a.LastRateLimitedAt),
 	}
 }
 
@@ -127,17 +218,19 @@ func (a *Account) authenticated() bool {
 }
 
 type PoolManager struct {
-	Settings Settings
-	Homes    *HomeRegistry
-	Accounts map[string]*Account
-	mu       sync.RWMutex
+	Settings          Settings
+	Homes             *HomeRegistry
+	Accounts          map[string]*Account
+	GlobalRateLimiter *TokenBucket
+	mu                sync.RWMutex
 }
 
 func NewPoolManager(settings Settings) (*PoolManager, error) {
 	pm := &PoolManager{
-		Settings: settings,
-		Homes:    NewHomeRegistry(settings.HomeRoot),
-		Accounts: map[string]*Account{},
+		Settings:          settings,
+		Homes:             NewHomeRegistry(settings.HomeRoot),
+		Accounts:          map[string]*Account{},
+		GlobalRateLimiter: NewTokenBucket(settings.RateLimits.GlobalRPM),
 	}
 	for i := range settings.Accounts {
 		cfg := settings.Accounts[i]
@@ -159,16 +252,51 @@ func (p *PoolManager) install(cfg *AccountConfig) (*Account, error) {
 	}
 	backend := buildBackend(cfg, p.Settings, home)
 	account := &Account{
-		Config:  cfg,
-		Backend: backend,
-		Enabled: cfg.enabled(),
-		Models:  append([]string{}, cfg.Models...),
-		HomeDir: home,
+		Config:      cfg,
+		Backend:     backend,
+		Enabled:     cfg.enabled(),
+		Models:      append([]string{}, cfg.Models...),
+		HomeDir:     home,
+		RateLimiter: NewTokenBucket(p.accountRateLimit(cfg)),
 	}
 	p.mu.Lock()
 	p.Accounts[cfg.ID] = account
 	p.mu.Unlock()
 	return account, nil
+}
+
+func (p *PoolManager) accountRateLimit(cfg *AccountConfig) int {
+	if cfg.RateLimitRPM != nil {
+		return *cfg.RateLimitRPM
+	}
+	return p.Settings.RateLimits.PerAccountRPM
+}
+
+func (p *PoolManager) TryAcquire(account *Account) bool {
+	if account == nil || !account.Available() {
+		return false
+	}
+	if p.GlobalRateLimiter != nil && !p.GlobalRateLimiter.Consume() {
+		return false
+	}
+	return account.TryAcquire()
+}
+
+func (p *PoolManager) GlobalRetryAfter() float64 {
+	if p.GlobalRateLimiter == nil {
+		return 0
+	}
+	return p.GlobalRateLimiter.RetryAfter()
+}
+
+func (p *PoolManager) ConfigureRateLimits(config RateLimitConfig) {
+	p.Settings.RateLimits = config
+	p.GlobalRateLimiter = NewTokenBucket(config.GlobalRPM)
+	for _, account := range p.Snapshot() {
+		account.mu.Lock()
+		account.RateLimiter = NewTokenBucket(p.accountRateLimit(account.Config))
+		account.mu.Unlock()
+	}
 }
 
 func buildBackend(cfg *AccountConfig, settings Settings, homeDir string) Backend {
@@ -317,6 +445,18 @@ func (p *PoolManager) RebuildBackend(ctx context.Context, id string) (*Account, 
 		}
 	}
 	return account, nil
+}
+
+func isRateLimitError(message string) bool {
+	text := strings.ToLower(message)
+	return strings.Contains(text, "429") || strings.Contains(text, "too many requests") || strings.Contains(text, "rate limit")
+}
+
+func rateLimitRPM(bucket *TokenBucket) int {
+	if bucket == nil {
+		return 0
+	}
+	return bucket.RPM
 }
 
 func nilIfEmptyString(value string) any {

@@ -46,6 +46,12 @@ type ChatResult struct {
 	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
 }
 
+type EmbeddingResult struct {
+	Model      string      `json:"model"`
+	Embeddings [][]float64 `json:"embeddings"`
+	Usage      Usage       `json:"usage"`
+}
+
 type StreamItem struct {
 	Kind         string
 	Text         string
@@ -57,8 +63,9 @@ type StreamItem struct {
 }
 
 type ModelSpec struct {
-	ID           string         `json:"id"`
-	Capabilities map[string]any `json:"capabilities,omitempty"`
+	ID                 string         `json:"id"`
+	SupportedEndpoints []string       `json:"supported_endpoints,omitempty"`
+	Capabilities       map[string]any `json:"capabilities,omitempty"`
 }
 
 type CacheRecord struct {
@@ -136,6 +143,9 @@ type ChatCompletionRequest struct {
 	ResponseOptions   map[string]any   `json:"response_options,omitempty"`
 	Cache             string           `json:"cache,omitempty"`
 	ReasoningEffort   string           `json:"reasoning_effort,omitempty"`
+
+	PreferredEndpoint string   `json:"-"`
+	FallbackEndpoints []string `json:"-"`
 }
 
 func (r ChatCompletionRequest) SamplingParams() map[string]any {
@@ -178,25 +188,55 @@ func (r ChatCompletionRequest) NeutralMessages() []NeutralMessage {
 	return out
 }
 
+func (r ChatCompletionRequest) EndpointPreferences() []string {
+	preferred := r.PreferredEndpoint
+	if preferred == "" {
+		preferred = endpointChatCompletions
+	}
+	out := []string{preferred}
+	for _, endpoint := range r.FallbackEndpoints {
+		if endpoint == "" {
+			continue
+		}
+		seen := false
+		for _, existing := range out {
+			if endpointMatches(existing, endpoint) {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			out = append(out, endpoint)
+		}
+	}
+	return out
+}
+
 type Plan struct {
-	Model        string
-	Messages     []NeutralMessage
-	Params       map[string]any
-	CacheKey     string
-	Control      string
-	Namespace    string
-	CacheHit     *CacheRecord
-	Account      *Account
-	IncludeUsage bool
+	Model         string
+	ResponseModel string
+	Endpoint      string
+	Messages      []NeutralMessage
+	Params        map[string]any
+	CacheKey      string
+	Control       string
+	Namespace     string
+	CacheHit      *CacheRecord
+	Account       *Account
+	IncludeUsage  bool
 }
 
 func (p Plan) Headers() map[string]string {
+	responseModel := firstNonEmpty(p.ResponseModel, p.Model)
 	headers := map[string]string{
-		"x-ghcp-model":              p.Model,
-		"openai-model":              p.Model,
-		"x-openai-model":            p.Model,
+		"x-ghcp-model":              responseModel,
+		"openai-model":              responseModel,
+		"x-openai-model":            responseModel,
 		"request-id":                newID("req"),
 		"anthropic-organization-id": "ghcp-pool",
+	}
+	if responseModel != p.Model {
+		headers["x-ghcp-upstream-model"] = p.Model
 	}
 	if p.CacheHit != nil {
 		headers["x-ghcp-account"] = "cache"

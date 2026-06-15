@@ -59,6 +59,29 @@ func envBool(name string, fallback bool) bool {
 	return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
 }
 
+func intFromAny(value any, fallback int) int {
+	switch v := value.(type) {
+	case nil:
+		return fallback
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return int(n)
+		}
+		return fallback
+	default:
+		if n, err := strconv.Atoi(fmt.Sprint(v)); err == nil {
+			return n
+		}
+		return fallback
+	}
+}
+
 func ptrValue[T any](ptr *T) any {
 	if ptr == nil {
 		return nil
@@ -71,6 +94,13 @@ func emptyToNil(value string) any {
 		return nil
 	}
 	return value
+}
+
+func nilIfZeroTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t.Format(time.RFC3339)
 }
 
 func nilIfEmptyMap(m map[string]any) any {

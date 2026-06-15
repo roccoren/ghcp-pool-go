@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -37,6 +38,7 @@ type AccountConfig struct {
 	Enabled             *bool    `yaml:"enabled" json:"enabled"`
 	MaxConcurrency      int      `yaml:"max_concurrency" json:"max_concurrency"`
 	Weight              int      `yaml:"weight" json:"weight"`
+	RateLimitRPM        *int     `yaml:"rate_limit_rpm" json:"rate_limit_rpm"`
 	Allow               []string `yaml:"allow" json:"allow"`
 	Deny                []string `yaml:"deny" json:"deny"`
 	Models              []string `yaml:"models" json:"models"`
@@ -98,6 +100,11 @@ type RouteConfig struct {
 	Priority int      `yaml:"priority" json:"priority"`
 }
 
+type RateLimitConfig struct {
+	GlobalRPM     int `yaml:"global_rpm" json:"global_rpm"`
+	PerAccountRPM int `yaml:"per_account_rpm" json:"per_account_rpm"`
+}
+
 type CacheConfig struct {
 	Enabled    *bool  `yaml:"enabled" json:"enabled"`
 	TTLSeconds int    `yaml:"ttl_seconds" json:"ttl_seconds"`
@@ -133,6 +140,8 @@ type GatewayConfig struct {
 	KeyVaultURL          string            `yaml:"key_vault_url" json:"key_vault_url"`
 	HomeRoot             string            `yaml:"home_root" json:"home_root"`
 	RouteBusyWaitSeconds float64           `yaml:"route_busy_wait_seconds" json:"route_busy_wait_seconds"`
+	ModelAliases         map[string]string `yaml:"model_aliases" json:"model_aliases"`
+	RateLimits           RateLimitConfig   `yaml:"rate_limits" json:"rate_limits"`
 	APIKeys              []APIKeyConfig    `yaml:"api_keys" json:"api_keys"`
 	Cache                CacheConfig       `yaml:"cache" json:"cache"`
 	Usage                UsageConfig       `yaml:"usage" json:"usage"`
@@ -157,6 +166,8 @@ type Settings struct {
 	KeyVaultURL          string
 	HomeRoot             string
 	RouteBusyWaitSeconds float64
+	ModelAliases         map[string]string
+	RateLimits           RateLimitConfig
 	APIKeys              []APIKeyConfig
 	Accounts             []AccountConfig
 	Routes               []RouteConfig
@@ -169,6 +180,30 @@ type Settings struct {
 
 func (s Settings) Addr() string {
 	return net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
+}
+
+func (s Settings) ResolveModelAlias(model string) string {
+	if s.ModelAliases == nil {
+		return model
+	}
+	if target := s.ModelAliases[model]; target != "" {
+		return target
+	}
+	return model
+}
+
+func (s Settings) DisplayIDsForModel(model string) []string {
+	aliases := []string{}
+	for alias, target := range s.ModelAliases {
+		if target == model {
+			aliases = append(aliases, alias)
+		}
+	}
+	if len(aliases) == 0 {
+		return []string{model}
+	}
+	sort.Strings(aliases)
+	return aliases
 }
 
 func LoadSettings(path string) (Settings, error) {
@@ -194,14 +229,26 @@ func LoadSettings(path string) (Settings, error) {
 		KeyVaultURL:          firstNonEmpty(os.Getenv("AZURE_KEY_VAULT_URL"), g.KeyVaultURL),
 		HomeRoot:             firstNonEmpty(os.Getenv("GHCP_HOME_ROOT"), g.HomeRoot, "runtime-home"),
 		RouteBusyWaitSeconds: firstFloat("", g.RouteBusyWaitSeconds, 4.0),
-		APIKeys:              g.APIKeys,
-		Accounts:             raw.Accounts,
-		Routes:               raw.Routes,
-		Cache:                g.Cache,
-		Usage:                g.Usage,
-		Login:                g.Login,
-		Debug:                g.Debug,
-		ReasoningEfforts:     map[string]string{},
+		ModelAliases:         map[string]string{},
+		RateLimits: RateLimitConfig{
+			GlobalRPM:     firstInt(os.Getenv("GHCP_GLOBAL_RATE_LIMIT_RPM"), g.RateLimits.GlobalRPM),
+			PerAccountRPM: firstInt(os.Getenv("GHCP_PER_ACCOUNT_RATE_LIMIT_RPM"), g.RateLimits.PerAccountRPM),
+		},
+		APIKeys:          g.APIKeys,
+		Accounts:         raw.Accounts,
+		Routes:           raw.Routes,
+		Cache:            g.Cache,
+		Usage:            g.Usage,
+		Login:            g.Login,
+		Debug:            g.Debug,
+		ReasoningEfforts: map[string]string{},
+	}
+	for alias, target := range g.ModelAliases {
+		alias = strings.TrimSpace(alias)
+		target = strings.TrimSpace(target)
+		if alias != "" && target != "" {
+			settings.ModelAliases[alias] = target
+		}
 	}
 	if settings.Cache.TTLSeconds == 0 {
 		settings.Cache.TTLSeconds = 3600

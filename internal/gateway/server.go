@@ -21,6 +21,10 @@ func NewServer(gw *Gateway) http.Handler {
 	mux.HandleFunc("POST /v1/chat/completions", s.chatCompletions)
 	mux.HandleFunc("POST /v1/responses", s.responses)
 	mux.HandleFunc("POST /v1/messages", s.anthropicMessages)
+	mux.HandleFunc("POST /v1/messages/count_tokens", s.anthropicCountTokens)
+	mux.HandleFunc("POST /v1/embeddings", s.embeddings)
+	mux.HandleFunc("GET /v1beta/models", s.geminiModels)
+	mux.HandleFunc("POST /v1beta/models/{model_action...}", s.geminiModelAction)
 	mux.HandleFunc("GET /admin/accounts", s.adminAccounts)
 	mux.HandleFunc("POST /admin/accounts/{account_id}/enable", s.adminAccountEnable)
 	mux.HandleFunc("POST /admin/accounts/{account_id}/disable", s.adminAccountDisable)
@@ -41,6 +45,10 @@ func NewServer(gw *Gateway) http.Handler {
 	mux.HandleFunc("GET /admin/routes", s.adminRoutes)
 	mux.HandleFunc("PUT /admin/routes", s.adminSetRoutes)
 	mux.HandleFunc("GET /admin/routes/resolve", s.adminRoutesResolve)
+	mux.HandleFunc("GET /admin/model-aliases", s.adminModelAliases)
+	mux.HandleFunc("PUT /admin/model-aliases", s.adminSetModelAliases)
+	mux.HandleFunc("GET /admin/rate-limits", s.adminRateLimits)
+	mux.HandleFunc("PUT /admin/rate-limits", s.adminSetRateLimits)
 	mux.HandleFunc("GET /admin/reasoning-efforts", s.adminReasoningEfforts)
 	mux.HandleFunc("PUT /admin/reasoning-efforts", s.adminSetReasoningEfforts)
 	mux.HandleFunc("GET /admin/usage", s.adminUsage)
@@ -91,7 +99,9 @@ func (s *server) listModels(w http.ResponseWriter, r *http.Request) {
 	data := []any{}
 	for _, model := range s.gw.Registry.VisibleModels() {
 		if p.MayUseModel(model) {
-			data = append(data, map[string]any{"id": model, "object": "model", "created": nowUnixInt(), "owned_by": "github-copilot"})
+			for _, displayID := range s.gw.Settings.DisplayIDsForModel(model) {
+				data = append(data, map[string]any{"id": displayID, "object": "model", "created": nowUnixInt(), "owned_by": "github-copilot"})
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data}, nil)
@@ -106,7 +116,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	if !p.MayUseModel(body.Model) {
+	body.PreferredEndpoint = endpointChatCompletions
+	body.FallbackEndpoints = []string{endpointResponses}
+	if !s.modelAllowed(w, body.Model, p) {
 		writeError(w, http.StatusForbidden, "model not allowed: "+body.Model)
 		return
 	}
@@ -116,7 +128,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Stream {
-		writeStream(w, plan.Headers(), s.gw.StreamChat(r.Context(), plan))
+		ctx, cancel := context.WithCancel(r.Context())
+		writeStream(w, plan.Headers(), s.gw.StreamChat(ctx, plan), cancel)
 		return
 	}
 	result, accountID, err := s.gw.CompleteResult(r.Context(), plan)
@@ -138,12 +151,10 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	if !strings.HasPrefix(strings.ToLower(body.Model), "gpt") {
-		writeError(w, http.StatusBadRequest, "/v1/responses is only available for gpt* models")
-		return
-	}
 	chat := body.ToChatRequest()
-	if !p.MayUseModel(chat.Model) {
+	chat.PreferredEndpoint = endpointResponses
+	chat.FallbackEndpoints = []string{endpointChatCompletions, endpointMessages}
+	if !s.modelAllowed(w, chat.Model, p) {
 		writeError(w, http.StatusForbidden, "model not allowed: "+chat.Model)
 		return
 	}
@@ -153,7 +164,8 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Stream {
-		writeStream(w, plan.Headers(), s.gw.StreamResponses(r.Context(), plan))
+		ctx, cancel := context.WithCancel(r.Context())
+		writeStream(w, plan.Headers(), s.gw.StreamResponses(ctx, plan), cancel)
 		return
 	}
 	result, accountID, err := s.gw.CompleteResult(r.Context(), plan)
@@ -175,7 +187,8 @@ func (s *server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	if !strings.HasPrefix(strings.ToLower(body.Model), "claude") {
+	resolvedModel := s.gw.Settings.ResolveModelAlias(body.Model)
+	if !strings.HasPrefix(strings.ToLower(resolvedModel), "claude") {
 		writeError(w, http.StatusBadRequest, "/v1/messages is only available for claude* models")
 		return
 	}
@@ -184,7 +197,9 @@ func (s *server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	chat := body.ToChatRequest()
-	if !p.MayUseModel(chat.Model) {
+	chat.PreferredEndpoint = endpointMessages
+	chat.FallbackEndpoints = []string{endpointResponses, endpointChatCompletions}
+	if !s.modelAllowed(w, chat.Model, p) {
 		writeError(w, http.StatusForbidden, "model not allowed: "+chat.Model)
 		return
 	}
@@ -194,7 +209,8 @@ func (s *server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Stream {
-		writeStream(w, plan.Headers(), s.gw.StreamAnthropic(r.Context(), plan))
+		ctx, cancel := context.WithCancel(r.Context())
+		writeStream(w, plan.Headers(), s.gw.StreamAnthropic(ctx, plan), cancel)
 		return
 	}
 	result, accountID, err := s.gw.CompleteResult(r.Context(), plan)
@@ -205,6 +221,78 @@ func (s *server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	headers := plan.Headers()
 	headers["x-ghcp-account"] = accountID
 	writeJSON(w, http.StatusOK, anthropicResponse(result.Model, result.Content, result.FinishReason, result.Usage, result.ToolCalls, chat.ResponseOptions), headers)
+}
+
+func (s *server) anthropicCountTokens(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.require(w, r, "inference")
+	if !ok {
+		return
+	}
+	var body AnthropicMessagesRequest
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	resolvedModel := s.gw.Settings.ResolveModelAlias(body.Model)
+	if !p.MayUseModel(resolvedModel) {
+		writeError(w, http.StatusForbidden, "model not allowed: "+body.Model)
+		return
+	}
+	if !strings.HasPrefix(strings.ToLower(resolvedModel), "claude") {
+		writeError(w, http.StatusBadRequest, "/v1/messages/count_tokens is only available for claude* models")
+		return
+	}
+	if s.gw.Registry.LastRefresh > 0 && len(s.gw.Registry.AccountsFor(resolvedModel)) == 0 {
+		writeError(w, http.StatusNotFound, "no account serves model "+resolvedModel)
+		return
+	}
+	chat := body.ToChatRequest()
+	inputTokens, internalModel := s.gw.EstimateInputTokens(chat)
+	headers := map[string]string{
+		"x-ghcp-model":              body.Model,
+		"request-id":                newID("req"),
+		"anthropic-organization-id": "ghcp-pool",
+	}
+	if body.Model != internalModel {
+		headers["x-ghcp-upstream-model"] = internalModel
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": inputTokens}, headers)
+}
+
+func (s *server) embeddings(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.require(w, r, "inference")
+	if !ok {
+		return
+	}
+	var body EmbeddingsRequest
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if !s.modelAllowed(w, body.Model, p) {
+		writeError(w, http.StatusForbidden, "model not allowed: "+body.Model)
+		return
+	}
+	inputs := body.InputTexts()
+	if len(inputs) == 0 {
+		writeError(w, http.StatusBadRequest, "embeddings input must not be empty")
+		return
+	}
+	result, _, headers, err := s.gw.CreateEmbeddings(r.Context(), body.Model, inputs, body.Params())
+	if err != nil {
+		var noAccount NoAccountForModel
+		var rateLimit RateLimitExceeded
+		switch {
+		case errors.Is(err, ErrEmbeddingsUnsupported):
+			writeError(w, http.StatusNotImplemented, err.Error())
+		case errors.As(err, &noAccount):
+			writeError(w, http.StatusNotFound, err.Error())
+		case errors.As(err, &rateLimit):
+			writeErrorWithHeaders(w, http.StatusTooManyRequests, err.Error(), map[string]string{"Retry-After": strconv.Itoa(int(rateLimit.RetryAfter))})
+		default:
+			writeError(w, http.StatusBadGateway, "backend error: "+err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, embeddingResponse(result.Model, result.Embeddings, result.Usage), headers)
 }
 
 func (s *server) adminAccounts(w http.ResponseWriter, r *http.Request) {
@@ -297,6 +385,7 @@ func (s *server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 		BaseDirectory:  baseDir,
 		MaxConcurrency: intFromPayload(payload["max_concurrency"], 32),
 		Weight:         intFromPayload(payload["weight"], 1),
+		RateLimitRPM:   intPtrFromPayload(payload["rate_limit_rpm"]),
 		Allow:          stringSliceFromAny(firstAny(payload["allow"], []any{"*"})),
 		Deny:           stringSliceFromAny(payload["deny"]),
 		Models:         stringSliceFromAny(payload["models"]),
@@ -456,7 +545,7 @@ func (s *server) adminModels(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.require(w, r, "admin"); !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"last_refresh": s.gw.Registry.LastRefresh, "refresh_interval_seconds": s.gw.Settings.ModelRefreshSeconds, "models_count": len(s.gw.Registry.AllModels()), "models": s.gw.Registry.ModelsIndex()}, nil)
+	writeJSON(w, http.StatusOK, map[string]any{"last_refresh": s.gw.Registry.LastRefresh, "refresh_interval_seconds": s.gw.Settings.ModelRefreshSeconds, "models_count": len(s.gw.Registry.AllModels()), "models": s.gw.Registry.ModelsIndex(), "capabilities": s.gw.Registry.CapabilitiesIndex(), "model_aliases": s.gw.Settings.ModelAliases}, nil)
 }
 
 func (s *server) adminModelsRefresh(w http.ResponseWriter, r *http.Request) {
@@ -516,7 +605,84 @@ func (s *server) adminRoutesResolve(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.require(w, r, "admin"); !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, s.gw.Router.Explain(r.URL.Query().Get("model")), nil)
+	requested := r.URL.Query().Get("model")
+	resolved := s.gw.Settings.ResolveModelAlias(requested)
+	endpoint := r.URL.Query().Get("endpoint")
+	info := s.gw.Router.ExplainEndpoint(resolved, endpoint)
+	if endpoint != "" {
+		info["selected_endpoint"] = s.gw.Registry.PickEndpoint(resolved, []string{endpoint})
+	}
+	info["requested_model"] = requested
+	info["resolved_model"] = resolved
+	writeJSON(w, http.StatusOK, info, nil)
+}
+
+func (s *server) adminModelAliases(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, "admin"); !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"model_aliases": s.gw.Settings.ModelAliases}, nil)
+}
+
+func (s *server) adminSetModelAliases(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, "admin"); !ok {
+		return
+	}
+	var payload map[string]string
+	if !decodeJSON(w, r, &payload) {
+		return
+	}
+	aliases := map[string]string{}
+	for alias, target := range payload {
+		alias = strings.TrimSpace(alias)
+		target = strings.TrimSpace(target)
+		if alias == "" || target == "" {
+			writeError(w, http.StatusBadRequest, "alias and target must be non-empty")
+			return
+		}
+		aliases[alias] = target
+	}
+	s.gw.Settings.ModelAliases = aliases
+	writeJSON(w, http.StatusOK, map[string]any{"updated": len(aliases), "model_aliases": aliases}, nil)
+}
+
+func (s *server) adminRateLimits(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, "admin"); !ok {
+		return
+	}
+	accounts := []any{}
+	for _, account := range s.gw.Pool.Snapshot() {
+		accounts = append(accounts, account.Status())
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"rate_limits": map[string]any{
+			"global_rpm":      s.gw.Settings.RateLimits.GlobalRPM,
+			"per_account_rpm": s.gw.Settings.RateLimits.PerAccountRPM,
+		},
+		"global_retry_after": s.gw.Pool.GlobalRetryAfter(),
+		"accounts":           accounts,
+	}, nil)
+}
+
+func (s *server) adminSetRateLimits(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, "admin"); !ok {
+		return
+	}
+	var payload map[string]any
+	if !decodeJSON(w, r, &payload) {
+		return
+	}
+	cfg := RateLimitConfig{
+		GlobalRPM:     intFromAny(firstAny(payload["global_rpm"], s.gw.Settings.RateLimits.GlobalRPM), s.gw.Settings.RateLimits.GlobalRPM),
+		PerAccountRPM: intFromAny(firstAny(payload["per_account_rpm"], s.gw.Settings.RateLimits.PerAccountRPM), s.gw.Settings.RateLimits.PerAccountRPM),
+	}
+	if cfg.GlobalRPM < 0 || cfg.PerAccountRPM < 0 {
+		writeError(w, http.StatusBadRequest, "rate limits must be >= 0")
+		return
+	}
+	s.gw.Pool.ConfigureRateLimits(cfg)
+	s.gw.Settings.RateLimits = cfg
+	writeJSON(w, http.StatusOK, map[string]any{"updated": true, "rate_limits": map[string]any{"global_rpm": cfg.GlobalRPM, "per_account_rpm": cfg.PerAccountRPM}}, nil)
 }
 
 func (s *server) adminReasoningEfforts(w http.ResponseWriter, r *http.Request) {
@@ -660,7 +826,7 @@ func (s *server) adminDebugClear(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) require(w http.ResponseWriter, r *http.Request, scope string) (Principal, bool) {
-	key := firstNonEmpty(r.Header.Get("Authorization"), r.Header.Get("x-api-key"))
+	key := firstNonEmpty(r.Header.Get("Authorization"), r.Header.Get("x-api-key"), r.Header.Get("x-goog-api-key"), r.URL.Query().Get("key"))
 	principal, ok := s.gw.Authenticator.Authenticate(key)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "invalid or missing API key")
@@ -673,12 +839,19 @@ func (s *server) require(w http.ResponseWriter, r *http.Request, scope string) (
 	return principal, true
 }
 
+func (s *server) modelAllowed(_ http.ResponseWriter, requested string, principal Principal) bool {
+	return principal.MayUseModel(s.gw.Settings.ResolveModelAlias(requested))
+}
+
 func (s *server) writeInferenceError(w http.ResponseWriter, err error) {
 	var noAccount NoAccountForModel
 	var routeErr RoutingError
+	var rateLimit RateLimitExceeded
 	switch {
 	case errors.As(err, &noAccount):
 		writeError(w, http.StatusNotFound, err.Error())
+	case errors.As(err, &rateLimit):
+		writeErrorWithHeaders(w, http.StatusTooManyRequests, err.Error(), map[string]string{"Retry-After": strconv.Itoa(int(rateLimit.RetryAfter))})
 	case errors.As(err, &routeErr):
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 	default:
@@ -718,17 +891,32 @@ func writeError(w http.ResponseWriter, status int, detail string) {
 	writeJSON(w, status, map[string]any{"detail": detail}, nil)
 }
 
-func writeStream(w http.ResponseWriter, headers map[string]string, stream <-chan string) {
+func writeErrorWithHeaders(w http.ResponseWriter, status int, detail string, headers map[string]string) {
+	writeJSON(w, status, map[string]any{"detail": detail}, headers)
+}
+
+func writeStream(w http.ResponseWriter, headers map[string]string, stream <-chan string, cancel context.CancelFunc) {
+	defer cancel()
 	for key, value := range headers {
 		w.Header().Set(key, value)
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
 	w.WriteHeader(http.StatusOK)
-	flusher, _ := w.(http.Flusher)
+	flusher.Flush()
 	for chunk := range stream {
-		_, _ = w.Write([]byte(chunk))
-		if flusher != nil {
+		if _, err := w.Write([]byte(chunk)); err != nil {
+			cancel()
+			return
+		}
+		if strings.HasSuffix(chunk, "\n\n") {
 			flusher.Flush()
 		}
 	}
@@ -763,6 +951,14 @@ func intFromPayload(value any, fallback int) int {
 	default:
 		return fallback
 	}
+}
+
+func intPtrFromPayload(value any) *int {
+	if value == nil {
+		return nil
+	}
+	v := intFromAny(value, 0)
+	return &v
 }
 
 func stringSliceFromAny(value any) []string {
