@@ -150,6 +150,7 @@ type ChatCompletionRequest struct {
 	PreferredEndpoint string         `json:"-"`
 	FallbackEndpoints []string       `json:"-"`
 	AnthropicRaw      map[string]any `json:"-"`
+	ResponsesRaw      map[string]any `json:"-"`
 }
 
 func (r ChatCompletionRequest) SamplingParams() map[string]any {
@@ -168,6 +169,7 @@ func (r ChatCompletionRequest) SamplingParams() map[string]any {
 		"parallel_tool_calls":     ptrValue(r.ParallelToolCalls),
 		"response_options":        nilIfEmptyMap(r.ResponseOptions),
 		internalAnthropicRawParam: nilIfEmptyMap(r.AnthropicRaw),
+		internalResponsesRawParam: nilIfEmptyMap(r.ResponsesRaw),
 	}
 	return params
 }

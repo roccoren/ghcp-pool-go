@@ -148,11 +148,13 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var body ResponsesRequest
-	if !decodeJSON(w, r, &body) {
+	rawBody, body, ok := decodeResponsesRaw(w, r)
+	if !ok {
 		return
 	}
+	rawBody = sanitizeNativeResponsesRaw(rawBody)
 	chat := body.ToChatRequest()
+	chat.ResponsesRaw = rawBody
 	chat.PreferredEndpoint = endpointResponses
 	chat.FallbackEndpoints = []string{endpointChatCompletions, endpointMessages}
 	if !s.modelAllowed(w, chat.Model, p) {
@@ -964,6 +966,30 @@ func decodeAnthropicMessagesRaw(w http.ResponseWriter, r *http.Request) (map[str
 	if err := json.Unmarshal(data, &body); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return nil, AnthropicMessagesRequest{}, false
+	}
+	return raw, body, true
+}
+
+func decodeResponsesRaw(w http.ResponseWriter, r *http.Request) (map[string]any, ResponsesRequest, bool) {
+	defer r.Body.Close()
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return nil, ResponsesRequest{}, false
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return nil, ResponsesRequest{}, false
+	}
+	if raw == nil {
+		writeError(w, http.StatusBadRequest, "request body must be a JSON object")
+		return nil, ResponsesRequest{}, false
+	}
+	var body ResponsesRequest
+	if err := json.Unmarshal(data, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return nil, ResponsesRequest{}, false
 	}
 	return raw, body, true
 }

@@ -779,7 +779,11 @@ func lastRoleFromBody(body any, field string) string {
 	if !ok {
 		return ""
 	}
-	items := anySlice(m[field])
+	raw := m[field]
+	if text, ok := raw.(string); ok && text != "" {
+		return "user"
+	}
+	items := anySlice(raw)
 	if len(items) == 0 {
 		return ""
 	}
@@ -931,6 +935,9 @@ func chatPayload(model string, messages []NeutralMessage, params map[string]any,
 }
 
 func responsesPayload(model string, messages []NeutralMessage, params map[string]any, stream bool) map[string]any {
+	if raw := rawResponsesPayload(params); raw != nil {
+		return normalizeNativeResponsesPayload(raw, model, stream, params)
+	}
 	options, _ := params["response_options"].(map[string]any)
 	instructions := []string{}
 	input := []any{}
@@ -998,6 +1005,57 @@ func responsesPayload(model string, messages []NeutralMessage, params map[string
 		body["text"] = text
 	}
 	return compactMap(body)
+}
+
+func rawResponsesPayload(params map[string]any) map[string]any {
+	raw, ok := params[internalResponsesRawParam].(map[string]any)
+	if !ok || len(raw) == 0 {
+		return nil
+	}
+	return cloneMap(raw)
+}
+
+func normalizeNativeResponsesPayload(raw map[string]any, model string, stream bool, params map[string]any) map[string]any {
+	sanitized := sanitizeNativeResponsesRaw(raw)
+	sanitized["model"] = model
+	sanitized["stream"] = stream
+	if _, ok := sanitized["store"]; !ok {
+		sanitized["store"] = false
+	}
+	effort := firstNonEmpty(stringParam(params, "reasoning_effort"), stringFromAny(sanitized["reasoning_effort"]))
+	delete(sanitized, "reasoning_effort")
+	if effort != "" && effort != "none" {
+		reasoning := anyMap(sanitized["reasoning"])
+		if reasoning == nil {
+			reasoning = map[string]any{}
+		}
+		reasoning["effort"] = effort
+		if reasoning["summary"] == nil {
+			reasoning["summary"] = "auto"
+		}
+		sanitized["reasoning"] = reasoning
+		if sanitized["include"] == nil {
+			sanitized["include"] = []string{"reasoning.encrypted_content"}
+		}
+	}
+	return compactMap(sanitized)
+}
+
+func sanitizeNativeResponsesRaw(raw map[string]any) map[string]any {
+	sanitized := cloneMap(raw)
+	delete(sanitized, "cache")
+	delete(sanitized, "model")
+	delete(sanitized, "stream")
+	if sanitized["max_output_tokens"] == nil && sanitized["max_tokens"] != nil {
+		sanitized["max_output_tokens"] = sanitized["max_tokens"]
+	}
+	delete(sanitized, "max_tokens")
+	for key := range sanitized {
+		if strings.HasPrefix(key, "__ghcp_") {
+			delete(sanitized, key)
+		}
+	}
+	return sanitized
 }
 
 func anthropicPayload(model string, messages []NeutralMessage, params map[string]any, stream bool) map[string]any {
@@ -1773,7 +1831,7 @@ func streamResponsesSSE(ctx context.Context, r io.Reader, out chan<- StreamItem)
 			completed = true
 			return false
 		case "response.failed", "response.incomplete", "error":
-			msg := firstNonEmpty(stringFromAny(item["message"]), stringFromAny(item["error"]))
+			msg := responsesStreamErrorMessage(item)
 			emitStreamItem(ctx, out, StreamItem{Kind: "error", Err: fmt.Errorf("responses stream failed: %s", msg)})
 			completed = true
 			return false
@@ -1787,6 +1845,36 @@ func streamResponsesSSE(ctx context.Context, r io.Reader, out chan<- StreamItem)
 	if !completed {
 		emitStreamItem(ctx, out, StreamItem{Kind: "error", Err: fmt.Errorf("responses stream ended without terminal event")})
 	}
+}
+
+func responsesStreamErrorMessage(item map[string]any) string {
+	if msg := stringFromAny(item["message"]); msg != "" {
+		return msg
+	}
+	for _, value := range []any{item["error"], nestedMapValue(item, "response", "error")} {
+		errObj := anyMap(value)
+		if errObj == nil {
+			if msg := stringFromAny(value); msg != "" {
+				return msg
+			}
+			continue
+		}
+		if msg := stringFromAny(errObj["message"]); msg != "" {
+			return msg
+		}
+		if typ := stringFromAny(errObj["type"]); typ != "" {
+			return typ
+		}
+	}
+	return "unknown upstream error"
+}
+
+func nestedMapValue(item map[string]any, parent, key string) any {
+	obj, ok := item[parent].(map[string]any)
+	if !ok {
+		return nil
+	}
+	return obj[key]
 }
 
 func streamAnthropicSSE(ctx context.Context, r io.Reader, out chan<- StreamItem) {

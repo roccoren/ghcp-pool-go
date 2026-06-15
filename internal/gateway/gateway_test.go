@@ -632,6 +632,75 @@ func TestResponsesPayloadPreservesNativeOptions(t *testing.T) {
 	}
 }
 
+func TestResponsesPayloadPreservesRawNativeShape(t *testing.T) {
+	raw := map[string]any{
+		"model":            "display-model",
+		"stream":           false,
+		"cache":            "bypass",
+		"max_tokens":       123,
+		"reasoning_effort": "high",
+		"input": []any{
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "input_text", "text": "look"},
+				map[string]any{"type": "input_image", "image_url": "data:image/png;base64,abc"},
+			}},
+			map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "done"},
+		},
+		"tools": []any{
+			map[string]any{"type": "local_shell"},
+			map[string]any{"type": "function", "name": "read_file", "parameters": map[string]any{"type": "object"}},
+		},
+	}
+	payload := responsesPayload("gpt-5.5", []NeutralMessage{{Role: "user", Content: "lossy fallback"}}, map[string]any{
+		"reasoning_effort":        "high",
+		internalResponsesRawParam: raw,
+	}, true)
+
+	if payload["model"] != "gpt-5.5" || payload["stream"] != true {
+		t.Fatalf("routing fields not overridden: %v", payload)
+	}
+	if payload["cache"] != nil || payload["reasoning_effort"] != nil || payload["max_tokens"] != nil {
+		t.Fatalf("unsupported fields leaked upstream: %v", payload)
+	}
+	if payload["max_output_tokens"] != 123 {
+		t.Fatalf("max_output_tokens=%v", payload["max_output_tokens"])
+	}
+	reasoning := payload["reasoning"].(map[string]any)
+	if reasoning["effort"] != "high" || reasoning["summary"] != "auto" {
+		t.Fatalf("reasoning=%v", reasoning)
+	}
+	input := payload["input"].([]any)
+	if input[1].(map[string]any)["type"] != "function_call_output" {
+		t.Fatalf("native input was not preserved: %v", input)
+	}
+	tools := payload["tools"].([]any)
+	if tools[0].(map[string]any)["type"] != "local_shell" {
+		t.Fatalf("native tools were not preserved: %v", tools)
+	}
+}
+
+func TestResponsesStreamErrorUsesNestedMessage(t *testing.T) {
+	body := strings.Join([]string{
+		"event: response.failed",
+		"data: {\"type\":\"response.failed\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad native field\"}}",
+		"",
+	}, "\n")
+	out := make(chan StreamItem)
+	go func() {
+		defer close(out)
+		streamResponsesSSE(context.Background(), strings.NewReader(body), out)
+	}()
+	for item := range out {
+		if item.Err != nil {
+			if !strings.Contains(item.Err.Error(), "bad native field") {
+				t.Fatalf("error=%v", item.Err)
+			}
+			return
+		}
+	}
+	t.Fatal("expected stream error")
+}
+
 func TestCopilotHeadersUseProtocolMetadata(t *testing.T) {
 	responsesBody := map[string]any{
 		"input": []any{
@@ -646,6 +715,9 @@ func TestCopilotHeadersUseProtocolMetadata(t *testing.T) {
 	}
 	if req.Header.Get("x-initiator") != "agent" {
 		t.Fatalf("x-initiator=%q", req.Header.Get("x-initiator"))
+	}
+	if got := copilotRequestMetadata(map[string]any{"input": "plain prompt"}, endpointResponses).Initiator; got != "user" {
+		t.Fatalf("string-input initiator=%q", got)
 	}
 	toolOutput := map[string]any{
 		"input": []any{
