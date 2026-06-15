@@ -24,6 +24,8 @@ const (
 	copilotUserAgent         = "GitHubCopilotChat/0.39.0"
 	copilotEditorVersion     = "vscode/1.111.0"
 	copilotPluginVersion     = "copilot-chat/0.39.0"
+	copilotAPIVersion        = "2026-06-01"
+	copilotIntent            = "conversation-edits"
 )
 
 var copilotHTTPClient = &http.Client{
@@ -113,9 +115,15 @@ func (b *CopilotBackend) ListModels(ctx context.Context) ([]ModelSpec, error) {
 	}
 	var payload struct {
 		Data []struct {
-			ID                 string         `json:"id"`
-			SupportedEndpoints []string       `json:"supported_endpoints"`
-			Capabilities       map[string]any `json:"capabilities"`
+			ID                 string   `json:"id"`
+			Name               string   `json:"name"`
+			Version            string   `json:"version"`
+			ModelPickerEnabled *bool    `json:"model_picker_enabled"`
+			SupportedEndpoints []string `json:"supported_endpoints"`
+			Policy             struct {
+				State string `json:"state"`
+			} `json:"policy"`
+			Capabilities map[string]any `json:"capabilities"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
@@ -123,10 +131,30 @@ func (b *CopilotBackend) ListModels(ctx context.Context) ([]ModelSpec, error) {
 	}
 	specs := make([]ModelSpec, 0, len(payload.Data))
 	for _, item := range payload.Data {
-		if item.ID == "" {
+		if item.ID == "" || strings.EqualFold(item.Policy.State, "disabled") {
 			continue
 		}
-		specs = append(specs, ModelSpec{ID: item.ID, SupportedEndpoints: item.SupportedEndpoints, Capabilities: item.Capabilities})
+		capabilities := cloneMap(item.Capabilities)
+		if capabilities == nil {
+			capabilities = map[string]any{}
+		}
+		if item.Name != "" {
+			capabilities["name"] = item.Name
+		}
+		if item.Version != "" {
+			capabilities["version"] = item.Version
+		}
+		if item.ModelPickerEnabled != nil {
+			capabilities["model_picker_enabled"] = *item.ModelPickerEnabled
+		}
+		specs = append(specs, ModelSpec{
+			ID:                 item.ID,
+			Name:               item.Name,
+			Version:            item.Version,
+			ModelPickerEnabled: item.ModelPickerEnabled,
+			SupportedEndpoints: item.SupportedEndpoints,
+			Capabilities:       capabilities,
+		})
 	}
 	return specs, nil
 }
@@ -476,7 +504,7 @@ func (b *CopilotBackend) doCopilot(ctx context.Context, method, endpoint string,
 	if err != nil {
 		return nil, nil, err
 	}
-	addCopilotHeaders(req, access.Token)
+	addCopilotHeaders(req, access.Token, endpoint, copilotRequestMetadata(body, endpoint))
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
@@ -595,16 +623,129 @@ func requestBody(body any) (io.Reader, error) {
 	}
 }
 
-func addCopilotHeaders(req *http.Request, token string) {
+type copilotRequestInfo struct {
+	Initiator string
+	Vision    bool
+}
+
+func addCopilotHeaders(req *http.Request, token, endpoint string, info copilotRequestInfo) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", copilotUserAgent)
 	req.Header.Set("Editor-Version", copilotEditorVersion)
 	req.Header.Set("Editor-Plugin-Version", copilotPluginVersion)
 	req.Header.Set("Copilot-Integration-Id", "vscode-chat")
-	req.Header.Set("Openai-Intent", "conversation-agent")
+	req.Header.Set("Openai-Intent", copilotIntent)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Github-Api-Version", "2025-04-01")
+	req.Header.Set("X-Github-Api-Version", copilotAPIVersion)
 	req.Header.Set("X-Request-Id", newID("req"))
+	if info.Initiator == "" {
+		info.Initiator = "user"
+	}
+	req.Header.Set("x-initiator", info.Initiator)
+	if info.Vision {
+		req.Header.Set("Copilot-Vision-Request", "true")
+	}
+	if endpointMatches(endpoint, endpointMessages) {
+		req.Header.Set("anthropic-beta", "interleaved-thinking-2025-05-14")
+	}
+}
+
+func copilotRequestMetadata(body any, endpoint string) copilotRequestInfo {
+	info := copilotRequestInfo{Initiator: "user", Vision: containsCopilotVision(body)}
+	switch {
+	case endpointMatches(endpoint, endpointChatCompletions):
+		if lastRoleFromBody(body, "messages") != "user" {
+			info.Initiator = "agent"
+		}
+	case endpointMatches(endpoint, endpointResponses):
+		if lastRoleFromBody(body, "input") != "user" {
+			info.Initiator = "agent"
+		}
+	case endpointMatches(endpoint, endpointMessages):
+		if !lastAnthropicMessageIsUserPrompt(body) {
+			info.Initiator = "agent"
+		}
+	}
+	return info
+}
+
+func lastRoleFromBody(body any, field string) string {
+	m, ok := body.(map[string]any)
+	if !ok {
+		return ""
+	}
+	items := anySlice(m[field])
+	if len(items) == 0 {
+		return ""
+	}
+	item, ok := items[len(items)-1].(map[string]any)
+	if !ok {
+		return ""
+	}
+	return strings.ToLower(stringFromAny(item["role"]))
+}
+
+func lastAnthropicMessageIsUserPrompt(body any) bool {
+	m, ok := body.(map[string]any)
+	if !ok {
+		return false
+	}
+	items := anySlice(m["messages"])
+	for i := len(items) - 1; i >= 0; i-- {
+		item, ok := items[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.ToLower(stringFromAny(item["role"])) != "user" {
+			return false
+		}
+		content := item["content"]
+		for _, part := range anySlice(content) {
+			block, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			if stringFromAny(block["type"]) != "tool_result" {
+				return true
+			}
+		}
+		return len(anySlice(content)) == 0 && coerceText(content) != ""
+	}
+	return false
+}
+
+func containsCopilotVision(value any) bool {
+	switch v := value.(type) {
+	case []any:
+		for _, item := range v {
+			if containsCopilotVision(item) {
+				return true
+			}
+		}
+	case []map[string]any:
+		for _, item := range v {
+			if containsCopilotVision(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		typ := strings.ToLower(stringFromAny(v["type"]))
+		if typ == "image" || typ == "input_image" || typ == "image_url" {
+			return true
+		}
+		if _, ok := v["image_url"]; ok {
+			return true
+		}
+		if source, ok := v["source"].(map[string]any); ok && strings.HasPrefix(strings.ToLower(stringFromAny(source["media_type"])), "image/") {
+			return true
+		}
+		for _, item := range v {
+			if containsCopilotVision(item) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func looksLikeCopilotBearer(token string) bool {
@@ -685,6 +826,7 @@ func chatPayload(model string, messages []NeutralMessage, params map[string]any,
 }
 
 func responsesPayload(model string, messages []NeutralMessage, params map[string]any, stream bool) map[string]any {
+	options, _ := params["response_options"].(map[string]any)
 	instructions := []string{}
 	input := []any{}
 	for _, message := range messages {
@@ -700,7 +842,7 @@ func responsesPayload(model string, messages []NeutralMessage, params map[string
 		"model":  model,
 		"input":  input,
 		"stream": stream,
-		"store":  false,
+		"store":  optionValue(options, "store", false),
 	}
 	if len(instructions) > 0 {
 		body["instructions"] = strings.Join(instructions, "\n")
@@ -708,6 +850,19 @@ func responsesPayload(model string, messages []NeutralMessage, params map[string
 	copyParam(body, params, "temperature")
 	copyParam(body, params, "top_p")
 	copyParamAs(body, params, "max_tokens", "max_output_tokens")
+	copyOption(body, options, "background")
+	copyOption(body, options, "include")
+	copyOption(body, options, "max_tool_calls")
+	copyOption(body, options, "metadata")
+	copyOption(body, options, "parallel_tool_calls")
+	copyOption(body, options, "previous_response_id")
+	copyOption(body, options, "prompt_cache_key")
+	copyOption(body, options, "prompt_cache_retention")
+	copyOption(body, options, "safety_identifier")
+	copyOption(body, options, "service_tier")
+	copyOption(body, options, "stream_options")
+	copyOption(body, options, "truncation")
+	copyOption(body, options, "user")
 	if choice := responsesToolChoice(params["tool_choice"]); choice != nil {
 		body["tool_choice"] = choice
 	}
@@ -715,11 +870,27 @@ func responsesPayload(model string, messages []NeutralMessage, params map[string
 	if tools, _ := params["tools"].([]map[string]any); len(tools) > 0 {
 		body["tools"] = tools
 	}
+	if reasoning := anyMap(optionValue(options, "reasoning", nil)); reasoning != nil {
+		body["reasoning"] = reasoning
+	}
 	if effort := stringParam(params, "reasoning_effort"); effort != "" && effort != "none" {
-		body["reasoning"] = map[string]any{"effort": effort, "summary": "detailed"}
+		reasoning := anyMap(body["reasoning"])
+		if reasoning == nil {
+			reasoning = map[string]any{}
+		}
+		reasoning["effort"] = effort
+		if reasoning["summary"] == nil {
+			reasoning["summary"] = "auto"
+		}
+		body["reasoning"] = reasoning
+		if body["include"] == nil {
+			body["include"] = []string{"reasoning.encrypted_content"}
+		}
 	}
 	if responseFormat, ok := params["response_format"].(map[string]any); ok && len(responseFormat) > 0 {
 		body["text"] = map[string]any{"format": responseFormat}
+	} else if text := anyMap(optionValue(options, "text", nil)); text != nil {
+		body["text"] = text
 	}
 	return compactMap(body)
 }
@@ -1174,6 +1345,12 @@ func copyParam(dest map[string]any, params map[string]any, key string) {
 func copyParamAs(dest map[string]any, params map[string]any, src, dst string) {
 	if value, ok := params[src]; ok && value != nil {
 		dest[dst] = value
+	}
+}
+
+func copyOption(dest map[string]any, options map[string]any, key string) {
+	if value := optionValue(options, key, nil); value != nil {
+		dest[key] = value
 	}
 }
 

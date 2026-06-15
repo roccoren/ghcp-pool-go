@@ -192,8 +192,8 @@ func (s *server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	rawBody["model"] = body.Model
 	rawBody = sanitizeNativeAnthropicRaw(rawBody)
 	resolvedModel := s.gw.Settings.ResolveModelAlias(body.Model)
-	if !strings.HasPrefix(strings.ToLower(resolvedModel), "claude") {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "/v1/messages is only available for claude* models")
+	if !s.modelSupportsAnthropicMessages(resolvedModel) {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "/v1/messages is only available for models that support /v1/messages")
 		return
 	}
 	if body.MaxTokens == nil {
@@ -244,8 +244,8 @@ func (s *server) anthropicCountTokens(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusForbidden, "permission_error", "model not allowed: "+body.Model)
 		return
 	}
-	if !strings.HasPrefix(strings.ToLower(resolvedModel), "claude") {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "/v1/messages/count_tokens is only available for claude* models")
+	if !s.modelSupportsAnthropicMessages(resolvedModel) {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "/v1/messages/count_tokens is only available for models that support /v1/messages")
 		return
 	}
 	if s.gw.Registry.LastRefresh > 0 && len(s.gw.Registry.AccountsFor(resolvedModel)) == 0 {
@@ -263,6 +263,13 @@ func (s *server) anthropicCountTokens(w http.ResponseWriter, r *http.Request) {
 		headers["x-ghcp-upstream-model"] = internalModel
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": inputTokens}, headers)
+}
+
+func (s *server) modelSupportsAnthropicMessages(model string) bool {
+	if strings.HasPrefix(strings.ToLower(model), "claude") {
+		return true
+	}
+	return s.gw.Registry.ModelSupportsEndpoint(model, endpointMessages)
 }
 
 func (s *server) embeddings(w http.ResponseWriter, r *http.Request) {

@@ -64,6 +64,9 @@ type StreamItem struct {
 
 type ModelSpec struct {
 	ID                 string         `json:"id"`
+	Name               string         `json:"name,omitempty"`
+	Version            string         `json:"version,omitempty"`
+	ModelPickerEnabled *bool          `json:"model_picker_enabled,omitempty"`
 	SupportedEndpoints []string       `json:"supported_endpoints,omitempty"`
 	Capabilities       map[string]any `json:"capabilities,omitempty"`
 }

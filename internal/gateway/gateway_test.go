@@ -603,6 +603,93 @@ func TestToolChoiceShapeMatchesSelectedEndpoint(t *testing.T) {
 	}
 }
 
+func TestResponsesPayloadPreservesNativeOptions(t *testing.T) {
+	payload := responsesPayload("gpt-5.5", []NeutralMessage{{Role: "user", Content: "hi"}}, map[string]any{
+		"reasoning_effort": "high",
+		"response_options": map[string]any{
+			"include":          []any{"custom.include"},
+			"metadata":         map[string]any{"session": "s1"},
+			"prompt_cache_key": "cache-key",
+			"service_tier":     "flex",
+			"store":            true,
+			"text":             map[string]any{"verbosity": "low"},
+			"truncation":       "auto",
+		},
+	}, false)
+	if payload["store"] != true || payload["prompt_cache_key"] != "cache-key" || payload["service_tier"] != "flex" {
+		t.Fatalf("native options not preserved: %v", payload)
+	}
+	if payload["text"].(map[string]any)["verbosity"] != "low" {
+		t.Fatalf("text options=%v", payload["text"])
+	}
+	reasoning := payload["reasoning"].(map[string]any)
+	if reasoning["effort"] != "high" || reasoning["summary"] != "auto" {
+		t.Fatalf("reasoning=%v", reasoning)
+	}
+	include := payload["include"].([]any)
+	if len(include) != 1 || include[0] != "custom.include" {
+		t.Fatalf("include should preserve caller value: %v", include)
+	}
+}
+
+func TestCopilotHeadersUseProtocolMetadata(t *testing.T) {
+	responsesBody := map[string]any{
+		"input": []any{
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "look"}}},
+			map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "ok"}}},
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/responses", nil)
+	addCopilotHeaders(req, "tok", endpointResponses, copilotRequestMetadata(responsesBody, endpointResponses))
+	if req.Header.Get("Openai-Intent") != "conversation-edits" || req.Header.Get("X-Github-Api-Version") != "2026-06-01" {
+		t.Fatalf("headers=%v", req.Header)
+	}
+	if req.Header.Get("x-initiator") != "agent" {
+		t.Fatalf("x-initiator=%q", req.Header.Get("x-initiator"))
+	}
+	toolOutput := map[string]any{
+		"input": []any{
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "look"}}},
+			map[string]any{"type": "function_call_output", "call_id": "call", "output": "done"},
+		},
+	}
+	if got := copilotRequestMetadata(toolOutput, endpointResponses).Initiator; got != "agent" {
+		t.Fatalf("tool-output initiator=%q", got)
+	}
+
+	visionBody := map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,abc"}}}}},
+	}
+	visionReq := httptest.NewRequest(http.MethodPost, "/chat/completions", nil)
+	addCopilotHeaders(visionReq, "tok", endpointChatCompletions, copilotRequestMetadata(visionBody, endpointChatCompletions))
+	if visionReq.Header.Get("x-initiator") != "user" || visionReq.Header.Get("Copilot-Vision-Request") != "true" {
+		t.Fatalf("vision headers=%v", visionReq.Header)
+	}
+
+	anthropicReq := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	addCopilotHeaders(anthropicReq, "tok", endpointMessages, copilotRequestMetadata(map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": "call", "content": "done"}}}},
+	}, endpointMessages))
+	if anthropicReq.Header.Get("x-initiator") != "agent" || anthropicReq.Header.Get("anthropic-beta") == "" {
+		t.Fatalf("anthropic headers=%v", anthropicReq.Header)
+	}
+}
+
+func TestModelSupportsEndpointUsesRegistryMetadata(t *testing.T) {
+	registry := NewModelRegistry(nil)
+	registry.index = map[string]map[string]ModelSpec{
+		"anthropic-bridge": {
+			"acct": {ID: "anthropic-bridge", SupportedEndpoints: []string{endpointMessages}},
+		},
+	}
+	if !registry.ModelSupportsEndpoint("anthropic-bridge", endpointMessages) {
+		t.Fatalf("expected /v1/messages support")
+	}
+	if registry.ModelSupportsEndpoint("anthropic-bridge", endpointResponses) {
+		t.Fatalf("did not expect /responses support")
+	}
+}
+
 func TestCopilotNativeThinkingNormalizesClaudeCodeShape(t *testing.T) {
 	thinking, outputConfig := copilotNativeThinking(map[string]any{"type": "enabled", "budget_tokens": float64(1024)}, nil, "claude-sonnet-4.6")
 	tm := thinking.(map[string]any)

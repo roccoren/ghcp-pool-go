@@ -118,6 +118,20 @@ func (r *ModelRegistry) AccountSupportsEndpoint(model, accountID, endpoint strin
 	return supportedEndpoint(spec, endpoint)
 }
 
+func (r *ModelRegistry) ModelSupportsEndpoint(model, endpoint string) bool {
+	if endpoint == "" {
+		return true
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, spec := range r.index[model] {
+		if supportedEndpoint(spec, endpoint) {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *ModelRegistry) PickEndpoint(model string, preferred []string) string {
 	if len(preferred) == 0 {
 		return endpointChatCompletions
