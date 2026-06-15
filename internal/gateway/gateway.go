@@ -29,6 +29,10 @@ func NewGateway(settings Settings) (*Gateway, error) {
 	if err != nil {
 		return nil, err
 	}
+	authenticator, err := NewAuthenticator(context.Background(), settings)
+	if err != nil {
+		return nil, err
+	}
 	registry := NewModelRegistry(pool)
 	store, err := NewUsageStore(settings.Usage.SQLitePath)
 	if err != nil {
@@ -44,7 +48,7 @@ func NewGateway(settings Settings) (*Gateway, error) {
 		UsageStore:    store,
 		Metrics:       metrics,
 		Meter:         NewMeter(store, metrics),
-		Authenticator: NewAuthenticator(settings),
+		Authenticator: authenticator,
 	}
 	gw.LoginManager = NewLoginManager(settings, pool)
 	return gw, nil

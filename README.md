@@ -70,10 +70,14 @@ docker run --rm -p 8000:8000 -e GHCP_API_KEY=sk-change-me ghcp-pool-go
 Supported deployment environment overrides include `GHCP_HOST`, `GHCP_PORT`,
 `GHCP_BACKEND`, `GHCP_CACHE_SALT`, `GHCP_USAGE_SQLITE_PATH`,
 `GHCP_MODEL_MAP_PATH`, `GHCP_GLOBAL_RATE_LIMIT_RPM`, and
-`GHCP_PER_ACCOUNT_RATE_LIMIT_RPM`.
+`GHCP_PER_ACCOUNT_RATE_LIMIT_RPM`. For Azure Key Vault-backed deployments, set
+`AZURE_KEY_VAULT_URL` plus `GHCP_API_KEY_KEY_VAULT_SECRET` and/or
+`GHCP_COPILOT_TOKEN_KEY_VAULT_SECRET` to resolve secrets at runtime through
+managed identity.
 
 For Azure Container Apps deployments that keep `GHCP_API_KEY` and
-`GHCP_COPILOT_TOKEN` in Azure Key Vault, see
+`GHCP_COPILOT_TOKEN` in Azure Key Vault, including a private VNet/Private Link
+stack, see
 [`docs/deploy-containerapp-keyvault.md`](docs/deploy-containerapp-keyvault.md).
 
 Useful admin controls:

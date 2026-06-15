@@ -1,18 +1,106 @@
-# Deploy ghcp-pool-go with Azure Key Vault secrets
+# Deploy ghcp-pool-go with Azure Container Apps and private Key Vault
 
-This guide shows how to keep the gateway API key and the GitHub/Copilot token
-in Azure Key Vault, then inject them into an existing Azure Container App by
-using Container Apps Key Vault secret references.
+This guide shows two supported patterns:
+
+1. Deploy a full private Azure stack with Container Apps in a VNet, Key Vault
+   public access disabled, and a Key Vault private endpoint/private DNS link.
+2. Retrofit an existing Container App by using Container Apps Key Vault secret
+   references.
+
+The full stack is preferred for private deployments because ghcp-pool-go reads
+tokens directly from Key Vault at runtime with managed identity and can also
+write rotated Copilot tokens back to Key Vault.
 
 The two secrets have different purposes:
 
-| Secret | Runtime env var | Used by | Purpose |
+| Secret | Runtime config | Used by | Purpose |
 | --- | --- | --- | --- |
-| Gateway API key | `GHCP_API_KEY` | Clients -> ghcp-pool-go | Authenticates clients calling `/v1/*`, `/v1/messages`, `/v1beta/*`, and admin endpoints. |
-| GitHub/Copilot token | `GHCP_COPILOT_TOKEN` | ghcp-pool-go -> GitHub/Copilot | Exchanged by the gateway for a Copilot API token, then used to call Copilot upstream. |
+| Gateway API key | `GHCP_API_KEY` or `GHCP_API_KEY_KEY_VAULT_SECRET` | Clients -> ghcp-pool-go | Authenticates clients calling `/v1/*`, `/v1/messages`, `/v1beta/*`, and admin endpoints. |
+| GitHub/Copilot token | `GHCP_COPILOT_TOKEN` or `GHCP_COPILOT_TOKEN_KEY_VAULT_SECRET` | ghcp-pool-go -> GitHub/Copilot | Exchanged by the gateway for a Copilot API token, then used to call Copilot upstream. |
 
 Do not put either value in `config.yaml`, Docker image layers, shell history, or
 source control.
+
+## Runtime Key Vault settings
+
+The gateway can resolve secrets directly from Azure Key Vault:
+
+```yaml
+gateway:
+  key_vault_url: https://<vault-name>.vault.azure.net/
+  api_keys:
+    - key_vault_secret: ghcp-api-key
+      scopes: [admin, inference]
+      model_allow: ["*"]
+      cache_namespace: default
+accounts:
+  - id: default
+    token_key_vault_secret: ghcp-copilot-token
+    enabled: true
+```
+
+Equivalent environment-only defaults are supported for container deployments:
+
+| Env var | Purpose |
+| --- | --- |
+| `AZURE_KEY_VAULT_URL` | Default vault URL for API keys and account tokens. |
+| `AZURE_CLIENT_ID` | User-assigned managed identity client ID, when using one. |
+| `GHCP_API_KEY_KEY_VAULT_SECRET` | Gateway API key secret name. |
+| `GHCP_ADMIN_API_KEY_KEY_VAULT_SECRET` | Optional separate admin key secret name. |
+| `GHCP_COPILOT_TOKEN_KEY_VAULT_SECRET` | Default account Copilot token secret name. |
+
+For multi-account pools, set `accounts[].token_key_vault_secret` per account.
+When admin login or `POST /admin/users/{id}/token` sets a token for an account
+with `token_key_vault_secret`, the gateway stores the new token in that Key
+Vault secret before rebuilding the account backend.
+
+## Deploy the private Container Apps + Key Vault stack
+
+The Bicep template at `infra/containerapp-keyvault.bicep` creates:
+
+- VNet with a delegated Container Apps subnet and a private endpoint subnet.
+- Key Vault with Azure RBAC enabled and public network access disabled.
+- Key Vault private endpoint plus `privatelink.vaultcore.azure.net` private DNS.
+- User-assigned managed identity with `Key Vault Secrets User` on the vault.
+- Container Apps environment and app configured with `AZURE_KEY_VAULT_URL`,
+  `AZURE_CLIENT_ID`, `GHCP_API_KEY_KEY_VAULT_SECRET`, and
+  `GHCP_COPILOT_TOKEN_KEY_VAULT_SECRET`.
+
+Deploy with Azure Deployment Stacks:
+
+```bash
+RG=ghcp-pool-rg
+LOCATION=eastus
+STACK=ghcp-pool-private
+IMAGE=ghcr.io/<owner>/ghcp-pool-go:latest
+
+export GHCP_API_KEY_VALUE="sk-$(openssl rand -hex 24)"
+export GHCP_COPILOT_TOKEN_VALUE="$(gh auth token)"
+
+az group create -n "$RG" -l "$LOCATION"
+
+az stack group create \
+  -g "$RG" \
+  -n "$STACK" \
+  --template-file infra/containerapp-keyvault.bicep \
+  --parameters \
+    location="$LOCATION" \
+    containerImage="$IMAGE" \
+    gatewayApiKey="$GHCP_API_KEY_VALUE" \
+    copilotToken="$GHCP_COPILOT_TOKEN_VALUE" \
+  --action-on-unmanage detachAll \
+  --deny-settings-mode none
+```
+
+The secure parameters create the initial `ghcp-api-key` and
+`ghcp-copilot-token` Key Vault secrets. The Container App does not receive those
+values as plain environment variables; it receives only the vault URL and secret
+names, then resolves them through the managed identity over the VNet/private
+endpoint path.
+
+If RBAC propagation delays cause the first app revision to start before the
+identity can read Key Vault, restart the latest revision after role assignment
+propagates.
 
 ## Assumptions
 
@@ -213,14 +301,14 @@ curl -sS "https://$FQDN/v1/models" \
 
 For a pool with multiple Copilot users, do not share one global
 `GHCP_COPILOT_TOKEN`. Store one GitHub/Copilot token per gateway account and
-reference each token through a separate environment variable.
+configure each account with its own `token_key_vault_secret`.
 
 Example account layout:
 
-| Account | Key Vault secret | Container App env var | Gateway config |
-| --- | --- | --- | --- |
-| `user-a` | `ghcp-copilot-token-user-a` | `GHCP_COPILOT_TOKEN_USER_A` | `token_env: GHCP_COPILOT_TOKEN_USER_A` |
-| `user-b` | `ghcp-copilot-token-user-b` | `GHCP_COPILOT_TOKEN_USER_B` | `token_env: GHCP_COPILOT_TOKEN_USER_B` |
+| Account | Key Vault secret | Gateway config |
+| --- | --- | --- |
+| `user-a` | `ghcp-copilot-token-user-a` | `token_key_vault_secret: ghcp-copilot-token-user-a` |
+| `user-b` | `ghcp-copilot-token-user-b` | `token_key_vault_secret: ghcp-copilot-token-user-b` |
 
 ### 6.1 Store each user's token in Key Vault
 
@@ -229,7 +317,6 @@ GitHub token out of band and stored it in a local shell variable.
 
 ```bash
 USER_A_SECRET_NAME=ghcp-copilot-token-user-a
-USER_A_ENV_NAME=GHCP_COPILOT_TOKEN_USER_A
 
 # Do not echo this value.
 export USER_A_GH_TOKEN="<user-a-github-token>"
@@ -249,7 +336,45 @@ az keyvault secret set \
   -o json
 ```
 
-### 6.2 Create Key Vault references for each user token
+### 6.2 Configure gateway accounts for direct Key Vault resolution
+
+The private stack already sets `AZURE_KEY_VAULT_URL`, `AZURE_CLIENT_ID`, and the
+managed identity role assignment. For a custom config, map each account to its
+Key Vault secret name:
+
+```yaml
+backend: copilot
+gateway:
+  key_vault_url: https://<vault-name>.vault.azure.net/
+  api_keys:
+    - key_vault_secret: ghcp-api-key
+      scopes: [admin, inference]
+      model_allow: ["*"]
+      cache_namespace: default
+accounts:
+  - id: user-a
+    label: User A
+    token_key_vault_secret: ghcp-copilot-token-user-a
+    enabled: true
+    max_concurrency: 8
+    allow: ["claude-*", "gpt-*", "gemini-*"]
+  - id: user-b
+    label: User B
+    token_key_vault_secret: ghcp-copilot-token-user-b
+    enabled: true
+    max_concurrency: 8
+    allow: ["claude-*", "gpt-*", "gemini-*"]
+routes:
+  - model: "*"
+    accounts: ["user-a", "user-b"]
+    strategy: smart
+```
+
+### 6.3 Alternative: Container App secret references
+
+If you prefer to let Container Apps inject each token as an environment variable
+instead of having the gateway call Key Vault directly, create Key Vault
+references for each user token:
 
 ```bash
 USER_A_SECRET_URI="$(az keyvault secret show \
@@ -268,6 +393,8 @@ az containerapp secret set \
 Bind the secret reference to a per-account environment variable:
 
 ```bash
+USER_A_ENV_NAME=GHCP_COPILOT_TOKEN_USER_A
+
 az containerapp update \
   -g "$RG" \
   -n "$APP" \
@@ -286,9 +413,7 @@ az containerapp update \
     GHCP_COPILOT_TOKEN_USER_B=secretref:ghcp-copilot-token-user-b
 ```
 
-### 6.3 Configure gateway accounts
-
-Mount or bake a `config.yaml` that maps accounts to those env vars:
+Then mount or bake a `config.yaml` that maps accounts to those env vars:
 
 ```yaml
 backend: copilot
@@ -319,14 +444,14 @@ routes:
 
 > Note: the gateway config loader does not expand `${...}` placeholders inside
 > YAML. Set `gateway.api_keys[].key` to the actual gateway API key value in your
-> rendered config, or use `GHCP_API_KEY` for a single global API key. The
-> per-account `token_env` values are environment variable names and are resolved
-> by the gateway at runtime.
+> rendered config, use `GHCP_API_KEY`, or use `gateway.api_keys[].key_vault_secret`.
+> The per-account `token_env` values are environment variable names and are
+> resolved by the gateway at runtime.
 
 If you prefer to add accounts after startup, use the admin API and keep the
-runtime token in the gateway process memory. For persistent multi-user
-deployments, `token_env` + Key Vault references are easier to recreate after
-restart.
+runtime token in the gateway process memory. For persistent multi-user private
+deployments, `token_key_vault_secret` is easier to recreate after restart and
+lets admin token updates persist back to Key Vault.
 
 ### 6.4 Restart and validate
 

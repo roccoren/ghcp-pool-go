@@ -155,8 +155,14 @@ func (m *LoginManager) applyToken(ctx context.Context, accountID, token, source 
 	if account == nil {
 		return errors.New("account not found")
 	}
+	if err := account.Config.StoreToken(ctx, m.settings.KeyVaultURL, token); err != nil {
+		return err
+	}
 	account.Config.RuntimeToken = token
 	account.Config.RuntimeTokenSource = source
+	if account.Config.TokenKeyVaultSecret != "" {
+		account.Config.RuntimeTokenSource = source + "_key_vault"
+	}
 	_, err := m.pool.RebuildBackend(ctx, accountID)
 	return err
 }

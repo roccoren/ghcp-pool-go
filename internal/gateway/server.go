@@ -394,15 +394,18 @@ func (s *server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 		baseDir = resolved
 	}
 	cfg := AccountConfig{
-		ID:             id,
-		Label:          firstNonEmpty(stringFromAny(payload["label"]), id),
-		BaseDirectory:  baseDir,
-		MaxConcurrency: intFromPayload(payload["max_concurrency"], 32),
-		Weight:         intFromPayload(payload["weight"], 1),
-		RateLimitRPM:   intPtrFromPayload(payload["rate_limit_rpm"]),
-		Allow:          stringSliceFromAny(firstAny(payload["allow"], []any{"*"})),
-		Deny:           stringSliceFromAny(payload["deny"]),
-		Models:         stringSliceFromAny(payload["models"]),
+		ID:                  id,
+		Label:               firstNonEmpty(stringFromAny(payload["label"]), id),
+		TokenEnv:            stringsTrim(stringFromAny(payload["token_env"])),
+		TokenKeyVaultSecret: stringsTrim(stringFromAny(payload["token_key_vault_secret"])),
+		KeyVaultURL:         stringsTrim(stringFromAny(payload["key_vault_url"])),
+		BaseDirectory:       baseDir,
+		MaxConcurrency:      intFromPayload(payload["max_concurrency"], 32),
+		Weight:              intFromPayload(payload["weight"], 1),
+		RateLimitRPM:        intPtrFromPayload(payload["rate_limit_rpm"]),
+		Allow:               stringSliceFromAny(firstAny(payload["allow"], []any{"*"})),
+		Deny:                stringSliceFromAny(payload["deny"]),
+		Models:              stringSliceFromAny(payload["models"]),
 	}
 	enabled := true
 	if v, ok := payload["enabled"].(bool); ok {
@@ -410,8 +413,15 @@ func (s *server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg.Enabled = &enabled
 	if token := stringsTrim(stringFromAny(payload["token"])); token != "" && token != "null" {
-		cfg.RuntimeToken = token
-		cfg.RuntimeTokenSource = "api_token"
+		if cfg.TokenKeyVaultSecret != "" {
+			if err := cfg.StoreToken(r.Context(), s.gw.Settings.KeyVaultURL, token); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		} else {
+			cfg.RuntimeToken = token
+			cfg.RuntimeTokenSource = "api_token"
+		}
 	}
 	_, err := s.gw.Pool.AddAccount(r.Context(), cfg)
 	if err != nil {

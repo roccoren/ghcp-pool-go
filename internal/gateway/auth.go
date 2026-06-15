@@ -1,6 +1,10 @@
 package gateway
 
-import "strings"
+import (
+	"context"
+	"fmt"
+	"strings"
+)
 
 type Principal struct {
 	config APIKeyConfig
@@ -34,12 +38,20 @@ type Authenticator struct {
 	keys map[string]APIKeyConfig
 }
 
-func NewAuthenticator(settings Settings) *Authenticator {
+func NewAuthenticator(ctx context.Context, settings Settings) (*Authenticator, error) {
 	keys := make(map[string]APIKeyConfig, len(settings.APIKeys))
-	for _, key := range settings.APIKeys {
-		keys[key.Key] = key
+	for i, key := range settings.APIKeys {
+		resolved, err := key.ResolveKey(ctx, settings.KeyVaultURL)
+		if err != nil {
+			return nil, err
+		}
+		if resolved == "" {
+			return nil, fmt.Errorf("api key %d has no key, key_env, or key_vault_secret", i)
+		}
+		key.Key = resolved
+		keys[resolved] = key
 	}
-	return &Authenticator{keys: keys}
+	return &Authenticator{keys: keys}, nil
 }
 
 func (a *Authenticator) Authenticate(value string) (Principal, bool) {

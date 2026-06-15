@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -22,6 +23,9 @@ var ValidStrategies = map[string]bool{
 
 type APIKeyConfig struct {
 	Key            string   `yaml:"key" json:"key"`
+	KeyEnv         string   `yaml:"key_env" json:"key_env"`
+	KeyVaultSecret string   `yaml:"key_vault_secret" json:"key_vault_secret"`
+	KeyVaultURL    string   `yaml:"key_vault_url" json:"key_vault_url"`
 	Scopes         []string `yaml:"scopes" json:"scopes"`
 	ModelAllow     []string `yaml:"model_allow" json:"model_allow"`
 	CacheNamespace string   `yaml:"cache_namespace" json:"cache_namespace"`
@@ -51,7 +55,26 @@ func (c *AccountConfig) enabled() bool {
 	return c.Enabled == nil || *c.Enabled
 }
 
-func (c *AccountConfig) ResolveToken(defaultKeyVaultURL string) (string, error) {
+func (c *APIKeyConfig) ResolveKey(ctx context.Context, defaultKeyVaultURL string) (string, error) {
+	if c.Key != "" {
+		return c.Key, nil
+	}
+	if c.KeyEnv != "" {
+		if key := os.Getenv(c.KeyEnv); key != "" {
+			return key, nil
+		}
+	}
+	if c.KeyVaultSecret != "" {
+		vaultURL := firstNonEmpty(c.KeyVaultURL, defaultKeyVaultURL)
+		if vaultURL == "" {
+			return "", fmt.Errorf("api key uses key_vault_secret %q but no key_vault_url is configured", c.KeyVaultSecret)
+		}
+		return getKeyVaultSecret(ctx, vaultURL, c.KeyVaultSecret)
+	}
+	return "", nil
+}
+
+func (c *AccountConfig) ResolveToken(ctx context.Context, defaultKeyVaultURL string) (string, error) {
 	if c.RuntimeToken != "" {
 		return c.RuntimeToken, nil
 	}
@@ -68,9 +91,20 @@ func (c *AccountConfig) ResolveToken(defaultKeyVaultURL string) (string, error) 
 		if vaultURL == "" {
 			return "", fmt.Errorf("account %q uses token_key_vault_secret but no key_vault_url is configured", c.ID)
 		}
-		return "", fmt.Errorf("Azure Key Vault token resolution is not available in the Go rewrite yet")
+		return getKeyVaultSecret(ctx, vaultURL, c.TokenKeyVaultSecret)
 	}
 	return "", nil
+}
+
+func (c *AccountConfig) StoreToken(ctx context.Context, defaultKeyVaultURL, token string) error {
+	if c.TokenKeyVaultSecret == "" {
+		return nil
+	}
+	vaultURL := firstNonEmpty(c.KeyVaultURL, defaultKeyVaultURL)
+	if vaultURL == "" {
+		return fmt.Errorf("account %q uses token_key_vault_secret but no key_vault_url is configured", c.ID)
+	}
+	return setKeyVaultSecret(ctx, vaultURL, c.TokenKeyVaultSecret, token)
 }
 
 func (c AccountConfig) AuthMethod() string {
@@ -287,15 +321,18 @@ func LoadSettings(path string) (Settings, error) {
 	if settings.Accounts == nil {
 		models := []string{"gpt-4.1", "gpt-4o-mini"}
 		tokenEnv := ""
+		tokenKeyVaultSecret := ""
 		if settings.Backend == "copilot" {
 			models = nil
 			tokenEnv = "GHCP_COPILOT_TOKEN"
+			tokenKeyVaultSecret = firstNonEmpty(os.Getenv("GHCP_COPILOT_TOKEN_KEY_VAULT_SECRET"), os.Getenv("GHCP_COPILOT_TOKEN_KEYVAULT_SECRET"))
 		}
 		settings.Accounts = []AccountConfig{{
-			ID:       "acct_a",
-			Label:    "Default account",
-			TokenEnv: tokenEnv,
-			Models:   models,
+			ID:                  "acct_a",
+			Label:               "Default account",
+			TokenEnv:            tokenEnv,
+			TokenKeyVaultSecret: tokenKeyVaultSecret,
+			Models:              models,
 		}}
 	}
 	if len(settings.Routes) == 0 {
@@ -308,13 +345,14 @@ func LoadSettings(path string) (Settings, error) {
 	if len(settings.APIKeys) == 0 {
 		apiKey := os.Getenv("GHCP_API_KEY")
 		adminKey := os.Getenv("GHCP_ADMIN_API_KEY")
-		if apiKey != "" || adminKey != "" {
-			if apiKey == "" {
-				apiKey = adminKey
+		apiKeySecret := firstNonEmpty(os.Getenv("GHCP_API_KEY_KEY_VAULT_SECRET"), os.Getenv("GHCP_API_KEY_KEYVAULT_SECRET"))
+		adminKeySecret := firstNonEmpty(os.Getenv("GHCP_ADMIN_API_KEY_KEY_VAULT_SECRET"), os.Getenv("GHCP_ADMIN_API_KEY_KEYVAULT_SECRET"))
+		if apiKey != "" || adminKey != "" || apiKeySecret != "" || adminKeySecret != "" {
+			if apiKey != "" || apiKeySecret != "" {
+				settings.APIKeys = append(settings.APIKeys, APIKeyConfig{Key: apiKey, KeyVaultSecret: apiKeySecret, Scopes: []string{"admin", "inference"}, ModelAllow: []string{"*"}, CacheNamespace: "default"})
 			}
-			settings.APIKeys = []APIKeyConfig{{Key: apiKey, Scopes: []string{"admin", "inference"}, ModelAllow: []string{"*"}, CacheNamespace: "default"}}
-			if adminKey != "" && adminKey != apiKey {
-				settings.APIKeys = append(settings.APIKeys, APIKeyConfig{Key: adminKey, Scopes: []string{"admin", "inference"}, ModelAllow: []string{"*"}, CacheNamespace: "default"})
+			if adminKey != "" || adminKeySecret != "" || len(settings.APIKeys) == 0 {
+				settings.APIKeys = append(settings.APIKeys, APIKeyConfig{Key: adminKey, KeyVaultSecret: adminKeySecret, Scopes: []string{"admin", "inference"}, ModelAllow: []string{"*"}, CacheNamespace: "default"})
 			}
 		}
 	}

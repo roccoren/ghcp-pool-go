@@ -303,14 +303,14 @@ func NewPoolManager(settings Settings) (*PoolManager, error) {
 	}
 	for i := range settings.Accounts {
 		cfg := settings.Accounts[i]
-		if _, err := pm.install(&cfg); err != nil {
+		if _, err := pm.install(context.Background(), &cfg); err != nil {
 			return nil, err
 		}
 	}
 	return pm, nil
 }
 
-func (p *PoolManager) install(cfg *AccountConfig) (*Account, error) {
+func (p *PoolManager) install(ctx context.Context, cfg *AccountConfig) (*Account, error) {
 	home := ""
 	if p.Settings.Backend == "copilot" {
 		var err error
@@ -319,7 +319,10 @@ func (p *PoolManager) install(cfg *AccountConfig) (*Account, error) {
 			return nil, err
 		}
 	}
-	backend := buildBackend(cfg, p.Settings, home)
+	backend, err := buildBackend(ctx, cfg, p.Settings, home)
+	if err != nil {
+		return nil, err
+	}
 	account := &Account{
 		Config:      cfg,
 		Backend:     backend,
@@ -368,9 +371,12 @@ func (p *PoolManager) ConfigureRateLimits(config RateLimitConfig) {
 	}
 }
 
-func buildBackend(cfg *AccountConfig, settings Settings, homeDir string) Backend {
+func buildBackend(ctx context.Context, cfg *AccountConfig, settings Settings, homeDir string) (Backend, error) {
 	if settings.Backend == "copilot" {
-		token, _ := cfg.ResolveToken(settings.KeyVaultURL)
+		token, err := cfg.ResolveToken(ctx, settings.KeyVaultURL)
+		if err != nil {
+			return nil, err
+		}
 		if token == "" && cfg.BaseDirectory == "" {
 			token = firstNonEmpty(
 				os.Getenv("GHCP_COPILOT_TOKEN"),
@@ -379,9 +385,9 @@ func buildBackend(cfg *AccountConfig, settings Settings, homeDir string) Backend
 				os.Getenv("GITHUB_TOKEN"),
 			)
 		}
-		return NewCopilotBackend(cfg.ID, token, homeDir)
+		return NewCopilotBackend(cfg.ID, token, homeDir), nil
 	}
-	return NewFakeBackend(cfg.ID, cfg.Models)
+	return NewFakeBackend(cfg.ID, cfg.Models), nil
 }
 
 func (p *PoolManager) Start(ctx context.Context) error {
@@ -471,7 +477,7 @@ func (p *PoolManager) AddAccount(ctx context.Context, cfg AccountConfig) (*Accou
 	if exists {
 		return nil, &conflictError{message: "account '" + cfg.ID + "' already exists"}
 	}
-	account, err := p.install(&cfg)
+	account, err := p.install(ctx, &cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -513,8 +519,12 @@ func (p *PoolManager) RebuildBackend(ctx context.Context, id string) (*Account, 
 	if account == nil {
 		return nil, nil
 	}
+	backend, err := buildBackend(ctx, account.Config, p.Settings, account.HomeDir)
+	if err != nil {
+		return nil, err
+	}
 	_ = account.Backend.Close()
-	account.Backend = buildBackend(account.Config, p.Settings, account.HomeDir)
+	account.Backend = backend
 	account.Started = false
 	if account.Enabled {
 		if err := p.StartAccount(ctx, id); err != nil {
