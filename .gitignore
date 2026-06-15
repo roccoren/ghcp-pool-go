@@ -4,3 +4,4 @@ ghcp-pool
 runtime-home/
 __pycache__/
 *.pyc
+config.yaml

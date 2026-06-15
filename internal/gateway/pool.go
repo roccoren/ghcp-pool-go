@@ -182,8 +182,13 @@ func (a *Account) RecordSuccess() {
 
 func (a *Account) RecordFailure(message string) {
 	a.mu.Lock()
-	a.Failures++
 	a.LastError = message
+	if isNonRetryableClientError(message) {
+		a.recordRequestLocked(true, false, time.Now())
+		a.mu.Unlock()
+		return
+	}
+	a.Failures++
 	base := 30
 	if isRateLimitError(message) {
 		base = 120
@@ -192,6 +197,13 @@ func (a *Account) RecordFailure(message string) {
 	a.recordRequestLocked(true, isRateLimitError(message), time.Now())
 	backoff := time.Duration(min(a.Failures*base, 300)) * time.Second
 	a.Cooldown = time.Now().Add(backoff)
+	a.mu.Unlock()
+}
+
+func (a *Account) ClearError() {
+	a.mu.Lock()
+	a.Failures = 0
+	a.LastError = ""
 	a.mu.Unlock()
 }
 
@@ -515,6 +527,13 @@ func (p *PoolManager) RebuildBackend(ctx context.Context, id string) (*Account, 
 func isRateLimitError(message string) bool {
 	text := strings.ToLower(message)
 	return strings.Contains(text, "429") || strings.Contains(text, "too many requests") || strings.Contains(text, "rate limit")
+}
+
+func isNonRetryableClientError(message string) bool {
+	text := strings.ToLower(message)
+	return strings.Contains(text, "copilot upstream error 400") ||
+		strings.Contains(text, "invalid_request_error") ||
+		strings.Contains(text, "bad request")
 }
 
 func rateLimitRPM(bucket *TokenBucket) int {

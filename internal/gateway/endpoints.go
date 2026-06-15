@@ -8,7 +8,8 @@ const (
 	endpointMessages        = "/v1/messages"
 	endpointEmbeddings      = "/embeddings"
 
-	internalEndpointParam = "__ghcp_endpoint"
+	internalEndpointParam     = "__ghcp_endpoint"
+	internalAnthropicRawParam = "__ghcp_anthropic_raw"
 )
 
 func normalizeEndpoint(endpoint string) string {
@@ -64,7 +65,7 @@ func endpointFromParams(params map[string]any, fallback string) string {
 func cleanBackendParams(params map[string]any) map[string]any {
 	out := make(map[string]any, len(params))
 	for key, value := range params {
-		if strings.HasPrefix(key, "__ghcp_") {
+		if strings.HasPrefix(key, "__ghcp_") && key != internalAnthropicRawParam {
 			continue
 		}
 		out[key] = value

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -179,33 +180,37 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.require(w, r, "inference")
+	p, ok := s.requireAnthropic(w, r, "inference")
 	if !ok {
 		return
 	}
-	var body AnthropicMessagesRequest
-	if !decodeJSON(w, r, &body) {
+	rawBody, body, ok := decodeAnthropicMessagesRaw(w, r)
+	if !ok {
 		return
 	}
+	body.Model = normalizeAnthropicRequestedModel(body.Model, r.Header.Get("anthropic-beta"))
+	rawBody["model"] = body.Model
+	rawBody = sanitizeNativeAnthropicRaw(rawBody)
 	resolvedModel := s.gw.Settings.ResolveModelAlias(body.Model)
 	if !strings.HasPrefix(strings.ToLower(resolvedModel), "claude") {
-		writeError(w, http.StatusBadRequest, "/v1/messages is only available for claude* models")
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "/v1/messages is only available for claude* models")
 		return
 	}
 	if body.MaxTokens == nil {
-		writeError(w, http.StatusBadRequest, "/v1/messages requires max_tokens")
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "/v1/messages requires max_tokens")
 		return
 	}
 	chat := body.ToChatRequest()
+	chat.AnthropicRaw = rawBody
 	chat.PreferredEndpoint = endpointMessages
 	chat.FallbackEndpoints = []string{endpointResponses, endpointChatCompletions}
 	if !s.modelAllowed(w, chat.Model, p) {
-		writeError(w, http.StatusForbidden, "model not allowed: "+chat.Model)
+		writeAnthropicError(w, http.StatusForbidden, "permission_error", "model not allowed: "+chat.Model)
 		return
 	}
 	plan, err := s.gw.PrepareWithWait(r.Context(), chat, p, firstNonEmpty(r.Header.Get("x-ghcp-cache"), chat.Cache))
 	if err != nil {
-		s.writeInferenceError(w, err)
+		s.writeAnthropicInferenceError(w, err)
 		return
 	}
 	if body.Stream {
@@ -215,7 +220,8 @@ func (s *server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	result, accountID, err := s.gw.CompleteResult(r.Context(), plan)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "backend error: "+err.Error())
+		status, errorType, message := anthropicErrorFromBackend(err)
+		writeAnthropicError(w, status, errorType, message)
 		return
 	}
 	headers := plan.Headers()
@@ -224,25 +230,26 @@ func (s *server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) anthropicCountTokens(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.require(w, r, "inference")
+	p, ok := s.requireAnthropic(w, r, "inference")
 	if !ok {
 		return
 	}
 	var body AnthropicMessagesRequest
-	if !decodeJSON(w, r, &body) {
+	if !decodeJSONAnthropic(w, r, &body) {
 		return
 	}
+	body.Model = normalizeAnthropicRequestedModel(body.Model, r.Header.Get("anthropic-beta"))
 	resolvedModel := s.gw.Settings.ResolveModelAlias(body.Model)
 	if !p.MayUseModel(resolvedModel) {
-		writeError(w, http.StatusForbidden, "model not allowed: "+body.Model)
+		writeAnthropicError(w, http.StatusForbidden, "permission_error", "model not allowed: "+body.Model)
 		return
 	}
 	if !strings.HasPrefix(strings.ToLower(resolvedModel), "claude") {
-		writeError(w, http.StatusBadRequest, "/v1/messages/count_tokens is only available for claude* models")
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "/v1/messages/count_tokens is only available for claude* models")
 		return
 	}
 	if s.gw.Registry.LastRefresh > 0 && len(s.gw.Registry.AccountsFor(resolvedModel)) == 0 {
-		writeError(w, http.StatusNotFound, "no account serves model "+resolvedModel)
+		writeAnthropicError(w, http.StatusNotFound, "not_found_error", "no account serves model "+resolvedModel)
 		return
 	}
 	chat := body.ToChatRequest()
@@ -842,6 +849,20 @@ func (s *server) require(w http.ResponseWriter, r *http.Request, scope string) (
 	return principal, true
 }
 
+func (s *server) requireAnthropic(w http.ResponseWriter, r *http.Request, scope string) (Principal, bool) {
+	key := firstNonEmpty(r.Header.Get("Authorization"), r.Header.Get("x-api-key"), r.Header.Get("x-goog-api-key"), r.URL.Query().Get("key"))
+	principal, ok := s.gw.Authenticator.Authenticate(key)
+	if !ok {
+		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "invalid or missing API key")
+		return Principal{}, false
+	}
+	if !principal.HasScope(scope) {
+		writeAnthropicError(w, http.StatusForbidden, "permission_error", "missing scope: "+scope)
+		return Principal{}, false
+	}
+	return principal, true
+}
+
 func (s *server) modelAllowed(_ http.ResponseWriter, requested string, principal Principal) bool {
 	return principal.MayUseModel(s.gw.Settings.ResolveModelAlias(requested))
 }
@@ -859,6 +880,22 @@ func (s *server) writeInferenceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 	default:
 		writeError(w, http.StatusBadRequest, err.Error())
+	}
+}
+
+func (s *server) writeAnthropicInferenceError(w http.ResponseWriter, err error) {
+	var noAccount NoAccountForModel
+	var routeErr RoutingError
+	var rateLimit RateLimitExceeded
+	switch {
+	case errors.As(err, &noAccount):
+		writeAnthropicError(w, http.StatusNotFound, "not_found_error", err.Error())
+	case errors.As(err, &rateLimit):
+		writeAnthropicErrorWithHeaders(w, http.StatusTooManyRequests, "rate_limit_error", err.Error(), map[string]string{"Retry-After": strconv.Itoa(int(rateLimit.RetryAfter))})
+	case errors.As(err, &routeErr):
+		writeAnthropicError(w, http.StatusServiceUnavailable, "overloaded_error", err.Error())
+	default:
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 	}
 }
 
@@ -881,6 +918,39 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
 	return true
 }
 
+func decodeJSONAnthropic(w http.ResponseWriter, r *http.Request, dest any) bool {
+	defer r.Body.Close()
+	if err := json.NewDecoder(r.Body).Decode(dest); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return false
+	}
+	return true
+}
+
+func decodeAnthropicMessagesRaw(w http.ResponseWriter, r *http.Request) (map[string]any, AnthropicMessagesRequest, bool) {
+	defer r.Body.Close()
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return nil, AnthropicMessagesRequest{}, false
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return nil, AnthropicMessagesRequest{}, false
+	}
+	if raw == nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "request body must be a JSON object")
+		return nil, AnthropicMessagesRequest{}, false
+	}
+	var body AnthropicMessagesRequest
+	if err := json.Unmarshal(data, &body); err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return nil, AnthropicMessagesRequest{}, false
+	}
+	return raw, body, true
+}
+
 func writeJSON(w http.ResponseWriter, status int, body any, headers map[string]string) {
 	for key, value := range headers {
 		w.Header().Set(key, value)
@@ -896,6 +966,51 @@ func writeError(w http.ResponseWriter, status int, detail string) {
 
 func writeErrorWithHeaders(w http.ResponseWriter, status int, detail string, headers map[string]string) {
 	writeJSON(w, status, map[string]any{"detail": detail}, headers)
+}
+
+func writeAnthropicError(w http.ResponseWriter, status int, errorType, message string) {
+	writeAnthropicErrorWithHeaders(w, status, errorType, message, nil)
+}
+
+func writeAnthropicErrorWithHeaders(w http.ResponseWriter, status int, errorType, message string, headers map[string]string) {
+	if errorType == "" {
+		errorType = "api_error"
+	}
+	if message == "" {
+		message = http.StatusText(status)
+	}
+	writeJSON(w, status, map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    errorType,
+			"message": message,
+		},
+	}, headers)
+}
+
+func normalizeAnthropicRequestedModel(model string, betaHeader string) string {
+	model = normalizeAnthropicModelAlias(model)
+	if strings.Contains(strings.ToLower(betaHeader), "context-1m") && !strings.HasSuffix(model, "-1m") {
+		model += "-1m"
+	}
+	return model
+}
+
+func normalizeAnthropicModelAlias(model string) string {
+	switch {
+	case strings.HasPrefix(model, "claude-sonnet-4-6-"):
+		return "claude-sonnet-4.6"
+	case strings.HasPrefix(model, "claude-sonnet-4-5-"):
+		return "claude-sonnet-4.5"
+	case strings.HasPrefix(model, "claude-opus-4-6-"):
+		return "claude-opus-4.6"
+	case strings.HasPrefix(model, "claude-opus-4-5-"):
+		return "claude-opus-4.5"
+	case strings.HasPrefix(model, "claude-haiku-4-5-"):
+		return "claude-haiku-4.5"
+	default:
+		return model
+	}
 }
 
 func writeStream(w http.ResponseWriter, headers map[string]string, stream <-chan string, cancel context.CancelFunc) {

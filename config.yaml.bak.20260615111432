@@ -1,0 +1,7 @@
+backend: copilot
+ gateway:
+   api_keys:
+     - key: sk-admin
+       scopes: [admin, inference]
+       model_allow: ['*']
+ accounts: []

@@ -144,25 +144,27 @@ type ChatCompletionRequest struct {
 	Cache             string           `json:"cache,omitempty"`
 	ReasoningEffort   string           `json:"reasoning_effort,omitempty"`
 
-	PreferredEndpoint string   `json:"-"`
-	FallbackEndpoints []string `json:"-"`
+	PreferredEndpoint string         `json:"-"`
+	FallbackEndpoints []string       `json:"-"`
+	AnthropicRaw      map[string]any `json:"-"`
 }
 
 func (r ChatCompletionRequest) SamplingParams() map[string]any {
 	params := map[string]any{
-		"temperature":         ptrValue(r.Temperature),
-		"top_p":               ptrValue(r.TopP),
-		"max_tokens":          ptrValue(r.MaxTokens),
-		"stop":                r.Stop,
-		"n":                   ptrValue(r.N),
-		"presence_penalty":    ptrValue(r.PresencePenalty),
-		"frequency_penalty":   ptrValue(r.FrequencyPenalty),
-		"response_format":     nilIfEmptyMap(r.ResponseFormat),
-		"reasoning_effort":    emptyToNil(r.ReasoningEffort),
-		"tools":               normalizeTools(r.Tools),
-		"tool_choice":         r.ToolChoice,
-		"parallel_tool_calls": ptrValue(r.ParallelToolCalls),
-		"response_options":    nilIfEmptyMap(r.ResponseOptions),
+		"temperature":             ptrValue(r.Temperature),
+		"top_p":                   ptrValue(r.TopP),
+		"max_tokens":              ptrValue(r.MaxTokens),
+		"stop":                    r.Stop,
+		"n":                       ptrValue(r.N),
+		"presence_penalty":        ptrValue(r.PresencePenalty),
+		"frequency_penalty":       ptrValue(r.FrequencyPenalty),
+		"response_format":         nilIfEmptyMap(r.ResponseFormat),
+		"reasoning_effort":        emptyToNil(r.ReasoningEffort),
+		"tools":                   normalizeTools(r.Tools),
+		"tool_choice":             r.ToolChoice,
+		"parallel_tool_calls":     ptrValue(r.ParallelToolCalls),
+		"response_options":        nilIfEmptyMap(r.ResponseOptions),
+		internalAnthropicRawParam: nilIfEmptyMap(r.AnthropicRaw),
 	}
 	return params
 }

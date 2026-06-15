@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 var adminHeaders = map[string]string{"Authorization": "Bearer sk-admin"}
@@ -257,6 +258,10 @@ func TestResponsesAndAnthropicShapes(t *testing.T) {
 	if bad.Code != 400 || !strings.Contains(bad.Body.String(), "requires max_tokens") {
 		t.Fatalf("bad max_tokens response: %d %s", bad.Code, bad.Body.String())
 	}
+	badPayload := decodeBody(t, bad)
+	if badPayload["type"] != "error" || badPayload["error"].(map[string]any)["type"] != "invalid_request_error" {
+		t.Fatalf("bad anthropic error shape=%v", badPayload)
+	}
 	msg := request(t, h, "POST", "/v1/messages", map[string]any{"model": "claude-3.5", "max_tokens": 64, "messages": []map[string]any{{"role": "user", "content": "anthropic hello"}}}, userHeaders)
 	if msg.Code != 200 {
 		t.Fatal(msg.Body.String())
@@ -268,6 +273,34 @@ func TestResponsesAndAnthropicShapes(t *testing.T) {
 	}
 	if got := msg.Header().Get("x-ghcp-account"); got != "acct_b" {
 		t.Fatalf("anthropic account=%q", got)
+	}
+}
+
+func TestAnthropicAuthAndModelNormalization(t *testing.T) {
+	_, h := testServer(t)
+	unauth := request(t, h, "POST", "/v1/messages", map[string]any{"model": "claude-3.5", "max_tokens": 1, "messages": []map[string]any{{"role": "user", "content": "hi"}}}, nil)
+	if unauth.Code != http.StatusUnauthorized {
+		t.Fatalf("unauth status=%d body=%s", unauth.Code, unauth.Body.String())
+	}
+	body := decodeBody(t, unauth)
+	if body["type"] != "error" || body["error"].(map[string]any)["type"] != "authentication_error" {
+		t.Fatalf("auth error shape=%v", body)
+	}
+
+	if got := normalizeAnthropicRequestedModel("claude-sonnet-4-6-20260101", "context-1m-2025-08-07"); got != "claude-sonnet-4.6-1m" {
+		t.Fatalf("normalized=%q", got)
+	}
+	if got := normalizeAnthropicRequestedModel("claude-haiku-4-5-20251001", ""); got != "claude-haiku-4.5" {
+		t.Fatalf("normalized=%q", got)
+	}
+
+	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader("null"))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", "sk-user")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "JSON object") {
+		t.Fatalf("null body response=%d %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -567,6 +600,164 @@ func TestToolChoiceShapeMatchesSelectedEndpoint(t *testing.T) {
 	anthropicChoice := anthropicPayload("claude-3.5", []NeutralMessage{{Role: "user", Content: "hi"}}, map[string]any{"tool_choice": chatChoice, "response_options": map[string]any{"max_tokens": 64}}, false)
 	if anthropicChoice["tool_choice"].(map[string]any)["type"] != "tool" {
 		t.Fatalf("anthropic tool_choice=%v", anthropicChoice["tool_choice"])
+	}
+}
+
+func TestCopilotNativeThinkingNormalizesClaudeCodeShape(t *testing.T) {
+	thinking, outputConfig := copilotNativeThinking(map[string]any{"type": "enabled", "budget_tokens": float64(1024)}, nil, "claude-sonnet-4.6")
+	tm := thinking.(map[string]any)
+	if tm["type"] != "adaptive" {
+		t.Fatalf("thinking=%v", thinking)
+	}
+	if _, ok := tm["budget_tokens"]; ok {
+		t.Fatalf("budget_tokens should be removed: %v", thinking)
+	}
+	om := outputConfig.(map[string]any)
+	if om["effort"] != "low" {
+		t.Fatalf("output_config=%v", outputConfig)
+	}
+
+	haikuThinking, haikuConfig := copilotNativeThinking(map[string]any{"type": "enabled", "budget_tokens": float64(8000)}, map[string]any{"effort": "medium"}, "claude-haiku-4.5")
+	if haikuThinking != nil {
+		t.Fatalf("haiku thinking should be stripped: %v", haikuThinking)
+	}
+	if hm, ok := haikuConfig.(map[string]any); ok {
+		if _, hasEffort := hm["effort"]; hasEffort {
+			t.Fatalf("haiku output_config should not include effort: %v", haikuConfig)
+		}
+	}
+}
+
+func TestNativeAnthropicPayloadPreservesRawBlocks(t *testing.T) {
+	raw := map[string]any{
+		"model": "claude-sonnet-4.6",
+		"cache": "no-store",
+		"system": []any{
+			map[string]any{"type": "text", "text": "system", "cache_control": map[string]any{"type": "ephemeral", "scope": "workspace"}},
+		},
+		"context_management": []any{map[string]any{"type": "clear"}},
+		"thinking":           map[string]any{"type": "enabled", "budget_tokens": float64(1024)},
+		"messages": []any{
+			map[string]any{"role": "system", "content": "system in messages"},
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "text", "text": "hello", "cache_control": map[string]any{"type": "ephemeral", "scope": "tool"}},
+					map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "abc"}},
+				},
+			},
+		},
+	}
+	payload := normalizeNativeAnthropicPayload(raw, "claude-sonnet-4.6", true)
+	if payload["stream"] != true {
+		t.Fatalf("stream=%v", payload["stream"])
+	}
+	if _, ok := payload["context_management"]; ok {
+		t.Fatalf("context_management should be stripped: %v", payload)
+	}
+	if _, ok := payload["cache"]; ok {
+		t.Fatalf("gateway cache control should be stripped: %v", payload)
+	}
+	msgs := payload["messages"].([]any)
+	if len(msgs) != 1 || msgs[0].(map[string]any)["role"] == "system" {
+		t.Fatalf("system messages should be hoisted: %v", msgs)
+	}
+	systemBlocks := payload["system"].([]any)
+	if len(systemBlocks) == 0 {
+		t.Fatalf("system should be preserved/hoisted: %v", payload["system"])
+	}
+	content := msgs[0].(map[string]any)["content"].([]any)
+	if content[1].(map[string]any)["type"] != "image" {
+		t.Fatalf("raw image block not preserved: %v", content)
+	}
+	cc := content[0].(map[string]any)["cache_control"].(map[string]any)
+	if _, ok := cc["scope"]; ok {
+		t.Fatalf("cache_control.scope should be stripped: %v", cc)
+	}
+	thinking := payload["thinking"].(map[string]any)
+	if thinking["type"] != "adaptive" || thinking["budget_tokens"] != nil {
+		t.Fatalf("thinking=%v", thinking)
+	}
+	outputConfig := payload["output_config"].(map[string]any)
+	if outputConfig["effort"] != "low" {
+		t.Fatalf("output_config=%v", outputConfig)
+	}
+}
+
+func TestSanitizedAnthropicRawCacheKeyStability(t *testing.T) {
+	withScope := map[string]any{
+		"model": "claude-sonnet-4.6",
+		"messages": []any{map[string]any{
+			"role": "user",
+			"content": []any{map[string]any{
+				"type":          "text",
+				"text":          "hello",
+				"cache_control": map[string]any{"type": "ephemeral", "scope": "tool"},
+			}},
+		}},
+	}
+	withoutScope := map[string]any{
+		"model": "claude-sonnet-4.6",
+		"messages": []any{map[string]any{
+			"role": "user",
+			"content": []any{map[string]any{
+				"type":          "text",
+				"text":          "hello",
+				"cache_control": map[string]any{"type": "ephemeral"},
+			}},
+		}},
+	}
+	reqA := ChatCompletionRequest{Model: "claude-sonnet-4.6", AnthropicRaw: sanitizeNativeAnthropicRaw(withScope)}
+	reqB := ChatCompletionRequest{Model: "claude-sonnet-4.6", AnthropicRaw: sanitizeNativeAnthropicRaw(withoutScope)}
+	if toJSONString(reqA.SamplingParams()[internalAnthropicRawParam]) != toJSONString(reqB.SamplingParams()[internalAnthropicRawParam]) {
+		t.Fatalf("sanitized raw payloads should match:\n%s\n%s", toJSONString(reqA.SamplingParams()[internalAnthropicRawParam]), toJSONString(reqB.SamplingParams()[internalAnthropicRawParam]))
+	}
+}
+
+func TestClientBadRequestDoesNotCooldownAccount(t *testing.T) {
+	settings := testSettings()
+	gw, err := NewGateway(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := gw.Pool.Get("acct_a")
+	account.RecordFailure("copilot upstream error 400: invalid_request_error")
+	if account.Failures != 0 {
+		t.Fatalf("failures=%d want 0", account.Failures)
+	}
+	if remaining := time.Until(account.Cooldown); remaining > 0 {
+		t.Fatalf("unexpected cooldown %v", remaining)
+	}
+	if !account.Available() {
+		t.Fatalf("account should remain available")
+	}
+}
+
+func TestAnthropicBackendInvalidRequestPreservesStatusAndShape(t *testing.T) {
+	err := &CopilotUpstreamError{
+		StatusCode: http.StatusBadRequest,
+		Body:       []byte(`{"type":"error","error":{"type":"invalid_request_error","message":"bad thinking"}}`),
+	}
+	if !isNonRetryableBackendError(err) {
+		t.Fatalf("expected non-retryable")
+	}
+	status, errorType, message := anthropicErrorFromBackend(err)
+	if status != http.StatusBadRequest || errorType != "invalid_request_error" || message != "bad thinking" {
+		t.Fatalf("status=%d type=%q message=%q", status, errorType, message)
+	}
+	forbidden := &CopilotUpstreamError{
+		StatusCode: http.StatusForbidden,
+		Body:       []byte(`{"type":"error","error":{"type":"permission_error","message":"account forbidden"}}`),
+	}
+	if isNonRetryableBackendError(forbidden) {
+		t.Fatalf("403 should remain retryable across accounts")
+	}
+	status, errorType, message = anthropicErrorFromBackend(&CopilotUpstreamError{
+		StatusCode: http.StatusBadRequest,
+		Body:       []byte(`{"message":"adaptive thinking is not supported on this model"}`),
+	})
+	if status != http.StatusBadRequest || errorType != "invalid_request_error" || !strings.Contains(message, "adaptive thinking") {
+		t.Fatalf("status=%d type=%q message=%q", status, errorType, message)
 	}
 }
 

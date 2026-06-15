@@ -89,6 +89,9 @@ func (b *CopilotBackend) Start(ctx context.Context) error {
 		b.mu.Lock()
 		b.sdkErr = err
 		b.mu.Unlock()
+		if b.githubToken != "" {
+			return nil
+		}
 		return err
 	}
 	b.mu.Lock()
@@ -484,7 +487,7 @@ func (b *CopilotBackend) doCopilot(ctx context.Context, method, endpoint string,
 	if resp.StatusCode >= 400 {
 		defer resp.Body.Close()
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return nil, nil, fmt.Errorf("copilot upstream error %d: %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
+		return nil, nil, &CopilotUpstreamError{StatusCode: resp.StatusCode, Body: errBody}
 	}
 	if stream {
 		return resp, nil, nil
@@ -722,6 +725,9 @@ func responsesPayload(model string, messages []NeutralMessage, params map[string
 }
 
 func anthropicPayload(model string, messages []NeutralMessage, params map[string]any, stream bool) map[string]any {
+	if raw := rawAnthropicPayload(params); raw != nil {
+		return normalizeNativeAnthropicPayload(raw, model, stream)
+	}
 	system := []string{}
 	bodyMessages := []any{}
 	for _, message := range messages {
@@ -745,16 +751,230 @@ func anthropicPayload(model string, messages []NeutralMessage, params map[string
 	}
 	copyParam(body, params, "temperature")
 	copyParam(body, params, "top_p")
+	if stops := optionValue(options, "stop_sequences", nil); stops != nil {
+		body["stop_sequences"] = stops
+	}
+	if metadata := optionValue(options, "metadata", nil); metadata != nil {
+		body["metadata"] = metadata
+	}
+	if serviceTier := optionValue(options, "service_tier", nil); serviceTier != nil {
+		body["service_tier"] = serviceTier
+	}
 	if tools := anthropicTools(params["tools"]); len(tools) > 0 {
 		body["tools"] = tools
 	}
 	if choice := anthropicToolChoiceForBackend(firstAny(optionValue(options, "tool_choice", nil), params["tool_choice"])); choice != nil {
 		body["tool_choice"] = choice
 	}
-	if thinking := optionValue(options, "thinking", nil); thinking != nil {
+	if outputConfig := optionValue(options, "output_config", nil); outputConfig != nil {
+		body["output_config"] = outputConfig
+	}
+	if thinking, outputConfig := copilotNativeThinking(optionValue(options, "thinking", nil), body["output_config"], model); thinking != nil || optionValue(options, "thinking", nil) != nil {
 		body["thinking"] = thinking
+		if outputConfig != nil {
+			body["output_config"] = outputConfig
+		} else {
+			delete(body, "output_config")
+		}
 	}
 	return compactMap(body)
+}
+
+func rawAnthropicPayload(params map[string]any) map[string]any {
+	raw, ok := params[internalAnthropicRawParam].(map[string]any)
+	if !ok || len(raw) == 0 {
+		return nil
+	}
+	return cloneMap(raw)
+}
+
+func normalizeNativeAnthropicPayload(raw map[string]any, model string, stream bool) map[string]any {
+	sanitized := sanitizeNativeAnthropicRaw(raw)
+	sanitized["model"] = model
+	sanitized["stream"] = stream
+	hoistSystemMessages(sanitized)
+	if thinking, outputConfig := copilotNativeThinking(sanitized["thinking"], sanitized["output_config"], model); thinking != nil || sanitized["thinking"] != nil {
+		sanitized["thinking"] = thinking
+		if outputConfig != nil {
+			sanitized["output_config"] = outputConfig
+		} else {
+			delete(sanitized, "output_config")
+		}
+	}
+	return compactMap(sanitized)
+}
+
+func sanitizeNativeAnthropicRaw(raw map[string]any) map[string]any {
+	sanitized, _ := sanitizeAnthropicContent(raw).(map[string]any)
+	if sanitized == nil {
+		sanitized = cloneMap(raw)
+	}
+	delete(sanitized, "context_management")
+	delete(sanitized, "cache")
+	return sanitized
+}
+
+func hoistSystemMessages(payload map[string]any) {
+	rawMessages, ok := payload["messages"].([]any)
+	if !ok {
+		return
+	}
+	remaining := make([]any, 0, len(rawMessages))
+	systems := []any{}
+	if existing := payload["system"]; existing != nil {
+		switch v := existing.(type) {
+		case []any:
+			systems = append(systems, v...)
+		default:
+			systems = append(systems, v)
+		}
+	}
+	for _, raw := range rawMessages {
+		msg, ok := raw.(map[string]any)
+		if !ok || stringFromAny(msg["role"]) != "system" {
+			remaining = append(remaining, raw)
+			continue
+		}
+		if content := msg["content"]; content != nil {
+			systems = append(systems, content)
+		}
+	}
+	if len(systems) > 0 {
+		payload["system"] = mergeAnthropicSystem(systems)
+	}
+	payload["messages"] = remaining
+}
+
+func mergeAnthropicSystem(systems []any) any {
+	blocks := []any{}
+	texts := []string{}
+	for _, system := range systems {
+		switch v := system.(type) {
+		case string:
+			if v != "" {
+				texts = append(texts, v)
+			}
+		case []any:
+			blocks = append(blocks, v...)
+		default:
+			blocks = append(blocks, v)
+		}
+	}
+	if len(blocks) == 0 {
+		return strings.Join(texts, "\n")
+	}
+	if len(texts) > 0 {
+		blocks = append([]any{map[string]any{"type": "text", "text": strings.Join(texts, "\n")}}, blocks...)
+	}
+	return blocks
+}
+
+func sanitizeAnthropicContent(value any) any {
+	switch v := value.(type) {
+	case []any:
+		out := make([]any, 0, len(v))
+		for _, item := range v {
+			out = append(out, sanitizeAnthropicContent(item))
+		}
+		return out
+	case map[string]any:
+		out := map[string]any{}
+		for key, item := range v {
+			if key == "cache_control" {
+				if cc, ok := item.(map[string]any); ok {
+					clean := map[string]any{}
+					for k, cv := range cc {
+						if k != "scope" {
+							clean[k] = cv
+						}
+					}
+					out[key] = clean
+					continue
+				}
+			}
+			out[key] = sanitizeAnthropicContent(item)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func copilotNativeThinking(thinking any, outputConfig any, model string) (any, any) {
+	m, ok := thinking.(map[string]any)
+	if !ok || len(m) == 0 {
+		return thinking, outputConfig
+	}
+	out := map[string]any{}
+	for key, value := range m {
+		out[key] = value
+	}
+	if stringFromAny(out["type"]) == "enabled" {
+		out["type"] = "adaptive"
+	}
+	if out["type"] == nil {
+		out["type"] = "adaptive"
+	}
+	cfg := anyMap(outputConfig)
+	if cfg == nil {
+		cfg = map[string]any{}
+	}
+	if !modelSupportsOutputEffort(model) {
+		delete(cfg, "effort")
+		if len(cfg) == 0 {
+			return nil, nil
+		}
+		return nil, cfg
+	} else if cfg["effort"] == nil {
+		if budget := intFromAny(out["budget_tokens"], 0); budget > 0 {
+			cfg["effort"] = effortFromThinkingBudget(budget)
+		}
+	}
+	delete(out, "budget_tokens")
+	if len(cfg) == 0 {
+		return out, nil
+	}
+	return out, cfg
+}
+
+func modelSupportsOutputEffort(model string) bool {
+	model = strings.ToLower(model)
+	return strings.HasPrefix(model, "claude-sonnet-") || strings.HasPrefix(model, "claude-opus-")
+}
+
+func effortFromThinkingBudget(budget int) string {
+	if budget >= 16000 {
+		return "high"
+	}
+	if budget >= 8000 {
+		return "medium"
+	}
+	return "low"
+}
+
+func anyMap(value any) map[string]any {
+	if value == nil {
+		return nil
+	}
+	if m, ok := value.(map[string]any); ok {
+		out := map[string]any{}
+		for key, v := range m {
+			out[key] = v
+		}
+		return out
+	}
+	return nil
+}
+
+func cloneMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]any, len(m))
+	for key, value := range m {
+		out[key] = value
+	}
+	return out
 }
 
 func openAIMessages(messages []NeutralMessage) []map[string]any {
@@ -797,6 +1017,7 @@ func anthropicMessage(message NeutralMessage) []any {
 		if message.Content != "" {
 			content = append(content, map[string]any{"type": "text", "text": message.Content})
 		}
+
 		for _, tc := range normalizeOpenAIToolCalls(message.ToolCalls) {
 			fn, _ := tc["function"].(map[string]any)
 			content = append(content, map[string]any{"type": "tool_use", "id": stringFromAny(tc["id"]), "name": stringFromAny(fn["name"]), "input": argsToObject(stringFromAny(fn["arguments"]))})

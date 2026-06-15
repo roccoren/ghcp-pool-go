@@ -36,6 +36,7 @@ func (r *ModelRegistry) Refresh(ctx context.Context) {
 			account.RecordFailure("list_models: " + err.Error())
 			continue
 		}
+		account.ClearError()
 		models := make([]string, 0, len(specs))
 		for _, spec := range specs {
 			models = append(models, spec.ID)
@@ -65,6 +66,8 @@ func (r *ModelRegistry) RefreshAccount(ctx context.Context, id string) {
 		if err != nil {
 			account.RecordFailure("list_models: " + err.Error())
 			specs = nil
+		} else {
+			account.ClearError()
 		}
 		models := make([]string, 0, len(specs))
 		r.mu.Lock()

@@ -153,6 +153,9 @@ func (g *Gateway) CompleteResult(ctx context.Context, plan Plan) (ChatResult, st
 		if err != nil {
 			current.RecordFailure(err.Error())
 			current.Release()
+			if isNonRetryableBackendError(err) {
+				return ChatResult{}, "", err
+			}
 			exclude[current.ID()] = true
 			lastErr = err
 			current = g.Router.SelectExcluding(plan.Model, exclude, plan.Endpoint)
