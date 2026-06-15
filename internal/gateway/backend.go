@@ -13,6 +13,7 @@ import (
 var ErrEmbeddingsUnsupported = errors.New("embeddings are not available through the configured backend")
 
 type Backend interface {
+	Start(context.Context) error
 	ListModels(context.Context) ([]ModelSpec, error)
 	Chat(context.Context, string, []NeutralMessage, map[string]any) (ChatResult, error)
 	Embeddings(context.Context, string, []string, map[string]any) (EmbeddingResult, error)
@@ -39,6 +40,8 @@ func (b *FakeBackend) ListModels(context.Context) ([]ModelSpec, error) {
 	}
 	return out, nil
 }
+
+func (b *FakeBackend) Start(context.Context) error { return nil }
 
 func (b *FakeBackend) Chat(_ context.Context, model string, messages []NeutralMessage, params map[string]any) (ChatResult, error) {
 	if tc := b.decideToolCall(messages, params); tc != nil {

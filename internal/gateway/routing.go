@@ -204,11 +204,11 @@ func (r *Router) pick(accounts []*Account, strategy string) *Account {
 		return accounts[int(n-1)%len(accounts)]
 	case "weighted":
 		return minBy(accounts, func(a *Account) float64 { return float64(a.InFlight) / float64(a.Weight()) })
-	case "quota_aware":
+	case "quota_aware", "smart":
 		now := time.Now()
 		sort.Slice(accounts, func(i, j int) bool {
-			pi := ratePenalty(accounts[i], now)
-			pj := ratePenalty(accounts[j], now)
+			pi := smartPenalty(accounts[i], now)
+			pj := smartPenalty(accounts[j], now)
 			if pi != pj {
 				return pi < pj
 			}
@@ -223,18 +223,16 @@ func (r *Router) pick(accounts []*Account, strategy string) *Account {
 	}
 }
 
-func ratePenalty(account *Account, now time.Time) float64 {
-	account.mu.Lock()
-	last := account.LastRateLimitedAt
-	account.mu.Unlock()
-	if last.IsZero() {
-		return 0
+func smartPenalty(account *Account, now time.Time) float64 {
+	requests, failures, last429 := account.RecentStats(now)
+	score := float64(requests) + float64(failures*5) + float64(account.InFlight*10)
+	if !last429.IsZero() {
+		remaining := 300 - now.Sub(last429).Seconds()
+		if remaining > 0 {
+			score += remaining * 3
+		}
 	}
-	remaining := 300 - now.Sub(last).Seconds()
-	if remaining < 0 {
-		return 0
-	}
-	return remaining
+	return score
 }
 
 func (r *Router) Explain(model string) map[string]any {

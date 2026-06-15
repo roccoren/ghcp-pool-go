@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	sdk "github.com/github/copilot-sdk/go"
 )
 
 const (
@@ -41,8 +43,11 @@ type CopilotBackend struct {
 	githubToken string
 	homeDir     string
 
-	mu     sync.Mutex
-	access copilotAccessToken
+	mu        sync.Mutex
+	access    copilotAccessToken
+	sdkClient *sdk.Client
+	sdkReady  bool
+	sdkErr    error
 }
 
 type copilotAccessToken struct {
@@ -55,9 +60,52 @@ func NewCopilotBackend(accountID, token, homeDir string) *CopilotBackend {
 	return &CopilotBackend{accountID: accountID, githubToken: strings.TrimSpace(token), homeDir: homeDir}
 }
 
+func (b *CopilotBackend) Start(ctx context.Context) error {
+	if !b.sdkConfigured() {
+		return nil
+	}
+	b.mu.Lock()
+	if b.sdkReady {
+		b.mu.Unlock()
+		return nil
+	}
+	if b.sdkClient == nil {
+		options := &sdk.ClientOptions{
+			BaseDirectory:             b.homeDir,
+			GitHubToken:               b.sdkGitHubToken(),
+			UseLoggedInUser:           sdk.Bool(b.sdkGitHubToken() == ""),
+			Mode:                      sdk.ModeEmpty,
+			SessionIdleTimeoutSeconds: 60,
+		}
+		if options.BaseDirectory == "" {
+			options.BaseDirectory = "runtime-home/" + b.accountID
+		}
+		b.sdkClient = sdk.NewClient(options)
+	}
+	client := b.sdkClient
+	b.mu.Unlock()
+
+	if err := client.Start(ctx); err != nil {
+		b.mu.Lock()
+		b.sdkErr = err
+		b.mu.Unlock()
+		return err
+	}
+	b.mu.Lock()
+	b.sdkReady = true
+	b.sdkErr = nil
+	b.mu.Unlock()
+	return nil
+}
+
 func (b *CopilotBackend) ListModels(ctx context.Context) ([]ModelSpec, error) {
 	_, data, err := b.doCopilot(ctx, http.MethodGet, "/models", nil, false)
 	if err != nil {
+		if b.sdkGitHubToken() != "" {
+			if specs, sdkErr := b.listModelsSDK(ctx); sdkErr == nil {
+				return specs, nil
+			}
+		}
 		return nil, err
 	}
 	var payload struct {
@@ -83,6 +131,11 @@ func (b *CopilotBackend) ListModels(ctx context.Context) ([]ModelSpec, error) {
 func (b *CopilotBackend) Chat(ctx context.Context, model string, messages []NeutralMessage, params map[string]any) (ChatResult, error) {
 	endpoint := endpointFromParams(params, endpointChatCompletions)
 	clean := cleanBackendParams(params)
+	if endpointMatches(endpoint, endpointChatCompletions) && b.canUseSDK(messages, clean) {
+		if result, err := b.chatSDK(ctx, model, messages, clean, false); err == nil {
+			return result, nil
+		}
+	}
 	var body any
 	switch {
 	case endpointMatches(endpoint, endpointResponses):
@@ -177,7 +230,229 @@ func (b *CopilotBackend) ChatStream(ctx context.Context, model string, messages 
 	return out, nil
 }
 
-func (b *CopilotBackend) Close() error { return nil }
+func (b *CopilotBackend) Close() error {
+	b.mu.Lock()
+	client := b.sdkClient
+	b.sdkClient = nil
+	b.sdkReady = false
+	b.mu.Unlock()
+	if client != nil {
+		return client.Stop()
+	}
+	return nil
+}
+
+func (b *CopilotBackend) sdkGitHubToken() string {
+	if looksLikeCopilotBearer(b.githubToken) {
+		return ""
+	}
+	return b.githubToken
+}
+
+func (b *CopilotBackend) sdkConfigured() bool {
+	return b.sdkGitHubToken() != "" || b.homeDir != ""
+}
+
+func (b *CopilotBackend) sdk(ctx context.Context) (*sdk.Client, error) {
+	b.mu.Lock()
+	if b.sdkReady && b.sdkClient != nil {
+		client := b.sdkClient
+		b.mu.Unlock()
+		return client, nil
+	}
+	b.mu.Unlock()
+	if err := b.Start(ctx); err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.sdkClient == nil {
+		return nil, fmt.Errorf("sdk client not available")
+	}
+	return b.sdkClient, nil
+}
+
+func (b *CopilotBackend) listModelsSDK(ctx context.Context) ([]ModelSpec, error) {
+	client, err := b.sdk(ctx)
+	if err != nil {
+		return nil, err
+	}
+	models, err := client.ListModels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	specs := make([]ModelSpec, 0, len(models))
+	for _, model := range models {
+		specs = append(specs, ModelSpec{
+			ID:                 model.ID,
+			SupportedEndpoints: []string{endpointChatCompletions},
+			Capabilities: map[string]any{
+				"name":                        model.Name,
+				"supports_reasoning_effort":   model.Capabilities.Supports.ReasoningEffort,
+				"supports_vision":             model.Capabilities.Supports.Vision,
+				"supported_reasoning_efforts": model.SupportedReasoningEfforts,
+				"default_reasoning_effort":    model.DefaultReasoningEffort,
+				"max_context_window_tokens":   ptrValue(model.Capabilities.Limits.MaxContextWindowTokens),
+				"max_prompt_tokens":           ptrValue(model.Capabilities.Limits.MaxPromptTokens),
+			},
+		})
+	}
+	return specs, nil
+}
+
+func (b *CopilotBackend) canUseSDK(messages []NeutralMessage, params map[string]any) bool {
+	if !b.sdkConfigured() {
+		return false
+	}
+	if len(messages) != 1 || messages[0].Role != "user" || messages[0].ToolCallID != "" || len(messages[0].ToolCalls) > 0 {
+		return false
+	}
+	if tools, _ := params["tools"].([]map[string]any); len(tools) > 0 {
+		return false
+	}
+	if choice := params["tool_choice"]; choice != nil {
+		if s, ok := choice.(string); !ok || (s != "" && s != "auto" && s != "none") {
+			return false
+		}
+	}
+	for _, key := range []string{
+		"temperature", "top_p", "max_tokens", "stop", "n", "presence_penalty",
+		"frequency_penalty", "response_format", "parallel_tool_calls",
+	} {
+		if params[key] != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func (b *CopilotBackend) chatSDK(ctx context.Context, model string, messages []NeutralMessage, params map[string]any, stream bool) (ChatResult, error) {
+	client, err := b.sdk(ctx)
+	if err != nil {
+		return ChatResult{}, err
+	}
+	session, err := client.CreateSession(ctx, b.sdkSessionConfig(model, params, stream))
+	if err != nil {
+		return ChatResult{}, err
+	}
+	defer session.Disconnect()
+	prompt := messages[0].Content
+	event, err := session.SendAndWait(ctx, sdk.MessageOptions{Prompt: prompt})
+	if err != nil {
+		return ChatResult{}, err
+	}
+	content := ""
+	outputTokens := 0
+	if event != nil {
+		if data, ok := event.Data.(*sdk.AssistantMessageData); ok {
+			content = data.Content
+			if data.OutputTokens != nil {
+				outputTokens = int(*data.OutputTokens)
+			}
+			if data.Model != nil {
+				model = *data.Model
+			}
+		}
+	}
+	usage := Usage{InputTokens: approxTokens(prompt), OutputTokens: outputTokens, APIEndpoint: endpointChatCompletions}.Normalized()
+	if usage.OutputTokens == 0 {
+		usage.OutputTokens = approxTokens(content)
+		usage = usage.Normalized()
+	}
+	return ChatResult{Content: content, Model: model, Usage: usage, FinishReason: "stop"}, nil
+}
+
+func (b *CopilotBackend) chatStreamSDK(ctx context.Context, model string, messages []NeutralMessage, params map[string]any) (<-chan StreamItem, error) {
+	client, err := b.sdk(ctx)
+	if err != nil {
+		return nil, err
+	}
+	session, err := client.CreateSession(ctx, b.sdkSessionConfig(model, params, true))
+	if err != nil {
+		return nil, err
+	}
+	prompt := messages[0].Content
+	out := make(chan StreamItem)
+	go func() {
+		defer close(out)
+		defer session.Disconnect()
+		done := make(chan struct{})
+		errCh := make(chan error, 1)
+		var once sync.Once
+		var finalContent string
+		outputTokens := 0
+		markDone := func() { once.Do(func() { close(done) }) }
+		unsubscribe := session.On(func(event sdk.SessionEvent) {
+			switch data := event.Data.(type) {
+			case *sdk.AssistantMessageDeltaData:
+				emitStreamItem(ctx, out, StreamItem{Kind: "delta", Text: data.DeltaContent})
+			case *sdk.AssistantMessageData:
+				finalContent = data.Content
+				if data.OutputTokens != nil {
+					outputTokens = int(*data.OutputTokens)
+				}
+			case *sdk.SessionErrorData:
+				msg := data.Message
+				if data.StatusCode != nil {
+					msg = fmt.Sprintf("sdk session error %d: %s", *data.StatusCode, msg)
+				} else if data.ErrorType != "" {
+					msg = fmt.Sprintf("sdk session error %s: %s", data.ErrorType, msg)
+				}
+				select {
+				case errCh <- fmt.Errorf("%s", msg):
+				default:
+				}
+				markDone()
+			case *sdk.SessionIdleData:
+				markDone()
+			}
+		})
+		defer unsubscribe()
+		if _, err := session.Send(ctx, sdk.MessageOptions{Prompt: prompt}); err != nil {
+			emitStreamItem(ctx, out, StreamItem{Kind: "error", Err: err})
+			return
+		}
+		select {
+		case <-done:
+			select {
+			case err := <-errCh:
+				emitStreamItem(ctx, out, StreamItem{Kind: "error", Err: err})
+				return
+			default:
+			}
+			usage := Usage{InputTokens: approxTokens(prompt), OutputTokens: outputTokens, APIEndpoint: endpointChatCompletions}.Normalized()
+			if usage.OutputTokens == 0 {
+				usage.OutputTokens = approxTokens(finalContent)
+				usage = usage.Normalized()
+			}
+			emitStreamItem(ctx, out, StreamItem{Kind: "done", Usage: usage, FinishReason: "stop"})
+		case <-ctx.Done():
+			_ = session.Abort(context.Background())
+			emitStreamItem(context.Background(), out, StreamItem{Kind: "error", Err: ctx.Err()})
+		}
+	}()
+	return out, nil
+}
+
+func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, stream bool) *sdk.SessionConfig {
+	cfg := &sdk.SessionConfig{
+		ClientName:              "ghcp-pool-go",
+		Model:                   model,
+		Streaming:               sdk.Bool(stream),
+		AvailableTools:          []string{},
+		EnableConfigDiscovery:   sdk.Bool(false),
+		SkipEmbeddingRetrieval:  sdk.Bool(true),
+		EmbeddingCacheStorage:   sdk.String("in-memory"),
+		EnableFileHooks:         sdk.Bool(false),
+		EnableHostGitOperations: sdk.Bool(false),
+		EnableSessionStore:      sdk.Bool(false),
+		EnableSkills:            sdk.Bool(false),
+	}
+	if effort := stringParam(params, "reasoning_effort"); effort != "" && effort != "none" {
+		cfg.ReasoningEffort = effort
+	}
+	return cfg
+}
 
 func (b *CopilotBackend) doCopilot(ctx context.Context, method, endpoint string, body any, stream bool) (*http.Response, []byte, error) {
 	access, err := b.validAccessToken(ctx)

@@ -17,7 +17,7 @@ var ValidReasoningEfforts = map[string]bool{
 }
 
 var ValidStrategies = map[string]bool{
-	"round_robin": true, "least_busy": true, "weighted": true, "quota_aware": true,
+	"round_robin": true, "least_busy": true, "weighted": true, "quota_aware": true, "smart": true,
 }
 
 type APIKeyConfig struct {
@@ -141,6 +141,7 @@ type GatewayConfig struct {
 	HomeRoot             string            `yaml:"home_root" json:"home_root"`
 	RouteBusyWaitSeconds float64           `yaml:"route_busy_wait_seconds" json:"route_busy_wait_seconds"`
 	ModelAliases         map[string]string `yaml:"model_aliases" json:"model_aliases"`
+	ModelMapPath         string            `yaml:"model_map_path" json:"model_map_path"`
 	RateLimits           RateLimitConfig   `yaml:"rate_limits" json:"rate_limits"`
 	APIKeys              []APIKeyConfig    `yaml:"api_keys" json:"api_keys"`
 	Cache                CacheConfig       `yaml:"cache" json:"cache"`
@@ -167,6 +168,7 @@ type Settings struct {
 	HomeRoot             string
 	RouteBusyWaitSeconds float64
 	ModelAliases         map[string]string
+	ModelMapPath         string
 	RateLimits           RateLimitConfig
 	APIKeys              []APIKeyConfig
 	Accounts             []AccountConfig
@@ -230,6 +232,7 @@ func LoadSettings(path string) (Settings, error) {
 		HomeRoot:             firstNonEmpty(os.Getenv("GHCP_HOME_ROOT"), g.HomeRoot, "runtime-home"),
 		RouteBusyWaitSeconds: firstFloat("", g.RouteBusyWaitSeconds, 4.0),
 		ModelAliases:         map[string]string{},
+		ModelMapPath:         firstNonEmpty(os.Getenv("GHCP_MODEL_MAP_PATH"), g.ModelMapPath, "model_map.json"),
 		RateLimits: RateLimitConfig{
 			GlobalRPM:     firstInt(os.Getenv("GHCP_GLOBAL_RATE_LIMIT_RPM"), g.RateLimits.GlobalRPM),
 			PerAccountRPM: firstInt(os.Getenv("GHCP_PER_ACCOUNT_RATE_LIMIT_RPM"), g.RateLimits.PerAccountRPM),
@@ -249,6 +252,13 @@ func LoadSettings(path string) (Settings, error) {
 		if alias != "" && target != "" {
 			settings.ModelAliases[alias] = target
 		}
+	}
+	if aliases, err := LoadModelAliases(settings.ModelMapPath); err == nil {
+		for alias, target := range aliases {
+			settings.ModelAliases[alias] = target
+		}
+	} else if !os.IsNotExist(err) {
+		return Settings{}, err
 	}
 	if settings.Cache.TTLSeconds == 0 {
 		settings.Cache.TTLSeconds = 3600
@@ -353,6 +363,11 @@ func LoadSettings(path string) (Settings, error) {
 	}
 	if settings.Usage.SQLitePath != ":memory:" {
 		if dir := filepath.Dir(settings.Usage.SQLitePath); dir != "." && dir != "" {
+			_ = os.MkdirAll(dir, 0o755)
+		}
+	}
+	if settings.ModelMapPath != "" && settings.ModelMapPath != ":memory:" {
+		if dir := filepath.Dir(settings.ModelMapPath); dir != "." && dir != "" {
 			_ = os.MkdirAll(dir, 0o755)
 		}
 	}

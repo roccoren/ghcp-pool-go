@@ -24,9 +24,11 @@ The rewrite keeps the same core contract:
   admin routes, user management, debug capture, model aliases, RPM rate limits,
   health and metrics endpoints
 
-The offline `fake` backend is fully implemented for local testing. The backend
-interface is isolated so the Go-native Copilot HTTP backend can run behind the
-same pool/router/cache/meter pipeline.
+The offline `fake` backend is fully implemented for local testing. The real
+Copilot backend uses direct Copilot HTTP for protocol-compatible API calls and
+also starts an official `github.com/github/copilot-sdk/go` client per account,
+using SDK sessions for simple Chat Completions turns and SDK model discovery
+fallbacks.
 
 ## Run
 
@@ -67,13 +69,15 @@ docker run --rm -p 8000:8000 -e GHCP_API_KEY=sk-change-me ghcp-pool-go
 
 Supported deployment environment overrides include `GHCP_HOST`, `GHCP_PORT`,
 `GHCP_BACKEND`, `GHCP_CACHE_SALT`, `GHCP_USAGE_SQLITE_PATH`,
-`GHCP_GLOBAL_RATE_LIMIT_RPM`, and `GHCP_PER_ACCOUNT_RATE_LIMIT_RPM`.
+`GHCP_MODEL_MAP_PATH`, `GHCP_GLOBAL_RATE_LIMIT_RPM`, and
+`GHCP_PER_ACCOUNT_RATE_LIMIT_RPM`.
 
 Useful admin controls:
 
 - `GET/PUT /admin/model-aliases` maps friendly client model IDs to backend IDs.
   Requests resolve aliases before routing/cache; responses echo the requested ID
-  and include `x-ghcp-upstream-model` when it differs.
+  and include `x-ghcp-upstream-model` when it differs. Updates are persisted to
+  `GHCP_MODEL_MAP_PATH` (default `model_map.json`).
 - `GET/PUT /admin/rate-limits` configures global and per-account RPM token
   buckets. Exhausted buckets return HTTP 429 with `Retry-After`.
 
@@ -83,7 +87,15 @@ token; the backend exchanges it for a Copilot API token, caches it until expiry,
 detects the Copilot API base URL from the token response, and proxies supported
 Copilot endpoints directly from Go.
 
+Docker builds run the official SDK bundler before compiling so the Copilot CLI
+runtime is embedded in the gateway binary. Local source builds need Go 1.24+.
+
 Model metadata from `/models` is retained per account, including
 `supported_endpoints`. The router uses those capabilities to choose between
 Chat Completions, Responses, Anthropic Messages, and embeddings endpoints when a
 model does not support the client-requested protocol directly.
+
+Route strategies include `round_robin`, `least_busy`, `weighted`,
+`quota_aware`, and `smart`. The `smart`/`quota_aware` scoring considers recent
+request volume, recent failures, current in-flight requests, and a decaying
+penalty for recent 429/rate-limit events.

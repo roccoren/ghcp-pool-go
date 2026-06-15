@@ -209,6 +209,35 @@ func TestAdminModelAliasesRoundtrip(t *testing.T) {
 	}
 }
 
+func TestModelAliasesPersistAndLoad(t *testing.T) {
+	path := t.TempDir() + "/model_map.json"
+	settings := testSettings()
+	settings.ModelMapPath = path
+	gw, err := NewGateway(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.SetModelAliases(map[string]string{"display-model": "gpt-4.1"}); err != nil {
+		t.Fatal(err)
+	}
+	aliases, err := LoadModelAliases(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aliases["display-model"] != "gpt-4.1" {
+		t.Fatalf("aliases=%v", aliases)
+	}
+
+	t.Setenv("GHCP_MODEL_MAP_PATH", path)
+	loaded, err := LoadSettings("/does/not/exist.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ModelAliases["display-model"] != "gpt-4.1" {
+		t.Fatalf("loaded aliases=%v", loaded.ModelAliases)
+	}
+}
+
 func TestResponsesAndAnthropicShapes(t *testing.T) {
 	_, h := testServer(t)
 	resp := request(t, h, "POST", "/v1/responses", map[string]any{"model": "gpt-4.1", "input": "responses hello", "max_output_tokens": 64}, userHeaders)
@@ -425,6 +454,26 @@ func TestCapabilityRoutingHonorsRoutesBeforeEndpointChoice(t *testing.T) {
 	}
 }
 
+func TestSmartLoadBalancingUsesRecentRequestsAnd429s(t *testing.T) {
+	settings := testSettings()
+	gw, err := NewGateway(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := gw.Pool.Get("acct_a")
+	b := gw.Pool.Get("acct_b")
+	for i := 0; i < 10; i++ {
+		a.RecordSuccess()
+	}
+	if selected := gw.Router.pick([]*Account{a, b}, "smart"); selected.ID() != "acct_b" {
+		t.Fatalf("selected=%s want acct_b", selected.ID())
+	}
+	b.RecordFailure("copilot upstream error 429: too many requests")
+	if selected := gw.Router.pick([]*Account{a, b}, "smart"); selected.ID() != "acct_a" {
+		t.Fatalf("selected=%s want acct_a after 429 penalty", selected.ID())
+	}
+}
+
 func TestGeminiAllowedFunctionNamesFilterTools(t *testing.T) {
 	req := GeminiGenerateContentRequest{
 		Contents: []GeminiContent{{Role: "user", Parts: []GeminiPart{{Text: "call a tool"}}}},
@@ -518,6 +567,19 @@ func TestToolChoiceShapeMatchesSelectedEndpoint(t *testing.T) {
 	anthropicChoice := anthropicPayload("claude-3.5", []NeutralMessage{{Role: "user", Content: "hi"}}, map[string]any{"tool_choice": chatChoice, "response_options": map[string]any{"max_tokens": 64}}, false)
 	if anthropicChoice["tool_choice"].(map[string]any)["type"] != "tool" {
 		t.Fatalf("anthropic tool_choice=%v", anthropicChoice["tool_choice"])
+	}
+}
+
+func TestSDKEligibilityRequiresSinglePlainUserMessage(t *testing.T) {
+	backend := NewCopilotBackend("acct", "gh-token", "")
+	if !backend.canUseSDK([]NeutralMessage{{Role: "user", Content: "hello"}}, map[string]any{}) {
+		t.Fatalf("single plain user prompt should be SDK-eligible")
+	}
+	if backend.canUseSDK([]NeutralMessage{{Role: "system", Content: "rules"}, {Role: "user", Content: "hello"}}, map[string]any{}) {
+		t.Fatalf("roleful chat should not be SDK-eligible")
+	}
+	if backend.canUseSDK([]NeutralMessage{{Role: "user", Content: "hello"}}, map[string]any{"temperature": 0.1}) {
+		t.Fatalf("sampling params should not be SDK-eligible")
 	}
 }
 

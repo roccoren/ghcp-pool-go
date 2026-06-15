@@ -69,6 +69,15 @@ func (g *Gateway) Shutdown() {
 	_ = g.UsageStore.Close()
 }
 
+func (g *Gateway) SetModelAliases(aliases map[string]string) error {
+	clean := sanitizeAliases(aliases)
+	if err := SaveModelAliases(g.Settings.ModelMapPath, clean); err != nil {
+		return err
+	}
+	g.Settings.ModelAliases = clean
+	return nil
+}
+
 func (g *Gateway) Prepare(req ChatCompletionRequest, principal Principal, control string) (Plan, error) {
 	requestedModel := req.Model
 	model := g.Settings.ResolveModelAlias(requestedModel)

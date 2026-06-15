@@ -621,7 +621,7 @@ func (s *server) adminModelAliases(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.require(w, r, "admin"); !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"model_aliases": s.gw.Settings.ModelAliases}, nil)
+	writeJSON(w, http.StatusOK, map[string]any{"model_aliases": s.gw.Settings.ModelAliases, "model_map_path": s.gw.Settings.ModelMapPath}, nil)
 }
 
 func (s *server) adminSetModelAliases(w http.ResponseWriter, r *http.Request) {
@@ -642,8 +642,11 @@ func (s *server) adminSetModelAliases(w http.ResponseWriter, r *http.Request) {
 		}
 		aliases[alias] = target
 	}
-	s.gw.Settings.ModelAliases = aliases
-	writeJSON(w, http.StatusOK, map[string]any{"updated": len(aliases), "model_aliases": aliases}, nil)
+	if err := s.gw.SetModelAliases(aliases); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"updated": len(aliases), "model_aliases": s.gw.Settings.ModelAliases, "model_map_path": s.gw.Settings.ModelMapPath}, nil)
 }
 
 func (s *server) adminRateLimits(w http.ResponseWriter, r *http.Request) {

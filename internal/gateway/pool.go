@@ -4,10 +4,13 @@ import (
 	"context"
 	"math"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+const recentRequestWindow = time.Hour
 
 type TokenBucket struct {
 	RPM       int
@@ -85,8 +88,15 @@ type Account struct {
 	InFlight          int
 	RateLimiter       *TokenBucket
 	LastRateLimitedAt time.Time
+	RecentRequests    []RequestRecord
 	mu                sync.Mutex
 	maxParallel       chan struct{}
+}
+
+type RequestRecord struct {
+	At     time.Time
+	Failed bool
+	Is429  bool
 }
 
 func (a *Account) ID() string { return a.Config.ID }
@@ -147,6 +157,7 @@ func (a *Account) TryAcquire() bool {
 		return false
 	}
 	if a.RateLimiter != nil && !a.RateLimiter.Consume() {
+		a.LastRateLimitedAt = time.Now()
 		return false
 	}
 	a.InFlight++
@@ -165,6 +176,7 @@ func (a *Account) RecordSuccess() {
 	a.mu.Lock()
 	a.Failures = 0
 	a.LastError = ""
+	a.recordRequestLocked(false, false, time.Now())
 	a.mu.Unlock()
 }
 
@@ -177,15 +189,50 @@ func (a *Account) RecordFailure(message string) {
 		base = 120
 		a.LastRateLimitedAt = time.Now()
 	}
+	a.recordRequestLocked(true, isRateLimitError(message), time.Now())
 	backoff := time.Duration(min(a.Failures*base, 300)) * time.Second
 	a.Cooldown = time.Now().Add(backoff)
 	a.mu.Unlock()
 }
 
+func (a *Account) recordRequestLocked(failed, is429 bool, now time.Time) {
+	a.RecentRequests = append(a.RecentRequests, RequestRecord{At: now, Failed: failed, Is429: is429})
+	a.trimRecentRequestsLocked(now)
+}
+
+func (a *Account) trimRecentRequestsLocked(now time.Time) {
+	cutoff := now.Add(-recentRequestWindow)
+	i := sort.Search(len(a.RecentRequests), func(i int) bool {
+		return !a.RecentRequests[i].At.Before(cutoff)
+	})
+	if i > 0 {
+		a.RecentRequests = append([]RequestRecord{}, a.RecentRequests[i:]...)
+	}
+}
+
+func (a *Account) RecentStats(now time.Time) (requests int, failures int, last429 time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.trimRecentRequestsLocked(now)
+	for _, record := range a.RecentRequests {
+		requests++
+		if record.Failed {
+			failures++
+		}
+		if record.Is429 && record.At.After(last429) {
+			last429 = record.At
+		}
+	}
+	if a.LastRateLimitedAt.After(last429) {
+		last429 = a.LastRateLimitedAt
+	}
+	return requests, failures, last429
+}
+
 func (a *Account) Status() map[string]any {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return map[string]any{
+	status := map[string]any{
 		"id":                   a.ID(),
 		"label":                a.Config.Label,
 		"enabled":              a.Enabled,
@@ -204,6 +251,16 @@ func (a *Account) Status() map[string]any {
 		"rate_retry_after":     a.RateRetryAfter(),
 		"last_rate_limited_at": nilIfZeroTime(a.LastRateLimitedAt),
 	}
+	a.trimRecentRequestsLocked(time.Now())
+	recentFailures := 0
+	for _, record := range a.RecentRequests {
+		if record.Failed {
+			recentFailures++
+		}
+	}
+	status["recent_requests"] = len(a.RecentRequests)
+	status["recent_failures"] = recentFailures
+	return status
 }
 
 func (a *Account) authenticated() bool {
@@ -332,10 +389,14 @@ func (p *PoolManager) Start(ctx context.Context) error {
 	return nil
 }
 
-func (p *PoolManager) StartAccount(_ context.Context, id string) error {
+func (p *PoolManager) StartAccount(ctx context.Context, id string) error {
 	account := p.Get(id)
 	if account == nil {
 		return nil
+	}
+	if err := account.Backend.Start(ctx); err != nil {
+		account.RecordFailure("start: " + err.Error())
+		return err
 	}
 	account.mu.Lock()
 	account.Started = true
@@ -404,6 +465,10 @@ func (p *PoolManager) AddAccount(ctx context.Context, cfg AccountConfig) (*Accou
 	}
 	if account.Enabled {
 		if err := p.StartAccount(ctx, account.ID()); err != nil {
+			p.mu.Lock()
+			delete(p.Accounts, account.ID())
+			p.mu.Unlock()
+			_ = account.Backend.Close()
 			return nil, err
 		}
 	}
