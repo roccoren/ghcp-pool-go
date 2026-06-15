@@ -72,6 +72,10 @@ Supported deployment environment overrides include `GHCP_HOST`, `GHCP_PORT`,
 `GHCP_MODEL_MAP_PATH`, `GHCP_GLOBAL_RATE_LIMIT_RPM`, and
 `GHCP_PER_ACCOUNT_RATE_LIMIT_RPM`.
 
+For Azure Container Apps deployments that keep `GHCP_API_KEY` and
+`GHCP_COPILOT_TOKEN` in Azure Key Vault, see
+[`docs/deploy-containerapp-keyvault.md`](docs/deploy-containerapp-keyvault.md).
+
 Useful admin controls:
 
 - `GET/PUT /admin/model-aliases` maps friendly client model IDs to backend IDs.
