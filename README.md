@@ -85,6 +85,11 @@ list and a private VNet/Private Link stack, see
 
 Useful admin controls:
 
+- [`docs/project-overview-cn.md`](docs/project-overview-cn.md) is a Chinese
+  user-facing project overview covering SDK/API advantages and simple deployment
+  paths.
+- [`docs/usage-guide-cn.md`](docs/usage-guide-cn.md) is a Chinese quick usage
+  guide with OpenAI, Anthropic, Gemini, embeddings, and admin examples.
 - [`docs/admin-operations.md`](docs/admin-operations.md) has copy/paste
   workflows for managing Copilot users, viewing admin status/usage, and managing
   models.
