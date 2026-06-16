@@ -17,6 +17,7 @@ type LoginState struct {
 	DeviceCode      string
 	UserCode        string
 	VerificationURI string
+	TokenURL        string
 	Interval        int
 	ExpiresAt       time.Time
 	Status          string
@@ -47,13 +48,15 @@ func NewLoginManager(settings Settings, pool *PoolManager) *LoginManager {
 }
 
 func (m *LoginManager) Start(ctx context.Context, accountID string) (map[string]any, error) {
-	if m.pool.Get(accountID) == nil {
+	account := m.pool.Get(accountID)
+	if account == nil {
 		return nil, errors.New("account not found")
 	}
 	if m.settings.Login.ClientID == "" {
 		return nil, errors.New("login.client_id is not configured")
 	}
-	data, err := postForm(ctx, m.settings.Login.DeviceCodeURL, url.Values{
+	deviceCodeURL, tokenURL := m.loginURLs(account)
+	data, err := postForm(ctx, deviceCodeURL, url.Values{
 		"client_id": {m.settings.Login.ClientID},
 		"scope":     {m.settings.Login.Scopes},
 	})
@@ -65,6 +68,7 @@ func (m *LoginManager) Start(ctx context.Context, accountID string) (map[string]
 		DeviceCode:      stringFromMap(data, "device_code"),
 		UserCode:        stringFromMap(data, "user_code"),
 		VerificationURI: firstNonEmpty(stringFromMap(data, "verification_uri"), stringFromMap(data, "verification_uri_complete"), "https://github.com/login/device"),
+		TokenURL:        tokenURL,
 		Interval:        intFromMap(data, "interval", 5),
 		ExpiresAt:       time.Now().Add(time.Duration(intFromMap(data, "expires_in", 900)) * time.Second),
 		Status:          "pending",
@@ -89,7 +93,7 @@ func (m *LoginManager) Poll(ctx context.Context, accountID string) (map[string]a
 		state.Status = "expired"
 		return state.Public(), nil
 	}
-	data, err := postForm(ctx, m.settings.Login.TokenURL, url.Values{
+	data, err := postForm(ctx, firstNonEmpty(state.TokenURL, m.settings.Login.TokenURL), url.Values{
 		"client_id":   {m.settings.Login.ClientID},
 		"device_code": {state.DeviceCode},
 		"grant_type":  {deviceGrant},
@@ -167,6 +171,16 @@ func (m *LoginManager) applyToken(ctx context.Context, accountID, token, source 
 	return err
 }
 
+func (m *LoginManager) loginURLs(account *Account) (string, string) {
+	deviceCodeURL := m.settings.Login.DeviceCodeURL
+	tokenURL := m.settings.Login.TokenURL
+	domain := normalizeDomain(account.Config.GitHubEnterpriseURL)
+	if domain == "" || deviceCodeURL != "https://github.com/login/device/code" || tokenURL != "https://github.com/login/oauth/access_token" {
+		return deviceCodeURL, tokenURL
+	}
+	return "https://" + domain + "/login/device/code", "https://" + domain + "/login/oauth/access_token"
+}
+
 func postForm(ctx context.Context, endpoint string, values url.Values) (map[string]any, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, stringsNewReader(values.Encode()))
 	if err != nil {
@@ -174,6 +188,7 @@ func postForm(ctx context.Context, endpoint string, values url.Values) (map[stri
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", copilotUserAgent)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err

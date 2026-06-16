@@ -36,6 +36,7 @@ type ResponsesRequest struct {
 	ToolChoice           any              `json:"tool_choice,omitempty"`
 	ParallelToolCalls    *bool            `json:"parallel_tool_calls,omitempty"`
 	ReasoningEffort      string           `json:"reasoning_effort,omitempty"`
+	ContextTier          string           `json:"context_tier,omitempty"`
 }
 
 func (r ResponsesRequest) EffectiveReasoningEffort() string {
@@ -63,6 +64,7 @@ func (r ResponsesRequest) ResponseOptions() map[string]any {
 	truncation := firstNonEmpty(r.Truncation, "disabled")
 	return map[string]any{
 		"background":             ptrValue(r.Background),
+		"context_tier":           emptyToNilString(r.ContextTier),
 		"include":                r.Include,
 		"instructions":           emptyToNilString(r.Instructions),
 		"max_output_tokens":      ptrValue(r.MaxOutputTokens),
@@ -120,6 +122,7 @@ func (r ResponsesRequest) ToChatRequest() ChatCompletionRequest {
 		ParallelToolCalls: r.ParallelToolCalls,
 		ResponseOptions:   r.ResponseOptions(),
 		ReasoningEffort:   r.EffectiveReasoningEffort(),
+		ContextTier:       r.ContextTier,
 		StreamOptions:     r.StreamOptions,
 	}
 }
@@ -182,6 +185,7 @@ type AnthropicMessagesRequest struct {
 	Tools             []map[string]any   `json:"tools,omitempty"`
 	ToolChoice        any                `json:"tool_choice,omitempty"`
 	ReasoningEffort   string             `json:"reasoning_effort,omitempty"`
+	ContextTier       string             `json:"context_tier,omitempty"`
 }
 
 type EmbeddingsRequest struct {
@@ -231,6 +235,7 @@ func (r AnthropicMessagesRequest) AnthropicOptions() map[string]any {
 	return map[string]any{
 		"cache_control":      nilIfEmptyMap(r.CacheControl),
 		"container":          emptyToNilString(r.Container),
+		"context_tier":       emptyToNilString(r.ContextTier),
 		"context_management": r.ContextManagement,
 		"inference_geo":      emptyToNilString(r.InferenceGeo),
 		"max_tokens":         ptrValue(r.MaxTokens),

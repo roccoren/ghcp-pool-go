@@ -51,6 +51,47 @@ func firstFloat(raw string, values ...float64) float64 {
 	return 0
 }
 
+func firstStringSlice(raw string, values ...[]string) []string {
+	if raw != "" {
+		parts := strings.FieldsFunc(raw, func(r rune) bool {
+			return r == ',' || r == '\n' || r == '\t' || r == ' '
+		})
+		return normalizeStringList(parts)
+	}
+	for _, value := range values {
+		if len(value) > 0 {
+			return normalizeStringList(value)
+		}
+	}
+	return nil
+}
+
+func normalizeStringList(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, item := range values {
+		item = strings.TrimSpace(item)
+		if item == "" || seen[item] {
+			continue
+		}
+		seen[item] = true
+		out = append(out, item)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func containsString(values []string, needle string) bool {
+	for _, value := range values {
+		if value == needle {
+			return true
+		}
+	}
+	return false
+}
+
 func envBool(name string, fallback bool) bool {
 	raw := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
 	if raw == "" {

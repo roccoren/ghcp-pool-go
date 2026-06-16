@@ -146,6 +146,7 @@ type ChatCompletionRequest struct {
 	ResponseOptions   map[string]any   `json:"response_options,omitempty"`
 	Cache             string           `json:"cache,omitempty"`
 	ReasoningEffort   string           `json:"reasoning_effort,omitempty"`
+	ContextTier       string           `json:"context_tier,omitempty"`
 
 	PreferredEndpoint string         `json:"-"`
 	FallbackEndpoints []string       `json:"-"`
@@ -164,6 +165,7 @@ func (r ChatCompletionRequest) SamplingParams() map[string]any {
 		"frequency_penalty":       ptrValue(r.FrequencyPenalty),
 		"response_format":         nilIfEmptyMap(r.ResponseFormat),
 		"reasoning_effort":        emptyToNil(r.ReasoningEffort),
+		"context_tier":            emptyToNilString(r.ContextTier),
 		"tools":                   normalizeTools(r.Tools),
 		"tool_choice":             r.ToolChoice,
 		"parallel_tool_calls":     ptrValue(r.ParallelToolCalls),

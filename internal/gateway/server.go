@@ -119,6 +119,10 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	body.PreferredEndpoint = endpointChatCompletions
 	body.FallbackEndpoints = []string{endpointResponses}
+	if s.gw.Settings.Backend == "copilot" && copilotPrefersResponses(s.gw.Settings.ResolveModelAlias(body.Model)) {
+		body.PreferredEndpoint = endpointResponses
+		body.FallbackEndpoints = []string{endpointChatCompletions}
+	}
 	if !s.modelAllowed(w, body.Model, p) {
 		writeError(w, http.StatusForbidden, "model not allowed: "+body.Model)
 		return
@@ -157,6 +161,10 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 	chat.ResponsesRaw = rawBody
 	chat.PreferredEndpoint = endpointResponses
 	chat.FallbackEndpoints = []string{endpointChatCompletions, endpointMessages}
+	if resolved := s.gw.Settings.ResolveModelAlias(chat.Model); s.gw.Settings.Backend == "copilot" && strings.HasPrefix(strings.ToLower(resolved), "gpt-") && !copilotPrefersResponses(resolved) {
+		chat.PreferredEndpoint = endpointChatCompletions
+		chat.FallbackEndpoints = []string{endpointResponses, endpointMessages}
+	}
 	if !s.modelAllowed(w, chat.Model, p) {
 		writeError(w, http.StatusForbidden, "model not allowed: "+chat.Model)
 		return

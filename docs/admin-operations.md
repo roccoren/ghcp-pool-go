@@ -124,10 +124,10 @@ curl -sS -X POST "https://$FQDN/admin/accounts/$USER_ID/enable" \
 
 ### Device login flow
 
-Use this only when `gateway.login.client_id` is configured. The value is the
-client ID of a GitHub OAuth App that supports the device authorization flow. In
-GitHub, create or choose an OAuth App, enable device flow for that app, then put
-its client ID in gateway config:
+The gateway defaults to the public Copilot OAuth client ID used by OpenCode, so
+admin device login works without creating your own GitHub OAuth App. For custom
+branding or stricter operations control, create or choose a GitHub OAuth App
+that supports the device authorization flow, then override the client ID:
 
 ```yaml
 gateway:
@@ -138,18 +138,73 @@ gateway:
     token_url: "https://github.com/login/oauth/access_token"
 ```
 
-`scopes`, `device_code_url`, and `token_url` have these defaults, so the minimal
-config is:
+`client_id`, `scopes`, `device_code_url`, and `token_url` all have defaults, so
+the minimal public GitHub.com config no longer needs a `login:` block.
+
+To use the OpenCode-style direct provider path instead of the default SDK-first
+mode, configure:
 
 ```yaml
 gateway:
-  login:
-    client_id: "<github-oauth-app-client-id>"
+  copilot:
+    mode: opencode
+    auth_mode: oauth
+    base_url: "https://api.githubcopilot.com"
 ```
 
+`mode: sdk` is the default. It uses the official SDK for model discovery and
+simple chat turns, with direct HTTP fallback for protocol-compatible routes.
+`mode: opencode` disables SDK use and talks directly to the Copilot provider API;
+when `auth_mode` is omitted, it defaults to `oauth`.
+
+SDK mode uses the Copilot client's empty mode, so SDK built-in tools are off by
+default. To expose web search for SDK-handled simple chat turns:
+
+```yaml
+gateway:
+  copilot:
+    mode: sdk
+    sdk_web_search: true
+```
+
+For advanced SDK tool allowlists, use `sdk_available_tools`:
+
+```yaml
+gateway:
+  copilot:
+    sdk_available_tools:
+      - web_search
+```
+
+For models that expose a long-context tier, such as Claude Opus variants in
+Copilot, clients can send `context_tier: "long_context"` in Chat Completions,
+Responses, or Anthropic Messages requests. To pin a model by default:
+
+```yaml
+gateway:
+  context_tiers:
+    "claude-opus-4.8": long_context
+```
+
+For GitHub Enterprise or data-residency deployments, set the enterprise domain.
+The gateway derives both device-login endpoints and
+`https://copilot-api.<enterprise-domain>`:
+
+```yaml
+gateway:
+  copilot:
+    mode: opencode
+    auth_mode: oauth
+    enterprise_url: "ghe.example.com"
+```
+
+Per-account overrides are also available as `copilot_mode`, `copilot_auth_mode`,
+`copilot_base_url`, `copilot_sdk_web_search`,
+`copilot_sdk_available_tools`, and `github_enterprise_url`.
+
 For the Azure Container Apps deployment in this repository, add the `login:`
-block to the generated `/tmp/config.yaml` startup template or to the mounted
-`config.yaml`, then restart the Container App revision.
+and/or `copilot:` block to the generated `/tmp/config.yaml` startup template or
+to the mounted `config.yaml`, then restart the Container App revision.
 
 ```bash
 USER_ID=acct-c

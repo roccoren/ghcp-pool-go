@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,14 +20,30 @@ import (
 )
 
 const (
-	copilotTokenURL          = "https://api.github.com/copilot_internal/v2/token"
-	defaultCopilotAPIBaseURL = "https://api.individual.githubcopilot.com"
-	copilotUserAgent         = "GitHubCopilotChat/0.39.0"
-	copilotEditorVersion     = "vscode/1.111.0"
-	copilotPluginVersion     = "copilot-chat/0.39.0"
-	copilotAPIVersion        = "2026-06-01"
-	copilotIntent            = "conversation-edits"
+	copilotTokenURL             = "https://api.github.com/copilot_internal/v2/token"
+	defaultCopilotAPIBaseURL    = "https://api.individual.githubcopilot.com"
+	copilotPublicAPIBaseURL     = "https://api.githubcopilot.com"
+	defaultCopilotOAuthClientID = "Ov23li8tweQw6odWQebz"
+	copilotBackendModeSDK       = "sdk"
+	copilotBackendModeOpencode  = "opencode"
+	copilotAuthModeExchange     = "exchange"
+	copilotAuthModeOAuth        = "oauth"
+	copilotUserAgent            = "GitHubCopilotChat/0.39.0"
+	copilotEditorVersion        = "vscode/1.111.0"
+	copilotPluginVersion        = "copilot-chat/0.39.0"
+	copilotAPIVersion           = "2026-06-01"
+	copilotIntent               = "conversation-edits"
 )
+
+var ValidCopilotBackendModes = map[string]bool{
+	copilotBackendModeSDK:      true,
+	copilotBackendModeOpencode: true,
+}
+
+var ValidCopilotAuthModes = map[string]bool{
+	copilotAuthModeExchange: true,
+	copilotAuthModeOAuth:    true,
+}
 
 var copilotHTTPClient = &http.Client{
 	Transport: &http.Transport{
@@ -41,14 +58,19 @@ var copilotHTTPClient = &http.Client{
 }
 
 var copilotModelListFallbackBaseURLs = []string{
-	"https://api.githubcopilot.com",
+	copilotPublicAPIBaseURL,
 	defaultCopilotAPIBaseURL,
 }
 
 type CopilotBackend struct {
-	accountID   string
-	githubToken string
-	homeDir     string
+	accountID    string
+	githubToken  string
+	homeDir      string
+	mode         string
+	authMode     string
+	baseURL      string
+	sdkWebSearch bool
+	sdkTools     []string
 
 	mu        sync.Mutex
 	access    copilotAccessToken
@@ -63,8 +85,29 @@ type copilotAccessToken struct {
 	ExpiresAt time.Time
 }
 
+type CopilotBackendOptions struct {
+	Mode         string
+	AuthMode     string
+	BaseURL      string
+	SDKWebSearch bool
+	SDKTools     []string
+}
+
 func NewCopilotBackend(accountID, token, homeDir string) *CopilotBackend {
-	return &CopilotBackend{accountID: accountID, githubToken: strings.TrimSpace(token), homeDir: homeDir}
+	return NewCopilotBackendWithOptions(accountID, token, homeDir, CopilotBackendOptions{})
+}
+
+func NewCopilotBackendWithOptions(accountID, token, homeDir string, options CopilotBackendOptions) *CopilotBackend {
+	return &CopilotBackend{
+		accountID:    accountID,
+		githubToken:  strings.TrimSpace(token),
+		homeDir:      homeDir,
+		mode:         normalizeCopilotBackendMode(options.Mode),
+		authMode:     normalizeCopilotAuthMode(defaultCopilotAuthMode(options.Mode, options.AuthMode)),
+		baseURL:      normalizeBaseURLOrEmpty(options.BaseURL),
+		sdkWebSearch: options.SDKWebSearch,
+		sdkTools:     normalizeStringList(options.SDKTools),
+	}
 }
 
 func (b *CopilotBackend) Start(ctx context.Context) error {
@@ -109,7 +152,7 @@ func (b *CopilotBackend) Start(ctx context.Context) error {
 }
 
 func (b *CopilotBackend) ListModels(ctx context.Context) ([]ModelSpec, error) {
-	if b.sdkGitHubToken() != "" {
+	if b.mode != copilotBackendModeOpencode && b.sdkGitHubToken() != "" {
 		if specs, err := b.listModelsSDK(ctx); err == nil && len(specs) > 0 {
 			if httpSpecs, httpErr := b.listModelsDirect(ctx); httpErr == nil {
 				mergeModelEndpointMetadata(specs, httpSpecs)
@@ -168,6 +211,15 @@ func mergeModelEndpointMetadata(specs []ModelSpec, httpSpecs []ModelSpec) {
 		if len(httpSpec.SupportedEndpoints) > 0 {
 			specs[i].SupportedEndpoints = httpSpec.SupportedEndpoints
 		}
+		if httpSpec.ModelPickerEnabled != nil {
+			specs[i].ModelPickerEnabled = httpSpec.ModelPickerEnabled
+		}
+		if httpSpec.Name != "" {
+			specs[i].Name = httpSpec.Name
+		}
+		if httpSpec.Version != "" {
+			specs[i].Version = httpSpec.Version
+		}
 		if len(httpSpec.Capabilities) > 0 {
 			if specs[i].Capabilities == nil {
 				specs[i].Capabilities = map[string]any{}
@@ -224,7 +276,7 @@ func parseCopilotModels(data []byte) ([]ModelSpec, error) {
 	}
 	specs := make([]ModelSpec, 0, len(payload.Data))
 	for _, item := range payload.Data {
-		if item.ID == "" || strings.EqualFold(item.Policy.State, "disabled") {
+		if !usableCopilotModel(item.ID, item.Policy.State, item.Capabilities) {
 			continue
 		}
 		capabilities := cloneMap(item.Capabilities)
@@ -374,6 +426,9 @@ func (b *CopilotBackend) sdkGitHubToken() string {
 }
 
 func (b *CopilotBackend) sdkConfigured() bool {
+	if b.mode == copilotBackendModeOpencode {
+		return false
+	}
 	return b.sdkGitHubToken() != "" || b.homeDir != ""
 }
 
@@ -563,7 +618,7 @@ func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, s
 		ClientName:              "ghcp-pool-go",
 		Model:                   model,
 		Streaming:               sdk.Bool(stream),
-		AvailableTools:          []string{},
+		AvailableTools:          b.sdkAvailableTools(),
 		EnableConfigDiscovery:   sdk.Bool(false),
 		SkipEmbeddingRetrieval:  sdk.Bool(true),
 		EmbeddingCacheStorage:   sdk.String("in-memory"),
@@ -575,7 +630,21 @@ func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, s
 	if effort := stringParam(params, "reasoning_effort"); effort != "" && effort != "none" {
 		cfg.ReasoningEffort = effort
 	}
+	if tier := stringParam(params, "context_tier"); tier != "" && tier != "default" {
+		cfg.ContextTier = sdk.ContextTier(tier)
+	}
 	return cfg
+}
+
+func (b *CopilotBackend) sdkAvailableTools() []string {
+	tools := normalizeStringList(b.sdkTools)
+	if b.sdkWebSearch && !containsString(tools, "web_search") && !containsString(tools, "builtin:web_search") {
+		tools = append(tools, "web_search")
+	}
+	if tools == nil {
+		return []string{}
+	}
+	return tools
 }
 
 func (b *CopilotBackend) doCopilot(ctx context.Context, method, endpoint string, body any, stream bool) (*http.Response, []byte, error) {
@@ -636,14 +705,24 @@ func (b *CopilotBackend) validAccessToken(ctx context.Context) (copilotAccessTok
 	if looksLikeCopilotBearer(b.githubToken) {
 		b.access = copilotAccessToken{
 			Token:     b.githubToken,
-			BaseURL:   copilotBaseURLFromBearer(b.githubToken),
+			BaseURL:   firstNonEmpty(b.baseURL, copilotBaseURLFromBearer(b.githubToken)),
 			ExpiresAt: copilotExpiryFromBearer(b.githubToken),
+		}
+		return b.access, nil
+	}
+	if b.authMode == copilotAuthModeOAuth {
+		b.access = copilotAccessToken{
+			Token:   b.githubToken,
+			BaseURL: firstNonEmpty(b.baseURL, copilotPublicAPIBaseURL),
 		}
 		return b.access, nil
 	}
 	token, err := exchangeGitHubTokenForCopilot(ctx, b.githubToken)
 	if err != nil {
 		return copilotAccessToken{}, err
+	}
+	if b.baseURL != "" {
+		token.BaseURL = b.baseURL
 	}
 	b.access = token
 	return token, nil
@@ -749,9 +828,8 @@ func addCopilotModelHeaders(req *http.Request, token string) {
 	req.Header.Set("Editor-Version", copilotEditorVersion)
 	req.Header.Set("Editor-Plugin-Version", copilotPluginVersion)
 	req.Header.Set("Copilot-Integration-Id", "vscode-chat")
-	req.Header.Set("Openai-Intent", "conversation-agent")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Github-Api-Version", "2025-04-01")
+	req.Header.Set("X-Github-Api-Version", copilotAPIVersion)
 	req.Header.Set("X-Request-Id", newID("req"))
 }
 
@@ -910,6 +988,75 @@ func normalizeBaseURL(base string) string {
 	return strings.TrimRight(base, "/")
 }
 
+func normalizeBaseURLOrEmpty(base string) string {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return ""
+	}
+	return normalizeBaseURL(base)
+}
+
+func normalizeDomain(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		return strings.TrimRight(u.Host, "/")
+	}
+	return strings.Trim(strings.TrimPrefix(strings.TrimPrefix(raw, "https://"), "http://"), "/")
+}
+
+func copilotEnterpriseAPIBaseURL(enterpriseURL string) string {
+	domain := normalizeDomain(enterpriseURL)
+	if domain == "" {
+		return ""
+	}
+	return "https://copilot-api." + domain
+}
+
+func normalizeCopilotAuthMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		return copilotAuthModeExchange
+	}
+	return mode
+}
+
+func normalizeCopilotBackendMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		return copilotBackendModeSDK
+	}
+	return mode
+}
+
+func defaultCopilotAuthMode(mode, authMode string) string {
+	if strings.TrimSpace(authMode) != "" {
+		return authMode
+	}
+	if normalizeCopilotBackendMode(mode) == copilotBackendModeOpencode {
+		return copilotAuthModeOAuth
+	}
+	return copilotAuthModeExchange
+}
+
+func usableCopilotModel(id, policyState string, capabilities map[string]any) bool {
+	if id == "" || strings.EqualFold(policyState, "disabled") {
+		return false
+	}
+	limits := anyMap(capabilities["limits"])
+	supports := anyMap(capabilities["supports"])
+	if intFromAny(limits["max_output_tokens"], 0) <= 0 || intFromAny(limits["max_prompt_tokens"], 0) <= 0 {
+		return false
+	}
+	_, hasToolCalls := supports["tool_calls"].(bool)
+	return hasToolCalls
+}
+
 func chatPayload(model string, messages []NeutralMessage, params map[string]any, stream bool) map[string]any {
 	body := map[string]any{"model": model, "messages": openAIMessages(messages), "stream": stream}
 	copyParam(body, params, "temperature")
@@ -921,12 +1068,15 @@ func chatPayload(model string, messages []NeutralMessage, params map[string]any,
 	copyParam(body, params, "frequency_penalty")
 	copyParam(body, params, "response_format")
 	copyParam(body, params, "reasoning_effort")
+	copyParam(body, params, "context_tier")
 	if choice := chatToolChoice(params["tool_choice"]); choice != nil {
 		body["tool_choice"] = choice
 	}
 	copyParam(body, params, "parallel_tool_calls")
 	if tools := openAITools(params["tools"]); len(tools) > 0 {
 		body["tools"] = tools
+	} else if needsNoopTool(messages) {
+		body["tools"] = []map[string]any{noopChatTool()}
 	}
 	if stream {
 		body["stream_options"] = map[string]any{"include_usage": true}
@@ -963,6 +1113,7 @@ func responsesPayload(model string, messages []NeutralMessage, params map[string
 	copyParam(body, params, "top_p")
 	copyParamAs(body, params, "max_tokens", "max_output_tokens")
 	copyOption(body, options, "background")
+	copyOption(body, options, "context_tier")
 	copyOption(body, options, "include")
 	copyOption(body, options, "max_tool_calls")
 	copyOption(body, options, "metadata")
@@ -981,6 +1132,8 @@ func responsesPayload(model string, messages []NeutralMessage, params map[string
 	copyParam(body, params, "parallel_tool_calls")
 	if tools, _ := params["tools"].([]map[string]any); len(tools) > 0 {
 		body["tools"] = tools
+	} else if needsNoopTool(messages) {
+		body["tools"] = []map[string]any{noopResponsesTool()}
 	}
 	if reasoning := anyMap(optionValue(options, "reasoning", nil)); reasoning != nil {
 		body["reasoning"] = reasoning
@@ -1022,6 +1175,12 @@ func normalizeNativeResponsesPayload(raw map[string]any, model string, stream bo
 	if _, ok := sanitized["store"]; !ok {
 		sanitized["store"] = false
 	}
+	if sanitized["context_tier"] == nil {
+		copyParam(sanitized, params, "context_tier")
+	}
+	if sanitized["tools"] == nil && rawResponsesNeedsNoopTool(sanitized) {
+		sanitized["tools"] = []map[string]any{noopResponsesTool()}
+	}
 	effort := firstNonEmpty(stringParam(params, "reasoning_effort"), stringFromAny(sanitized["reasoning_effort"]))
 	delete(sanitized, "reasoning_effort")
 	if effort != "" && effort != "none" {
@@ -1060,7 +1219,7 @@ func sanitizeNativeResponsesRaw(raw map[string]any) map[string]any {
 
 func anthropicPayload(model string, messages []NeutralMessage, params map[string]any, stream bool) map[string]any {
 	if raw := rawAnthropicPayload(params); raw != nil {
-		return normalizeNativeAnthropicPayload(raw, model, stream)
+		return normalizeNativeAnthropicPayload(raw, model, stream, params)
 	}
 	system := []string{}
 	bodyMessages := []any{}
@@ -1091,11 +1250,16 @@ func anthropicPayload(model string, messages []NeutralMessage, params map[string
 	if metadata := optionValue(options, "metadata", nil); metadata != nil {
 		body["metadata"] = metadata
 	}
+	if contextTier := optionValue(options, "context_tier", nil); contextTier != nil {
+		body["context_tier"] = contextTier
+	}
 	if serviceTier := optionValue(options, "service_tier", nil); serviceTier != nil {
 		body["service_tier"] = serviceTier
 	}
 	if tools := anthropicTools(params["tools"]); len(tools) > 0 {
 		body["tools"] = tools
+	} else if needsNoopTool(messages) {
+		body["tools"] = []map[string]any{noopAnthropicTool()}
 	}
 	if choice := anthropicToolChoiceForBackend(firstAny(optionValue(options, "tool_choice", nil), params["tool_choice"])); choice != nil {
 		body["tool_choice"] = choice
@@ -1122,10 +1286,13 @@ func rawAnthropicPayload(params map[string]any) map[string]any {
 	return cloneMap(raw)
 }
 
-func normalizeNativeAnthropicPayload(raw map[string]any, model string, stream bool) map[string]any {
+func normalizeNativeAnthropicPayload(raw map[string]any, model string, stream bool, params map[string]any) map[string]any {
 	sanitized := sanitizeNativeAnthropicRaw(raw)
 	sanitized["model"] = model
 	sanitized["stream"] = stream
+	if sanitized["context_tier"] == nil {
+		copyParam(sanitized, params, "context_tier")
+	}
 	hoistSystemMessages(sanitized)
 	if thinking, outputConfig := copilotNativeThinking(sanitized["thinking"], sanitized["output_config"], model); thinking != nil || sanitized["thinking"] != nil {
 		sanitized["thinking"] = thinking
@@ -1134,6 +1301,9 @@ func normalizeNativeAnthropicPayload(raw map[string]any, model string, stream bo
 		} else {
 			delete(sanitized, "output_config")
 		}
+	}
+	if sanitized["tools"] == nil && rawAnthropicNeedsNoopTool(sanitized) {
+		sanitized["tools"] = []map[string]any{noopAnthropicTool()}
 	}
 	return compactMap(sanitized)
 }
@@ -1499,6 +1669,84 @@ func anthropicTools(value any) []map[string]any {
 		}))
 	}
 	return out
+}
+
+func needsNoopTool(messages []NeutralMessage) bool {
+	for _, message := range messages {
+		if message.ToolCallID != "" || len(message.ToolCalls) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func rawResponsesNeedsNoopTool(payload map[string]any) bool {
+	for _, item := range anySlice(payload["input"]) {
+		if m, ok := item.(map[string]any); ok {
+			switch stringFromAny(m["type"]) {
+			case "function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func rawAnthropicNeedsNoopTool(payload map[string]any) bool {
+	for _, item := range anySlice(payload["messages"]) {
+		msg, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, part := range anySlice(msg["content"]) {
+			block, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch stringFromAny(block["type"]) {
+			case "tool_use", "tool_result":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func noopToolSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"reason": map[string]any{"type": "string", "description": "Unused"},
+		},
+	}
+}
+
+func noopChatTool() map[string]any {
+	return map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "_noop",
+			"description": "Do not call this tool. It exists only for API compatibility and must never be invoked.",
+			"parameters":  noopToolSchema(),
+		},
+	}
+}
+
+func noopResponsesTool() map[string]any {
+	return map[string]any{
+		"type":        "function",
+		"name":        "_noop",
+		"description": "Do not call this tool. It exists only for API compatibility and must never be invoked.",
+		"parameters":  noopToolSchema(),
+	}
+}
+
+func noopAnthropicTool() map[string]any {
+	return map[string]any{
+		"name":         "_noop",
+		"description":  "Do not call this tool. It exists only for API compatibility and must never be invoked.",
+		"input_schema": noopToolSchema(),
+	}
 }
 
 func copyParam(dest map[string]any, params map[string]any, key string) {

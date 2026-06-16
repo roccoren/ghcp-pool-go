@@ -17,6 +17,10 @@ var ValidReasoningEfforts = map[string]bool{
 	"none": true, "low": true, "medium": true, "high": true, "xhigh": true, "max": true,
 }
 
+var ValidContextTiers = map[string]bool{
+	"default": true, "long_context": true,
+}
+
 var ValidStrategies = map[string]bool{
 	"round_robin": true, "least_busy": true, "weighted": true, "quota_aware": true, "smart": true,
 }
@@ -39,6 +43,12 @@ type AccountConfig struct {
 	TokenKeyVaultSecret string   `yaml:"token_key_vault_secret" json:"token_key_vault_secret"`
 	KeyVaultURL         string   `yaml:"key_vault_url" json:"key_vault_url"`
 	BaseDirectory       string   `yaml:"base_directory" json:"base_directory"`
+	CopilotMode         string   `yaml:"copilot_mode" json:"copilot_mode"`
+	CopilotAuthMode     string   `yaml:"copilot_auth_mode" json:"copilot_auth_mode"`
+	CopilotBaseURL      string   `yaml:"copilot_base_url" json:"copilot_base_url"`
+	CopilotSDKWebSearch *bool    `yaml:"copilot_sdk_web_search" json:"copilot_sdk_web_search"`
+	CopilotSDKTools     []string `yaml:"copilot_sdk_available_tools" json:"copilot_sdk_available_tools"`
+	GitHubEnterpriseURL string   `yaml:"github_enterprise_url" json:"github_enterprise_url"`
 	Enabled             *bool    `yaml:"enabled" json:"enabled"`
 	MaxConcurrency      int      `yaml:"max_concurrency" json:"max_concurrency"`
 	Weight              int      `yaml:"weight" json:"weight"`
@@ -166,6 +176,15 @@ type LoginConfig struct {
 	TokenURL      string `yaml:"token_url" json:"token_url"`
 }
 
+type CopilotConfig struct {
+	Mode          string   `yaml:"mode" json:"mode"`
+	AuthMode      string   `yaml:"auth_mode" json:"auth_mode"`
+	BaseURL       string   `yaml:"base_url" json:"base_url"`
+	EnterpriseURL string   `yaml:"enterprise_url" json:"enterprise_url"`
+	SDKWebSearch  bool     `yaml:"sdk_web_search" json:"sdk_web_search"`
+	SDKTools      []string `yaml:"sdk_available_tools" json:"sdk_available_tools"`
+}
+
 type GatewayConfig struct {
 	Host                 string            `yaml:"host" json:"host"`
 	Port                 int               `yaml:"port" json:"port"`
@@ -181,8 +200,10 @@ type GatewayConfig struct {
 	Cache                CacheConfig       `yaml:"cache" json:"cache"`
 	Usage                UsageConfig       `yaml:"usage" json:"usage"`
 	Login                LoginConfig       `yaml:"login" json:"login"`
+	Copilot              CopilotConfig     `yaml:"copilot" json:"copilot"`
 	Debug                DebugConfig       `yaml:"debug" json:"debug"`
 	ReasoningEfforts     map[string]string `yaml:"reasoning_efforts" json:"reasoning_efforts"`
+	ContextTiers         map[string]string `yaml:"context_tiers" json:"context_tiers"`
 }
 
 type rawSettings struct {
@@ -210,8 +231,10 @@ type Settings struct {
 	Cache                CacheConfig
 	Usage                UsageConfig
 	Login                LoginConfig
+	Copilot              CopilotConfig
 	Debug                DebugConfig
 	ReasoningEfforts     map[string]string
+	ContextTiers         map[string]string
 }
 
 func (s Settings) Addr() string {
@@ -271,14 +294,23 @@ func LoadSettings(path string) (Settings, error) {
 			GlobalRPM:     firstInt(os.Getenv("GHCP_GLOBAL_RATE_LIMIT_RPM"), g.RateLimits.GlobalRPM),
 			PerAccountRPM: firstInt(os.Getenv("GHCP_PER_ACCOUNT_RATE_LIMIT_RPM"), g.RateLimits.PerAccountRPM),
 		},
-		APIKeys:          g.APIKeys,
-		Accounts:         raw.Accounts,
-		Routes:           raw.Routes,
-		Cache:            g.Cache,
-		Usage:            g.Usage,
-		Login:            g.Login,
+		APIKeys:  g.APIKeys,
+		Accounts: raw.Accounts,
+		Routes:   raw.Routes,
+		Cache:    g.Cache,
+		Usage:    g.Usage,
+		Login:    g.Login,
+		Copilot: CopilotConfig{
+			Mode:          firstNonEmpty(os.Getenv("GHCP_COPILOT_MODE"), g.Copilot.Mode),
+			AuthMode:      firstNonEmpty(os.Getenv("GHCP_COPILOT_AUTH_MODE"), g.Copilot.AuthMode),
+			BaseURL:       firstNonEmpty(os.Getenv("GHCP_COPILOT_API_BASE_URL"), g.Copilot.BaseURL),
+			EnterpriseURL: firstNonEmpty(os.Getenv("GHCP_GITHUB_ENTERPRISE_URL"), g.Copilot.EnterpriseURL),
+			SDKWebSearch:  envBool("GHCP_COPILOT_SDK_WEB_SEARCH", g.Copilot.SDKWebSearch),
+			SDKTools:      firstStringSlice(os.Getenv("GHCP_COPILOT_SDK_AVAILABLE_TOOLS"), g.Copilot.SDKTools),
+		},
 		Debug:            g.Debug,
 		ReasoningEfforts: map[string]string{},
+		ContextTiers:     map[string]string{},
 	}
 	for alias, target := range g.ModelAliases {
 		alias = strings.TrimSpace(alias)
@@ -302,14 +334,40 @@ func LoadSettings(path string) (Settings, error) {
 	}
 	settings.Cache.Salt = firstNonEmpty(os.Getenv("GHCP_CACHE_SALT"), settings.Cache.Salt, "change-me")
 	settings.Usage.SQLitePath = firstNonEmpty(os.Getenv("GHCP_USAGE_SQLITE_PATH"), settings.Usage.SQLitePath, "usage.sqlite")
+	settings.Login.ClientID = firstNonEmpty(os.Getenv("GHCP_LOGIN_CLIENT_ID"), settings.Login.ClientID, defaultCopilotOAuthClientID)
+	settings.Copilot.Mode = normalizeCopilotBackendMode(settings.Copilot.Mode)
+	if !ValidCopilotBackendModes[settings.Copilot.Mode] {
+		return Settings{}, fmt.Errorf("invalid copilot mode %q; valid: sdk, opencode", settings.Copilot.Mode)
+	}
+	settings.Copilot.AuthMode = normalizeCopilotAuthMode(defaultCopilotAuthMode(settings.Copilot.Mode, settings.Copilot.AuthMode))
+	if !ValidCopilotAuthModes[settings.Copilot.AuthMode] {
+		return Settings{}, fmt.Errorf("invalid copilot auth_mode %q; valid: exchange, oauth", settings.Copilot.AuthMode)
+	}
+	settings.Copilot.EnterpriseURL = normalizeDomain(settings.Copilot.EnterpriseURL)
+	if settings.Copilot.BaseURL == "" && settings.Copilot.EnterpriseURL != "" {
+		settings.Copilot.BaseURL = copilotEnterpriseAPIBaseURL(settings.Copilot.EnterpriseURL)
+	}
+	if settings.Copilot.BaseURL == "" && settings.Copilot.Mode == copilotBackendModeOpencode {
+		settings.Copilot.BaseURL = copilotPublicAPIBaseURL
+	}
 	if settings.Login.Scopes == "" {
 		settings.Login.Scopes = "read:user"
 	}
+	settings.Login.DeviceCodeURL = firstNonEmpty(os.Getenv("GHCP_LOGIN_DEVICE_CODE_URL"), settings.Login.DeviceCodeURL)
+	settings.Login.TokenURL = firstNonEmpty(os.Getenv("GHCP_LOGIN_TOKEN_URL"), settings.Login.TokenURL)
 	if settings.Login.DeviceCodeURL == "" {
-		settings.Login.DeviceCodeURL = "https://github.com/login/device/code"
+		if settings.Copilot.EnterpriseURL != "" {
+			settings.Login.DeviceCodeURL = "https://" + settings.Copilot.EnterpriseURL + "/login/device/code"
+		} else {
+			settings.Login.DeviceCodeURL = "https://github.com/login/device/code"
+		}
 	}
 	if settings.Login.TokenURL == "" {
-		settings.Login.TokenURL = "https://github.com/login/oauth/access_token"
+		if settings.Copilot.EnterpriseURL != "" {
+			settings.Login.TokenURL = "https://" + settings.Copilot.EnterpriseURL + "/login/oauth/access_token"
+		} else {
+			settings.Login.TokenURL = "https://github.com/login/oauth/access_token"
+		}
 	}
 	if settings.Debug.MaxEntries == 0 {
 		settings.Debug.MaxEntries = 200
@@ -399,6 +457,13 @@ func LoadSettings(path string) (Settings, error) {
 		}
 		settings.ReasoningEfforts[pattern] = effort
 	}
+	for pattern, tier := range g.ContextTiers {
+		tier = strings.ToLower(strings.TrimSpace(tier))
+		if !ValidContextTiers[tier] {
+			return Settings{}, fmt.Errorf("invalid context tier %q for model pattern %q", tier, pattern)
+		}
+		settings.ContextTiers[pattern] = tier
+	}
 	if settings.Usage.SQLitePath != ":memory:" {
 		if dir := filepath.Dir(settings.Usage.SQLitePath); dir != "." && dir != "" {
 			_ = os.MkdirAll(dir, 0o755)
@@ -413,6 +478,14 @@ func LoadSettings(path string) (Settings, error) {
 }
 
 func resolveReasoningEffort(model string, overrides map[string]string) string {
+	return resolveModelOverride(model, overrides)
+}
+
+func resolveContextTier(model string, overrides map[string]string) string {
+	return resolveModelOverride(model, overrides)
+}
+
+func resolveModelOverride(model string, overrides map[string]string) string {
 	bestScore := -1
 	best := ""
 	for pattern, effort := range overrides {

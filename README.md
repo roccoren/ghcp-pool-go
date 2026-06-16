@@ -76,8 +76,8 @@ Supported deployment environment overrides include `GHCP_HOST`, `GHCP_PORT`,
 managed identity.
 
 For Azure Container Apps deployments that keep `GHCP_API_KEY` and
-`GHCP_COPILOT_TOKEN` in Azure Key Vault, including a private VNet/Private Link
-stack, see
+`GHCP_COPILOT_TOKEN` in Azure Key Vault, including the minimum Azure resource
+list and a private VNet/Private Link stack, see
 [`docs/deploy-containerapp-keyvault.md`](docs/deploy-containerapp-keyvault.md).
 
 Useful admin controls:
@@ -94,17 +94,50 @@ Useful admin controls:
 
 Set `GHCP_BACKEND=copilot` plus `GHCP_COPILOT_TOKEN` to route through the
 Go-native Copilot HTTP backend. `GHCP_COPILOT_TOKEN` should be a GitHub OAuth
-token; the backend exchanges it for a Copilot API token, caches it until expiry,
-detects the Copilot API base URL from the token response, and proxies supported
-Copilot endpoints directly from Go.
+token; by default the backend exchanges it for a Copilot API token, caches it
+until expiry, detects the Copilot API base URL from the token response, and
+proxies supported Copilot endpoints directly from Go.
+
+Choose the Copilot implementation with `GHCP_COPILOT_MODE` or
+`gateway.copilot.mode`:
+
+- `sdk` (default): official SDK-first behavior for model discovery and simple
+  chat turns, with direct HTTP fallback for protocol-compatible routes.
+- `opencode`: OpenCode-inspired direct provider behavior. This defaults
+  `auth_mode` to `oauth` and sends the GitHub OAuth token directly to
+  `https://api.githubcopilot.com` unless another Copilot API base URL is set.
+
+SDK mode runs the Copilot client in multi-tenant-safe empty mode, so no SDK
+built-in tools are exposed by default. Set `GHCP_COPILOT_SDK_WEB_SEARCH=true`
+or `gateway.copilot.sdk_web_search: true` to expose the SDK `web_search` tool.
+For advanced SDK tool allowlists, set `GHCP_COPILOT_SDK_AVAILABLE_TOOLS` or
+`gateway.copilot.sdk_available_tools`.
+
+Models that support a long-context tier, such as Copilot-exposed Claude Opus
+variants, can be pinned with request field `context_tier: "long_context"` or
+configured by pattern:
+
+```yaml
+gateway:
+  context_tiers:
+    "claude-opus-4.8": long_context
+```
+
+For GitHub Enterprise, set `GHCP_GITHUB_ENTERPRISE_URL=<enterprise-domain>`;
+the gateway derives `https://copilot-api.<enterprise-domain>` plus enterprise
+device-login URLs. The admin device-login flow defaults to the same public
+Copilot OAuth client ID used by OpenCode and can be overridden with
+`GHCP_LOGIN_CLIENT_ID` or `gateway.login.client_id`.
 
 Docker builds run the official SDK bundler before compiling so the Copilot CLI
 runtime is embedded in the gateway binary. Local source builds need Go 1.24+.
 
 Model metadata from `/models` is retained per account, including
-`supported_endpoints`. The router uses those capabilities to choose between
-Chat Completions, Responses, Anthropic Messages, and embeddings endpoints when a
-model does not support the client-requested protocol directly.
+`supported_endpoints` and `model_picker_enabled`. The router uses those
+capabilities to choose between Chat Completions, Responses, Anthropic Messages,
+and embeddings endpoints when a model does not support the client-requested
+protocol directly; non-picker utility models remain routable but are not
+advertised from `/v1/models`.
 
 Route strategies include `round_robin`, `least_busy`, `weighted`,
 `quota_aware`, and `smart`. The `smart`/`quota_aware` scoring considers recent

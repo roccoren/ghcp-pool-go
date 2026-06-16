@@ -8,8 +8,9 @@ This guide shows two supported patterns:
    references.
 
 The full stack is preferred for private deployments because ghcp-pool-go reads
-tokens directly from Key Vault at runtime with managed identity and can also
-write rotated Copilot tokens back to Key Vault.
+tokens directly from Key Vault at runtime with managed identity. With additional
+write RBAC, admin token updates can also persist rotated Copilot tokens back to
+Key Vault.
 
 The two secrets have different purposes:
 
@@ -20,6 +21,31 @@ The two secrets have different purposes:
 
 Do not put either value in `config.yaml`, Docker image layers, shell history, or
 source control.
+
+## Minimum Azure resources
+
+For the smallest Azure deployment that is still suitable for shared use, run
+ghcp-pool-go on Azure Container Apps and keep the gateway API key and Copilot
+tokens in Key Vault. The runtime-minimum Azure resource set is:
+
+| Azure resource | Minimum shape | Required for |
+| --- | --- | --- |
+| Resource group | One resource group in an Azure region that supports Container Apps and private endpoints. | Deployment boundary for all resources below. |
+| Container Apps environment | One managed environment. For the private stack, attach it to a delegated `Microsoft.App/environments` subnet; the template uses a `/23`. | Hosts Container Apps revisions and networking. |
+| Container App | One app running the ghcp-pool-go image. The template defaults to 0.5 vCPU, 1.0 GiB memory, `minReplicas=1`, `maxReplicas=3`, target port 8000. | Runs the gateway. |
+| Log Analytics workspace | One workspace, `PerGB2018`, 30-day retention in the template. | Container Apps logs. |
+| Managed identity | One user-assigned identity on the Container App. | Lets the app read Key Vault without storing Azure credentials. |
+| Key Vault | One Standard vault with Azure RBAC. For the private stack, disable public network access. | Stores `ghcp-api-key`, `ghcp-copilot-token`, and any per-account Copilot tokens. |
+| Key Vault role assignment | `Key Vault Secrets User` for the app identity at vault scope. Add `Key Vault Secrets Officer` only if admin token update APIs must write tokens back to Key Vault. | Runtime secret reads; optional token rotation writes. |
+| Virtual network | One VNet with a Container Apps delegated subnet and a private endpoint subnet. | Required when Key Vault public network access is disabled. |
+| Key Vault private endpoint | One private endpoint in the private endpoint subnet. | Private network path from Container Apps to Key Vault. |
+| Private DNS zone/link | `privatelink.vaultcore.azure.net` linked to the VNet. | Resolves the Key Vault hostname to the private endpoint. |
+| Container image source | Any reachable registry image, for example GHCR or ACR. | Supplies the container image. ACR is optional unless you want Azure-native image builds/storage. |
+
+Not required for the minimal gateway deployment: Azure OpenAI/Cognitive
+Services, Storage accounts, App Service, Azure Functions, Azure SQL, Redis, or a
+custom domain. Add a custom domain, ACR, persistent storage, or extra monitoring
+only if your operational requirements need them.
 
 ## Runtime Key Vault settings
 
@@ -56,7 +82,8 @@ Vault secret before rebuilding the account backend.
 
 ## Deploy the private Container Apps + Key Vault stack
 
-The Bicep template at `infra/containerapp-keyvault.bicep` creates:
+The Bicep template at `infra/containerapp-keyvault.bicep` creates the private
+minimum resource set:
 
 - VNet with a delegated Container Apps subnet and a private endpoint subnet.
 - Key Vault with Azure RBAC enabled and public network access disabled.

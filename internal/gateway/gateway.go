@@ -101,6 +101,18 @@ func (g *Gateway) Prepare(req ChatCompletionRequest, principal Principal, contro
 	} else {
 		params["reasoning_effort"] = nil
 	}
+	contextTier := stringParam(params, "context_tier")
+	if contextTier == "" {
+		contextTier = resolveContextTier(model, g.Settings.ContextTiers)
+	}
+	if contextTier != "" {
+		if !ValidContextTiers[contextTier] {
+			return Plan{}, fmt.Errorf("invalid context_tier %q; valid: default, long_context", contextTier)
+		}
+		params["context_tier"] = contextTier
+	} else {
+		params["context_tier"] = nil
+	}
 	includeUsage := false
 	if v, ok := req.StreamOptions["include_usage"].(bool); ok {
 		includeUsage = v

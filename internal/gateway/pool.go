@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"os"
 	"sort"
@@ -385,9 +386,44 @@ func buildBackend(ctx context.Context, cfg *AccountConfig, settings Settings, ho
 				os.Getenv("GITHUB_TOKEN"),
 			)
 		}
-		return NewCopilotBackend(cfg.ID, token, homeDir), nil
+		options, err := copilotBackendOptions(settings.Copilot, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return NewCopilotBackendWithOptions(cfg.ID, token, homeDir, options), nil
 	}
 	return NewFakeBackend(cfg.ID, cfg.Models), nil
+}
+
+func copilotBackendOptions(defaults CopilotConfig, cfg *AccountConfig) (CopilotBackendOptions, error) {
+	mode := normalizeCopilotBackendMode(firstNonEmpty(cfg.CopilotMode, defaults.Mode))
+	if !ValidCopilotBackendModes[mode] {
+		return CopilotBackendOptions{}, fmt.Errorf("invalid copilot mode %q for account %q; valid: sdk, opencode", mode, cfg.ID)
+	}
+	authMode := normalizeCopilotAuthMode(defaultCopilotAuthMode(mode, cfg.CopilotAuthMode))
+	if cfg.CopilotAuthMode == "" && cfg.CopilotMode == "" {
+		authMode = defaults.AuthMode
+	}
+	if !ValidCopilotAuthModes[authMode] {
+		return CopilotBackendOptions{}, fmt.Errorf("invalid copilot auth mode %q for account %q; valid: exchange, oauth", authMode, cfg.ID)
+	}
+	baseURL := firstNonEmpty(cfg.CopilotBaseURL, defaults.BaseURL)
+	enterpriseURL := firstNonEmpty(cfg.GitHubEnterpriseURL, defaults.EnterpriseURL)
+	if baseURL == "" && enterpriseURL != "" {
+		baseURL = copilotEnterpriseAPIBaseURL(enterpriseURL)
+	}
+	if baseURL == "" && mode == copilotBackendModeOpencode {
+		baseURL = copilotPublicAPIBaseURL
+	}
+	sdkWebSearch := defaults.SDKWebSearch
+	if cfg.CopilotSDKWebSearch != nil {
+		sdkWebSearch = *cfg.CopilotSDKWebSearch
+	}
+	sdkTools := defaults.SDKTools
+	if len(cfg.CopilotSDKTools) > 0 {
+		sdkTools = cfg.CopilotSDKTools
+	}
+	return CopilotBackendOptions{Mode: mode, AuthMode: authMode, BaseURL: baseURL, SDKWebSearch: sdkWebSearch, SDKTools: sdkTools}, nil
 }
 
 func (p *PoolManager) Start(ctx context.Context) error {

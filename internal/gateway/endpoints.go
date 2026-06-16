@@ -1,6 +1,9 @@
 package gateway
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 const (
 	endpointChatCompletions = "/chat/completions"
@@ -61,6 +64,29 @@ func endpointFromParams(params map[string]any, fallback string) string {
 		return endpoint
 	}
 	return fallback
+}
+
+func copilotPrefersResponses(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if strings.HasPrefix(model, "gpt-5-mini") {
+		return false
+	}
+	if !strings.HasPrefix(model, "gpt-") {
+		return false
+	}
+	rest := strings.TrimPrefix(model, "gpt-")
+	digits := ""
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			break
+		}
+		digits += string(r)
+	}
+	if digits == "" {
+		return false
+	}
+	n, err := strconv.Atoi(digits)
+	return err == nil && n >= 5
 }
 
 func cleanBackendParams(params map[string]any) map[string]any {

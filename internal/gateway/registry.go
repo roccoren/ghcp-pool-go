@@ -194,8 +194,11 @@ func (r *ModelRegistry) VisibleModels() []string {
 	defer r.mu.RUnlock()
 	models := []string{}
 	for model, ids := range r.index {
-		for id := range ids {
+		for id, spec := range ids {
 			if account := r.Pool.Get(id); account != nil && account.Enabled {
+				if spec.ModelPickerEnabled != nil && !*spec.ModelPickerEnabled {
+					continue
+				}
 				models = append(models, model)
 				break
 			}
