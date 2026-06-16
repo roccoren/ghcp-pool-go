@@ -409,12 +409,32 @@ func toolCallsToOpenAI(toolCalls []ToolCall) []map[string]any {
 	return out
 }
 
-func responseResponse(model, content, finish string, usage Usage, toolCalls []ToolCall, options map[string]any) map[string]any {
-	output := []any{}
-	if content != "" {
-		output = append(output, responseMessageItem(newID("msg"), content))
+func responseResponse(result ChatResult, options map[string]any) map[string]any {
+	output := responseOutputFromResult(result, options)
+	finish := result.FinishReason
+	if len(result.ToolCalls) > 0 {
+		finish = "tool_calls"
 	}
-	for _, tc := range toolCalls {
+	status := firstNonEmpty(result.Status, "completed")
+	return responseObject(firstNonEmpty(result.ID, newID("resp")), result.Model, status, output, result.Content, finish, &result.Usage, options, ptrBool(len(result.ToolCalls) == 0))
+}
+
+func responseOutputFromResult(result ChatResult, options map[string]any) []any {
+	if len(result.ResponsesOutput) > 0 {
+		out := make([]any, 0, len(result.ResponsesOutput))
+		for _, item := range result.ResponsesOutput {
+			out = append(out, cloneJSONMap(item))
+		}
+		return out
+	}
+	output := []any{}
+	if responseOptionsHaveWebSearchTool(options) && len(result.ToolCalls) == 0 {
+		output = append(output, map[string]any{"id": newID("ws"), "type": "web_search_call", "status": "completed"})
+	}
+	if result.Content != "" {
+		output = append(output, responseMessageItem(newID("msg"), result.Content))
+	}
+	for _, tc := range result.ToolCalls {
 		if tc.Kind == "custom" {
 			output = append(output, map[string]any{"id": newID("ctc"), "type": "custom_tool_call", "status": "completed", "call_id": tc.ID, "name": tc.Name, "input": tc.Arguments})
 		} else {
@@ -422,12 +442,18 @@ func responseResponse(model, content, finish string, usage Usage, toolCalls []To
 		}
 	}
 	if len(output) == 0 {
-		output = append(output, responseMessageItem(newID("msg"), content))
+		output = append(output, responseMessageItem(newID("msg"), result.Content))
 	}
-	if len(toolCalls) > 0 {
-		finish = "tool_calls"
+	return output
+}
+
+func responseOptionsHaveWebSearchTool(options map[string]any) bool {
+	for _, item := range anySlice(optionValue(options, "tools", nil)) {
+		if tool, ok := item.(map[string]any); ok && isWebSearchToolSpec(tool) {
+			return true
+		}
 	}
-	return responseObject(newID("resp"), model, "completed", output, content, finish, &usage, options, ptrBool(len(toolCalls) == 0))
+	return false
 }
 
 func responseObject(id, model, status string, output []any, outputText, finish string, usage *Usage, options map[string]any, endTurn *bool) map[string]any {
@@ -496,31 +522,37 @@ func responseMessageItem(id, content string) map[string]any {
 	}
 }
 
-func anthropicResponse(model, content, finish string, usage Usage, toolCalls []ToolCall, options map[string]any) map[string]any {
+func anthropicResponse(result ChatResult, options map[string]any) map[string]any {
 	blocks := []any{}
-	if content != "" {
-		blocks = append(blocks, map[string]any{"type": "text", "text": content})
+	if len(result.AnthropicContent) > 0 {
+		for _, block := range result.AnthropicContent {
+			blocks = append(blocks, cloneJSONMap(block))
+		}
+	} else if result.Content != "" {
+		blocks = append(blocks, map[string]any{"type": "text", "text": result.Content})
 	}
-	for _, tc := range toolCalls {
-		blocks = append(blocks, map[string]any{"type": "tool_use", "id": tc.ID, "name": tc.Name, "input": argsToObject(tc.Arguments)})
+	if len(result.AnthropicContent) == 0 {
+		for _, tc := range result.ToolCalls {
+			blocks = append(blocks, map[string]any{"type": "tool_use", "id": tc.ID, "name": tc.Name, "input": argsToObject(tc.Arguments)})
+		}
 	}
 	if len(blocks) == 0 {
-		blocks = append(blocks, map[string]any{"type": "text", "text": content})
+		blocks = append(blocks, map[string]any{"type": "text", "text": result.Content})
 	}
-	stop := anthropicStopReason(finish)
-	if len(toolCalls) > 0 {
+	stop := anthropicStopReason(result.FinishReason)
+	if len(result.ToolCalls) > 0 {
 		stop = "tool_use"
 	}
 	msg := map[string]any{
-		"id":            newID("msg"),
+		"id":            firstNonEmpty(result.ID, newID("msg")),
 		"type":          "message",
 		"role":          "assistant",
-		"model":         model,
+		"model":         result.Model,
 		"content":       blocks,
 		"stop_reason":   stop,
 		"stop_sequence": nil,
 		"stop_details":  nil,
-		"usage":         anthropicUsage(usage, options),
+		"usage":         anthropicUsage(result.Usage, options),
 	}
 	if container := anthropicContainer(options); container != nil {
 		msg["container"] = container

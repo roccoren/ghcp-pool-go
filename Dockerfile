@@ -10,12 +10,14 @@ COPY . .
 RUN go tool bundler -output cmd/ghcp-pool
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/ghcp-pool ./cmd/ghcp-pool
 
-FROM alpine:3.20
+FROM debian:bookworm-slim
 WORKDIR /app
 
 COPY --from=build /out/ghcp-pool /app/ghcp-pool
-RUN apk add --no-cache ca-certificates \
-    && addgroup -S ghcp && adduser -S -G ghcp ghcp \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && addgroup --system ghcp && adduser --system --ingroup ghcp ghcp \
     && mkdir -p /data /runtime-home \
     && chown -R ghcp:ghcp /data /runtime-home /app
 

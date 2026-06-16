@@ -152,20 +152,27 @@ gateway:
     base_url: "https://api.githubcopilot.com"
 ```
 
-`mode: sdk` is the default. It uses the official SDK for model discovery and
-simple chat turns, with direct HTTP fallback for protocol-compatible routes.
+`mode: sdk` is the default. It uses the official SDK for authentication, model
+discovery, and eligible simple chat turns. It never calls direct Copilot APIs;
+SDK-unsupported request shapes fail explicitly instead of falling back to HTTP.
 `mode: opencode` disables SDK use and talks directly to the Copilot provider API;
 when `auth_mode` is omitted, it defaults to `oauth`.
 
 SDK mode uses the Copilot client's empty mode, so SDK built-in tools are off by
-default. To expose web search for SDK-handled simple chat turns:
+default. To handle OpenAI/Anthropic web-search requests through the SDK without
+direct Copilot API calls, enable the explicit CLI-mode bridge:
 
 ```yaml
 gateway:
   copilot:
     mode: sdk
-    sdk_web_search: true
+    sdk_web_search_mode: cli
 ```
+
+Only web-search requests use the temporary Copilot CLI-mode SDK client; normal
+SDK turns still use empty mode. The legacy `sdk_web_search: true` setting keeps
+the older empty-mode allowlist behavior, which may not expose a usable web
+search tool in current SDK runtimes.
 
 For advanced SDK tool allowlists, use `sdk_available_tools`:
 
@@ -325,9 +332,9 @@ curl -sS "https://$FQDN/admin/users/$USER_ID/models" \
   -H "Authorization: Bearer $GHCP_API_KEY" | jq
 ```
 
-If an account only shows `gpt-4.1`, that is what Copilot advertised for that
-token during model discovery. `allow: ["*"]` permits all advertised models; it
-does not grant additional Copilot model entitlement.
+If an account only shows `gpt-4.1`, that is what SDK model discovery advertised
+for that token. `allow: ["*"]` permits all advertised models; it does not grant
+additional Copilot model entitlement.
 
 ### Refresh model discovery
 

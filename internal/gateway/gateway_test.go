@@ -139,15 +139,6 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-func jsonHTTPResponse(t *testing.T, status int, body any) *http.Response {
-	t.Helper()
-	return &http.Response{
-		StatusCode: status,
-		Header:     make(http.Header),
-		Body:       io.NopCloser(bytes.NewReader(mustJSON(t, body))),
-	}
-}
-
 func TestHealthAndAuth(t *testing.T) {
 	_, h := testServer(t)
 	if rr := request(t, h, "GET", "/healthz", nil, nil); rr.Code != 200 {
@@ -251,6 +242,17 @@ func TestLoadSettingsSDKWebSearchAndToolsFlags(t *testing.T) {
 	if strings.Join(settings.Copilot.SDKTools, ",") != "view,web_search" {
 		t.Fatalf("sdk tools=%v", settings.Copilot.SDKTools)
 	}
+	if settings.Copilot.SDKWebSearchMode != "empty" {
+		t.Fatalf("sdk web search mode=%q", settings.Copilot.SDKWebSearchMode)
+	}
+	t.Setenv("GHCP_COPILOT_SDK_WEB_SEARCH_MODE", "cli")
+	settings, err = LoadSettings("/does/not/exist.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.Copilot.SDKWebSearchMode != "cli" {
+		t.Fatalf("sdk web search mode override=%q", settings.Copilot.SDKWebSearchMode)
+	}
 }
 
 func TestLoadSettingsDerivesEnterpriseCopilotProviderURLs(t *testing.T) {
@@ -299,14 +301,15 @@ func TestCopilotBackendOptionsAllowPerAccountSDKWebSearchOverride(t *testing.T) 
 		SDKWebSearch: false,
 		SDKTools:     []string{"view"},
 	}, &AccountConfig{
-		ID:                  "acct-sdk",
-		CopilotSDKWebSearch: &enabled,
-		CopilotSDKTools:     []string{"grep"},
+		ID:                      "acct-sdk",
+		CopilotSDKWebSearch:     &enabled,
+		CopilotSDKWebSearchMode: "cli",
+		CopilotSDKTools:         []string{"grep"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !options.SDKWebSearch || strings.Join(options.SDKTools, ",") != "grep" {
+	if !options.SDKWebSearch || options.SDKWebSearchMode != "cli" || strings.Join(options.SDKTools, ",") != "grep" {
 		t.Fatalf("options=%+v", options)
 	}
 }
@@ -475,6 +478,88 @@ func TestResponsesAndAnthropicShapes(t *testing.T) {
 	}
 	if got := msg.Header().Get("x-ghcp-account"); got != "acct_b" {
 		t.Fatalf("anthropic account=%q", got)
+	}
+}
+
+func TestResponsesLifecycleAPI(t *testing.T) {
+	gw, h := testServer(t)
+	resp := request(t, h, "POST", "/v1/responses", map[string]any{"model": "gpt-4.1", "input": "remember me", "store": true}, userHeaders)
+	if resp.Code != 200 {
+		t.Fatal(resp.Body.String())
+	}
+	body := decodeBody(t, resp)
+	id := body["id"].(string)
+
+	got := request(t, h, "GET", "/v1/responses/"+id, nil, userHeaders)
+	if got.Code != 200 {
+		t.Fatalf("get response: %d %s", got.Code, got.Body.String())
+	}
+	retrieved := decodeBody(t, got)
+	if retrieved["id"] != id || retrieved["object"] != "response" {
+		t.Fatalf("retrieved=%v", retrieved)
+	}
+
+	itemsResp := request(t, h, "GET", "/v1/responses/"+id+"/input_items", nil, userHeaders)
+	if itemsResp.Code != 200 {
+		t.Fatalf("input items: %d %s", itemsResp.Code, itemsResp.Body.String())
+	}
+	items := decodeBody(t, itemsResp)
+	data := items["data"].([]any)
+	if len(data) != 1 || data[0].(map[string]any)["type"] != "message" {
+		t.Fatalf("input items=%v", items)
+	}
+
+	queuedID := "resp_cancel_test"
+	gw.Responses.Store(map[string]any{"id": queuedID, "object": "response", "status": "in_progress", "model": "gpt-4.1", "output": []any{}, "output_text": ""}, nil)
+	cancel := request(t, h, "POST", "/v1/responses/"+queuedID+"/cancel", nil, userHeaders)
+	if cancel.Code != 200 {
+		t.Fatalf("cancel: %d %s", cancel.Code, cancel.Body.String())
+	}
+	if decodeBody(t, cancel)["status"] != "cancelled" {
+		t.Fatalf("cancel body=%v", decodeBody(t, cancel))
+	}
+
+	del := request(t, h, "DELETE", "/v1/responses/"+id, nil, userHeaders)
+	if del.Code != 200 || decodeBody(t, del)["deleted"] != true {
+		t.Fatalf("delete: %d %s", del.Code, del.Body.String())
+	}
+	missing := request(t, h, "GET", "/v1/responses/"+id, nil, userHeaders)
+	if missing.Code != 404 || !strings.Contains(missing.Body.String(), "response not found") {
+		t.Fatalf("missing: %d %s", missing.Code, missing.Body.String())
+	}
+}
+
+func TestNativeOutputBlocksArePreserved(t *testing.T) {
+	responses := responseResponse(ChatResult{
+		ID:      "resp_native",
+		Model:   "gpt-5.5",
+		Content: "answer",
+		Usage:   Usage{InputTokens: 1, OutputTokens: 1}.Normalized(),
+		ResponsesOutput: []map[string]any{
+			{"id": "rs_1", "type": "reasoning", "summary": []any{map[string]any{"type": "summary_text", "text": "thought"}}},
+			{"id": "ws_1", "type": "web_search_call", "status": "completed"},
+			{"id": "msg_1", "type": "message", "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "answer", "annotations": []any{}}}},
+		},
+	}, nil)
+	output := responses["output"].([]any)
+	if output[0].(map[string]any)["type"] != "reasoning" || output[1].(map[string]any)["type"] != "web_search_call" {
+		t.Fatalf("responses output=%v", output)
+	}
+
+	anthropic := anthropicResponse(ChatResult{
+		ID:           "msg_native",
+		Model:        "claude-sonnet-4.6",
+		Content:      "final",
+		Usage:        Usage{InputTokens: 1, OutputTokens: 1}.Normalized(),
+		FinishReason: "stop",
+		AnthropicContent: []map[string]any{
+			{"type": "thinking", "thinking": "private summary", "signature": "sig"},
+			{"type": "text", "text": "final", "citations": []any{map[string]any{"type": "webpage_location", "url": "https://example.com"}}},
+		},
+	}, nil)
+	blocks := anthropic["content"].([]any)
+	if blocks[0].(map[string]any)["type"] != "thinking" || blocks[1].(map[string]any)["citations"] == nil {
+		t.Fatalf("anthropic blocks=%v", blocks)
 	}
 }
 
@@ -841,6 +926,26 @@ func TestToolChoiceShapeMatchesSelectedEndpoint(t *testing.T) {
 	}
 }
 
+func TestWebSearchToolPreservedAcrossPayloads(t *testing.T) {
+	tools := normalizeTools([]map[string]any{
+		{"type": "web_search_preview", "search_context_size": "low"},
+		{"type": "function", "function": map[string]any{"name": "lookup", "description": "Lookup", "parameters": map[string]any{"type": "object"}}},
+	})
+	if len(tools) != 2 || tools[0]["type"] != "web_search_preview" || tools[1]["name"] != "lookup" {
+		t.Fatalf("normalized tools=%v", tools)
+	}
+	responses := responsesPayload("gpt-5.5", []NeutralMessage{{Role: "user", Content: "hi"}}, map[string]any{"tools": tools}, false)
+	responseTools := responses["tools"].([]map[string]any)
+	if responseTools[0]["type"] != "web_search_preview" || responseTools[0]["search_context_size"] != "low" {
+		t.Fatalf("responses tools=%v", responseTools)
+	}
+	anthropic := anthropicPayload("claude-sonnet-4.6", []NeutralMessage{{Role: "user", Content: "hi"}}, map[string]any{"tools": []map[string]any{{"type": "web_search_20250305", "name": "web_search"}}, "response_options": map[string]any{"max_tokens": 64}}, false)
+	anthropicTools := anthropic["tools"].([]map[string]any)
+	if anthropicTools[0]["type"] != "web_search_20250305" || anthropicTools[0]["name"] != "web_search" {
+		t.Fatalf("anthropic tools=%v", anthropicTools)
+	}
+}
+
 func TestResponsesPayloadPreservesNativeOptions(t *testing.T) {
 	payload := responsesPayload("gpt-5.5", []NeutralMessage{{Role: "user", Content: "hi"}}, map[string]any{
 		"reasoning_effort": "high",
@@ -1006,52 +1111,124 @@ func TestCopilotDirectOAuthModeUsesProviderBaseURL(t *testing.T) {
 	}
 }
 
-func TestCopilotExchange404WithOAuthTokenUsesDirectProvider(t *testing.T) {
+func TestCopilotSDKModeListsModelsOnlyThroughSDK(t *testing.T) {
 	oldClient := copilotHTTPClient
-	oldFallbacks := copilotModelListFallbackBaseURLs
 	defer func() {
 		copilotHTTPClient = oldClient
-		copilotModelListFallbackBaseURLs = oldFallbacks
 	}()
-	copilotModelListFallbackBaseURLs = nil
-
-	tokenRequests := 0
-	modelRequests := 0
 	copilotHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		switch req.URL.Host {
-		case "api.github.com":
-			tokenRequests++
-			return jsonHTTPResponse(t, http.StatusNotFound, map[string]any{"message": "Not Found"}), nil
-		case "api.githubcopilot.com":
-			modelRequests++
-			if req.URL.Path != "/models" {
-				t.Fatalf("unexpected provider path %q", req.URL.Path)
-			}
-			if got := req.Header.Get("Authorization"); got != "Bearer gho_oauth_token" {
-				t.Fatalf("authorization=%q", got)
-			}
-			return jsonHTTPResponse(t, http.StatusOK, map[string]any{"data": []any{
-				copilotModelFixture("gpt-5.5", []string{"/chat/completions"}),
-			}}), nil
-		default:
-			t.Fatalf("unexpected host %q", req.URL.Host)
-			return nil, nil
-		}
+		t.Fatalf("sdk model discovery should not call Copilot HTTP: %s", req.URL.String())
+		return nil, nil
 	})}
 
-	backend := NewCopilotBackendWithOptions("acct", "gho_oauth_token", "", CopilotBackendOptions{AuthMode: copilotAuthModeExchange})
-	specs, err := backend.listModelsDirect(context.Background())
+	backend := NewCopilotBackend("acct", "gho_oauth_token", "")
+	backend.sdkClient = sdk.NewClient(&sdk.ClientOptions{OnListModels: func(context.Context) ([]sdk.ModelInfo, error) {
+		return []sdk.ModelInfo{
+			{ID: "claude-sonnet-4.6", Name: "Claude Sonnet 4.6"},
+			{ID: "gpt-5.5", Name: "GPT-5.5"},
+		}, nil
+	}})
+	backend.sdkReady = true
+	specs, err := backend.ListModels(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tokenRequests != 1 || modelRequests != 1 {
-		t.Fatalf("requests token=%d model=%d", tokenRequests, modelRequests)
-	}
-	if len(specs) != 1 || specs[0].ID != "gpt-5.5" {
+	if len(specs) != 2 {
 		t.Fatalf("specs=%v", specs)
 	}
-	if backend.access.Token != "gho_oauth_token" || backend.access.BaseURL != copilotPublicAPIBaseURL {
-		t.Fatalf("access=%+v", backend.access)
+	if specs[0].ID != "claude-sonnet-4.6" || !supportedEndpoint(specs[0], endpointMessages) {
+		t.Fatalf("claude spec=%+v", specs[0])
+	}
+	if specs[1].ID != "gpt-5.5" || !supportedEndpoint(specs[1], endpointResponses) {
+		t.Fatalf("gpt spec=%+v", specs[1])
+	}
+}
+
+func TestCopilotSDKModeEmptyModelListFails(t *testing.T) {
+	backend := NewCopilotBackend("acct", "gho_oauth_token", "")
+	backend.sdkClient = sdk.NewClient(&sdk.ClientOptions{OnListModels: func(context.Context) ([]sdk.ModelInfo, error) {
+		return nil, nil
+	}})
+	backend.sdkReady = true
+	_, err := backend.ListModels(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "sdk model discovery returned no models") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestCopilotSDKModeBestEffortRequestsWithoutHTTP(t *testing.T) {
+	oldClient := copilotHTTPClient
+	defer func() { copilotHTTPClient = oldClient }()
+	copilotHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		t.Fatalf("sdk mode should not call Copilot HTTP: %s", req.URL.String())
+		return nil, nil
+	})}
+
+	backend := NewCopilotBackend("acct", "gh-token", "")
+	cases := []struct {
+		name     string
+		messages []NeutralMessage
+		params   map[string]any
+	}{
+		{
+			name:     "multi-message chat",
+			messages: []NeutralMessage{{Role: "system", Content: "rules"}, {Role: "user", Content: "hello"}},
+		},
+		{
+			name:     "sampling param",
+			messages: []NeutralMessage{{Role: "user", Content: "hello"}},
+			params:   map[string]any{"max_tokens": 10},
+		},
+		{
+			name:     "responses endpoint",
+			messages: []NeutralMessage{{Role: "user", Content: "hello"}},
+			params:   map[string]any{internalEndpointParam: endpointResponses},
+		},
+		{
+			name:     "messages endpoint",
+			messages: []NeutralMessage{{Role: "user", Content: "hello"}},
+			params:   map[string]any{internalEndpointParam: endpointMessages},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !backend.canUseSDK(tc.messages, tc.params) {
+				t.Fatalf("expected SDK best-effort support")
+			}
+		})
+	}
+
+	result := applySDKOutputConstraints(ChatResult{Content: "one two three stop four", FinishReason: "stop", Usage: Usage{InputTokens: 1, OutputTokens: 5}}, map[string]any{"max_tokens": 2, "stop": []any{"stop"}})
+	if result.Content != "one two" || result.FinishReason != "length" {
+		t.Fatalf("constrained result=%+v", result)
+	}
+}
+
+func TestCopilotSDKModeAcceptsToolRequestsWithoutDirectHTTP(t *testing.T) {
+	oldClient := copilotHTTPClient
+	defer func() { copilotHTTPClient = oldClient }()
+	copilotHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		t.Fatalf("sdk mode should not call Copilot HTTP: %s", req.URL.String())
+		return nil, nil
+	})}
+
+	backend := NewCopilotBackend("acct", "gh-token", "")
+	params := map[string]any{
+		"tools": []map[string]any{{"type": "function", "function": map[string]any{"name": "lookup"}}},
+	}
+	req := ChatCompletionRequest{Model: "gpt-5-mini", Messages: []ChatMessage{{Role: "user", Content: "hello", Raw: map[string]any{"role": "user", "content": "hello"}}}, Tools: params["tools"].([]map[string]any)}
+	cfg := backend.sdkSessionConfig("gpt-5-mini", req.SamplingParams(), false)
+	if len(cfg.Tools) != 1 || cfg.Tools[0].Name != "lookup" {
+		t.Fatalf("sdk tools=%v", cfg.Tools)
+	}
+	if strings.Join(cfg.AvailableTools, ",") != "lookup" {
+		t.Fatalf("available tools=%v", cfg.AvailableTools)
+	}
+	if backend.canUseSDK([]NeutralMessage{{Role: "user", Content: "hello"}}, map[string]any{"n": 2}) {
+		t.Fatalf("n>1 cannot be satisfied through SDK")
+	}
+	if _, err := backend.Embeddings(context.Background(), "text-embedding", []string{"hello"}, nil); err != ErrEmbeddingsUnsupported {
+		t.Fatalf("embeddings err=%v", err)
 	}
 }
 
@@ -1312,20 +1489,50 @@ func TestSDKEligibilityRequiresSinglePlainUserMessage(t *testing.T) {
 	if !backend.canUseSDK([]NeutralMessage{{Role: "user", Content: "hello"}}, map[string]any{}) {
 		t.Fatalf("single plain user prompt should be SDK-eligible")
 	}
-	if backend.canUseSDK([]NeutralMessage{{Role: "system", Content: "rules"}, {Role: "user", Content: "hello"}}, map[string]any{}) {
-		t.Fatalf("roleful chat should not be SDK-eligible")
+	if !backend.canUseSDK([]NeutralMessage{{Role: "system", Content: "rules"}, {Role: "user", Content: "hello"}}, map[string]any{}) {
+		t.Fatalf("roleful chat should be SDK-eligible via prompt folding")
 	}
-	if backend.canUseSDK([]NeutralMessage{{Role: "user", Content: "hello"}}, map[string]any{"temperature": 0.1}) {
-		t.Fatalf("sampling params should not be SDK-eligible")
+	if !backend.canUseSDK([]NeutralMessage{{Role: "user", Content: "hello"}}, map[string]any{"temperature": 0.1}) {
+		t.Fatalf("sampling params should be SDK-eligible best-effort")
+	}
+	if !backend.canUseSDK([]NeutralMessage{{Role: "assistant", ToolCalls: []map[string]any{{"id": "call_1", "name": "lookup", "arguments": "{}"}}}, {Role: "tool", ToolCallID: "call_1", Content: "ok"}}, map[string]any{"tools": []map[string]any{{"type": "function", "name": "lookup"}}}) {
+		t.Fatalf("tool call replay should be SDK-eligible via prompt folding")
 	}
 	opencode := NewCopilotBackendWithOptions("acct", "gh-token", "", CopilotBackendOptions{Mode: copilotBackendModeOpencode})
 	if opencode.canUseSDK([]NeutralMessage{{Role: "user", Content: "hello"}}, map[string]any{}) {
 		t.Fatalf("opencode mode should not use SDK")
 	}
+	toolParams := map[string]any{"tools": []map[string]any{
+		{"type": "function", "name": "lookup", "description": "Lookup", "parameters": map[string]any{"type": "object"}},
+		{"type": "web_search_preview", "search_context_size": "low"},
+	}}
+	cfg := backend.sdkSessionConfig("gpt-4.1", toolParams, false)
+	if len(cfg.Tools) != 1 || cfg.Tools[0].Name != "lookup" {
+		t.Fatalf("sdk custom tools=%v", cfg.Tools)
+	}
+	if strings.Join(cfg.AvailableTools, ",") != "lookup" {
+		t.Fatalf("request tools should be available to SDK, got %v", cfg.AvailableTools)
+	}
+	cliWeb := NewCopilotBackendWithOptions("acct", "gh-token", "", CopilotBackendOptions{SDKWebSearchMode: "cli"})
+	cfg = cliWeb.sdkSessionConfig("gpt-4.1", toolParams, false)
+	if strings.Join(cfg.AvailableTools, ",") != "builtin:*,web_fetch,report_intent,lookup" {
+		t.Fatalf("cli web search tools=%v", cfg.AvailableTools)
+	}
+	if !cliWeb.useSDKCLIWebSearch(toolParams) {
+		t.Fatalf("expected cli web search path")
+	}
+	cfg = backend.sdkSessionConfig("gpt-4.1", map[string]any{}, false)
+	if cfg.AvailableTools == nil || len(cfg.AvailableTools) != 0 {
+		t.Fatalf("empty SDK tool allowlist must be explicit, got %#v", cfg.AvailableTools)
+	}
 	withSearch := NewCopilotBackendWithOptions("acct", "gh-token", "", CopilotBackendOptions{SDKWebSearch: true})
-	cfg := withSearch.sdkSessionConfig("gpt-4.1", map[string]any{}, false)
+	cfg = withSearch.sdkSessionConfig("gpt-4.1", map[string]any{}, false)
 	if strings.Join(cfg.AvailableTools, ",") != "web_search" {
 		t.Fatalf("available tools=%v", cfg.AvailableTools)
+	}
+	cfg = withSearch.sdkSessionConfig("gpt-4.1", map[string]any{"tool_choice": "none", "tools": []map[string]any{{"type": "web_search_preview"}}}, false)
+	if len(cfg.AvailableTools) != 0 || len(cfg.Tools) != 0 {
+		t.Fatalf("tool_choice none should disable SDK tools, available=%v custom=%v", cfg.AvailableTools, cfg.Tools)
 	}
 	withTools := NewCopilotBackendWithOptions("acct", "gh-token", "", CopilotBackendOptions{SDKWebSearch: true, SDKTools: []string{"view", "web_search", "view"}})
 	cfg = withTools.sdkSessionConfig("gpt-4.1", map[string]any{}, false)
@@ -1338,7 +1545,7 @@ func TestSDKEligibilityRequiresSinglePlainUserMessage(t *testing.T) {
 	}
 }
 
-func TestCopilotListModelsFallsBackToPublicAPIBase(t *testing.T) {
+func TestCopilotOpenCodeListModelsFallsBackToPublicAPIBase(t *testing.T) {
 	oldClient := copilotHTTPClient
 	oldFallbacks := copilotModelListFallbackBaseURLs
 	defer func() {
@@ -1362,7 +1569,7 @@ func TestCopilotListModelsFallsBackToPublicAPIBase(t *testing.T) {
 	defer fallback.Close()
 
 	copilotModelListFallbackBaseURLs = []string{fallback.URL}
-	backend := NewCopilotBackend("acct", "", "")
+	backend := NewCopilotBackendWithOptions("acct", "", "", CopilotBackendOptions{Mode: copilotBackendModeOpencode})
 	backend.access = copilotAccessToken{Token: "cp-token", BaseURL: primary.URL, ExpiresAt: time.Now().Add(time.Hour)}
 	specs, err := backend.ListModels(context.Background())
 	if err != nil {
@@ -1377,7 +1584,7 @@ func TestCopilotListModelsFallsBackToPublicAPIBase(t *testing.T) {
 	}
 }
 
-func TestCopilotListModelsMergesPublicAPIBase(t *testing.T) {
+func TestCopilotOpenCodeListModelsMergesPublicAPIBase(t *testing.T) {
 	oldClient := copilotHTTPClient
 	oldFallbacks := copilotModelListFallbackBaseURLs
 	defer func() {
@@ -1401,7 +1608,7 @@ func TestCopilotListModelsMergesPublicAPIBase(t *testing.T) {
 	defer fallback.Close()
 
 	copilotModelListFallbackBaseURLs = []string{fallback.URL}
-	backend := NewCopilotBackend("acct", "", "")
+	backend := NewCopilotBackendWithOptions("acct", "", "", CopilotBackendOptions{Mode: copilotBackendModeOpencode})
 	backend.access = copilotAccessToken{Token: "cp-token", BaseURL: primary.URL, ExpiresAt: time.Now().Add(time.Hour)}
 	specs, err := backend.ListModels(context.Background())
 	if err != nil {

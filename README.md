@@ -25,10 +25,9 @@ The rewrite keeps the same core contract:
   health and metrics endpoints
 
 The offline `fake` backend is fully implemented for local testing. The real
-Copilot backend uses direct Copilot HTTP for protocol-compatible API calls and
-also starts an official `github.com/github/copilot-sdk/go` client per account,
-using SDK sessions for simple Chat Completions turns and SDK model discovery
-fallbacks.
+Copilot backend starts an official `github.com/github/copilot-sdk/go` client per
+account, using SDK authentication and SDK model discovery in the default mode.
+OpenCode mode is available when direct Copilot provider API behavior is needed.
 
 ## Run
 
@@ -97,25 +96,27 @@ Useful admin controls:
   buckets. Exhausted buckets return HTTP 429 with `Retry-After`.
 
 Set `GHCP_BACKEND=copilot` plus `GHCP_COPILOT_TOKEN` to route through the
-Go-native Copilot HTTP backend. `GHCP_COPILOT_TOKEN` should be a GitHub OAuth
-token; by default the backend exchanges it for a Copilot API token, caches it
-until expiry, detects the Copilot API base URL from the token response, and
-proxies supported Copilot endpoints directly from Go.
+Copilot backend. `GHCP_COPILOT_TOKEN` should be a GitHub OAuth token. In the
+default SDK mode, the token is passed to the SDK runtime and model discovery is
+performed by the SDK rather than by the direct Copilot API.
 
 Choose the Copilot implementation with `GHCP_COPILOT_MODE` or
 `gateway.copilot.mode`:
 
-- `sdk` (default): official SDK-first behavior for model discovery and simple
-  chat turns, with direct HTTP fallback for protocol-compatible routes.
+- `sdk` (default): official SDK behavior for authentication, model discovery,
+  and eligible simple chat turns. This mode never calls direct Copilot APIs; SDK
+  unsupported request shapes return an error instead of falling back to HTTP.
 - `opencode`: OpenCode-inspired direct provider behavior. This defaults
   `auth_mode` to `oauth` and sends the GitHub OAuth token directly to
   `https://api.githubcopilot.com` unless another Copilot API base URL is set.
 
 SDK mode runs the Copilot client in multi-tenant-safe empty mode, so no SDK
-built-in tools are exposed by default. Set `GHCP_COPILOT_SDK_WEB_SEARCH=true`
-or `gateway.copilot.sdk_web_search: true` to expose the SDK `web_search` tool.
-For advanced SDK tool allowlists, set `GHCP_COPILOT_SDK_AVAILABLE_TOOLS` or
-`gateway.copilot.sdk_available_tools`.
+built-in tools are exposed by default. Set `GHCP_COPILOT_SDK_AVAILABLE_TOOLS`
+or `gateway.copilot.sdk_available_tools` for explicit allowlists. For SDK-only
+web search without direct Copilot API calls, set
+`GHCP_COPILOT_SDK_WEB_SEARCH_MODE=cli` or
+`gateway.copilot.sdk_web_search_mode: cli`; web-search requests then use a
+temporary Copilot CLI-mode SDK client with controlled web handlers.
 
 Models that support a long-context tier, such as Copilot-exposed Claude Opus
 variants, can be pinned with request field `context_tier: "long_context"` or
@@ -136,12 +137,17 @@ Copilot OAuth client ID used by OpenCode and can be overridden with
 Docker builds run the official SDK bundler before compiling so the Copilot CLI
 runtime is embedded in the gateway binary. Local source builds need Go 1.24+.
 
-Model metadata from `/models` is retained per account, including
-`supported_endpoints` and `model_picker_enabled`. The router uses those
-capabilities to choose between Chat Completions, Responses, Anthropic Messages,
-and embeddings endpoints when a model does not support the client-requested
-protocol directly; non-picker utility models remain routable but are not
-advertised from `/v1/models`.
+Model metadata from SDK discovery is retained per account. In OpenCode mode,
+direct `/models` metadata such as `supported_endpoints` and
+`model_picker_enabled` is also retained. The router uses those capabilities to
+choose between Chat Completions, Responses, Anthropic Messages, and embeddings
+endpoints when a model does not support the client-requested protocol directly;
+non-picker utility models remain routable but are not advertised from
+`/v1/models`.
+
+Use OpenCode mode for direct API-compatible features such as native Responses,
+Anthropic Messages, embeddings, or request parameters that the SDK simple-chat
+path does not support.
 
 Route strategies include `round_robin`, `least_busy`, `weighted`,
 `quota_aware`, and `smart`. The `smart`/`quota_aware` scoring considers recent

@@ -273,6 +273,10 @@ func normalizeTools(tools []map[string]any) []map[string]any {
 	}
 	out := make([]map[string]any, 0, len(tools))
 	for _, tool := range tools {
+		if isWebSearchToolSpec(tool) {
+			out = append(out, compactMap(cloneMap(tool)))
+			continue
+		}
 		fn := tool
 		if nested, ok := tool["function"].(map[string]any); ok {
 			fn = nested
@@ -305,6 +309,18 @@ func normalizeTools(tools []map[string]any) []map[string]any {
 		return nil
 	}
 	return out
+}
+
+func isWebSearchToolSpec(tool map[string]any) bool {
+	kind := strings.ToLower(stringFromAny(tool["type"]))
+	name := strings.ToLower(stringFromAny(tool["name"]))
+	if strings.Contains(kind, "web_search") {
+		return true
+	}
+	if name == "web_search" && (kind == "" || kind == "server_tool" || strings.Contains(kind, "web")) {
+		return true
+	}
+	return false
 }
 
 func firstAny(values ...any) any {

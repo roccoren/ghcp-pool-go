@@ -20,6 +20,7 @@ type Gateway struct {
 	Meter         *Meter
 	LoginManager  *LoginManager
 	Authenticator *Authenticator
+	Responses     *ResponseStore
 
 	refreshCancel context.CancelFunc
 }
@@ -49,6 +50,7 @@ func NewGateway(settings Settings) (*Gateway, error) {
 		Metrics:       metrics,
 		Meter:         NewMeter(store, metrics),
 		Authenticator: authenticator,
+		Responses:     NewResponseStore(),
 	}
 	gw.LoginManager = NewLoginManager(settings, pool)
 	return gw, nil
@@ -159,7 +161,7 @@ func (g *Gateway) CompleteResult(ctx context.Context, plan Plan) (ChatResult, st
 	if plan.CacheHit != nil {
 		rec := plan.CacheHit
 		g.Meter.Observe(nil, rec.Model, rec.Usage, "hit", true, "")
-		return ChatResult{Content: rec.Content, Model: plan.ResponseModel, Usage: rec.Usage, FinishReason: rec.FinishReason, ToolCalls: rec.ToolCalls}, "cache", nil
+		return ChatResult{Content: rec.Content, Model: plan.ResponseModel, Usage: rec.Usage, FinishReason: rec.FinishReason, ToolCalls: rec.ToolCalls, ResponsesOutput: rec.ResponsesOutput, AnthropicContent: rec.AnthropicContent}, "cache", nil
 	}
 	exclude := map[string]bool{}
 	current := plan.Account
@@ -181,11 +183,13 @@ func (g *Gateway) CompleteResult(ctx context.Context, plan Plan) (ChatResult, st
 		current.Release()
 		result.Usage = result.Usage.Normalized()
 		g.Cache.Store(plan.CacheKey, CacheRecord{
-			Content:      result.Content,
-			Model:        result.Model,
-			FinishReason: result.FinishReason,
-			Usage:        result.Usage,
-			ToolCalls:    result.ToolCalls,
+			Content:          result.Content,
+			Model:            result.Model,
+			FinishReason:     result.FinishReason,
+			Usage:            result.Usage,
+			ToolCalls:        result.ToolCalls,
+			ResponsesOutput:  result.ResponsesOutput,
+			AnthropicContent: result.AnthropicContent,
 		}, plan.Control)
 		id := current.ID()
 		g.Meter.Observe(&id, plan.Model, result.Usage, "miss", true, "")
@@ -374,8 +378,12 @@ func (g *Gateway) StreamResponses(ctx context.Context, plan Plan) <-chan string 
 			if len(rec.ToolCalls) > 0 {
 				finish = "tool_calls"
 			}
-			if !emitSSE(ctx, out, namedSSE(responseCompleted(responseID, plan.ResponseModel, output, rec.Content, finish, rec.Usage, next(), options, len(rec.ToolCalls) == 0))) {
+			completed := responseCompleted(responseID, plan.ResponseModel, output, rec.Content, finish, rec.Usage, next(), options, len(rec.ToolCalls) == 0)
+			if !emitSSE(ctx, out, namedSSE(completed)) {
 				return
+			}
+			if response, ok := completed["response"].(map[string]any); ok {
+				g.Responses.Store(response, responseInputItemsFromRaw(rawResponsesPayload(plan.Params)))
 			}
 			g.Meter.Observe(nil, rec.Model, rec.Usage, "hit", true, "")
 			return
@@ -403,8 +411,12 @@ func (g *Gateway) StreamResponses(ctx context.Context, plan Plan) <-chan string 
 		if len(toolCalls) > 0 {
 			finish = "tool_calls"
 		}
-		if !emitSSE(ctx, out, namedSSE(responseCompleted(responseID, plan.ResponseModel, output, content, finish, usage, next(), options, len(toolCalls) == 0))) {
+		completed := responseCompleted(responseID, plan.ResponseModel, output, content, finish, usage, next(), options, len(toolCalls) == 0)
+		if !emitSSE(ctx, out, namedSSE(completed)) {
 			return
+		}
+		if response, ok := completed["response"].(map[string]any); ok {
+			g.Responses.Store(response, responseInputItemsFromRaw(rawResponsesPayload(plan.Params)))
 		}
 		account.RecordSuccess()
 		g.Cache.Store(plan.CacheKey, CacheRecord{Content: content, Model: plan.Model, FinishReason: finish, Usage: usage, ToolCalls: toolCalls}, plan.Control)

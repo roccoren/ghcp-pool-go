@@ -21,6 +21,10 @@ var ValidContextTiers = map[string]bool{
 	"default": true, "long_context": true,
 }
 
+var ValidCopilotSDKWebSearchModes = map[string]bool{
+	"off": true, "empty": true, "cli": true,
+}
+
 var ValidStrategies = map[string]bool{
 	"round_robin": true, "least_busy": true, "weighted": true, "quota_aware": true, "smart": true,
 }
@@ -36,26 +40,27 @@ type APIKeyConfig struct {
 }
 
 type AccountConfig struct {
-	ID                  string   `yaml:"id" json:"id"`
-	Label               string   `yaml:"label" json:"label"`
-	Token               string   `yaml:"token" json:"token"`
-	TokenEnv            string   `yaml:"token_env" json:"token_env"`
-	TokenKeyVaultSecret string   `yaml:"token_key_vault_secret" json:"token_key_vault_secret"`
-	KeyVaultURL         string   `yaml:"key_vault_url" json:"key_vault_url"`
-	BaseDirectory       string   `yaml:"base_directory" json:"base_directory"`
-	CopilotMode         string   `yaml:"copilot_mode" json:"copilot_mode"`
-	CopilotAuthMode     string   `yaml:"copilot_auth_mode" json:"copilot_auth_mode"`
-	CopilotBaseURL      string   `yaml:"copilot_base_url" json:"copilot_base_url"`
-	CopilotSDKWebSearch *bool    `yaml:"copilot_sdk_web_search" json:"copilot_sdk_web_search"`
-	CopilotSDKTools     []string `yaml:"copilot_sdk_available_tools" json:"copilot_sdk_available_tools"`
-	GitHubEnterpriseURL string   `yaml:"github_enterprise_url" json:"github_enterprise_url"`
-	Enabled             *bool    `yaml:"enabled" json:"enabled"`
-	MaxConcurrency      int      `yaml:"max_concurrency" json:"max_concurrency"`
-	Weight              int      `yaml:"weight" json:"weight"`
-	RateLimitRPM        *int     `yaml:"rate_limit_rpm" json:"rate_limit_rpm"`
-	Allow               []string `yaml:"allow" json:"allow"`
-	Deny                []string `yaml:"deny" json:"deny"`
-	Models              []string `yaml:"models" json:"models"`
+	ID                      string   `yaml:"id" json:"id"`
+	Label                   string   `yaml:"label" json:"label"`
+	Token                   string   `yaml:"token" json:"token"`
+	TokenEnv                string   `yaml:"token_env" json:"token_env"`
+	TokenKeyVaultSecret     string   `yaml:"token_key_vault_secret" json:"token_key_vault_secret"`
+	KeyVaultURL             string   `yaml:"key_vault_url" json:"key_vault_url"`
+	BaseDirectory           string   `yaml:"base_directory" json:"base_directory"`
+	CopilotMode             string   `yaml:"copilot_mode" json:"copilot_mode"`
+	CopilotAuthMode         string   `yaml:"copilot_auth_mode" json:"copilot_auth_mode"`
+	CopilotBaseURL          string   `yaml:"copilot_base_url" json:"copilot_base_url"`
+	CopilotSDKWebSearch     *bool    `yaml:"copilot_sdk_web_search" json:"copilot_sdk_web_search"`
+	CopilotSDKWebSearchMode string   `yaml:"copilot_sdk_web_search_mode" json:"copilot_sdk_web_search_mode"`
+	CopilotSDKTools         []string `yaml:"copilot_sdk_available_tools" json:"copilot_sdk_available_tools"`
+	GitHubEnterpriseURL     string   `yaml:"github_enterprise_url" json:"github_enterprise_url"`
+	Enabled                 *bool    `yaml:"enabled" json:"enabled"`
+	MaxConcurrency          int      `yaml:"max_concurrency" json:"max_concurrency"`
+	Weight                  int      `yaml:"weight" json:"weight"`
+	RateLimitRPM            *int     `yaml:"rate_limit_rpm" json:"rate_limit_rpm"`
+	Allow                   []string `yaml:"allow" json:"allow"`
+	Deny                    []string `yaml:"deny" json:"deny"`
+	Models                  []string `yaml:"models" json:"models"`
 
 	RuntimeToken       string `yaml:"-" json:"-"`
 	RuntimeTokenSource string `yaml:"-" json:"-"`
@@ -177,12 +182,13 @@ type LoginConfig struct {
 }
 
 type CopilotConfig struct {
-	Mode          string   `yaml:"mode" json:"mode"`
-	AuthMode      string   `yaml:"auth_mode" json:"auth_mode"`
-	BaseURL       string   `yaml:"base_url" json:"base_url"`
-	EnterpriseURL string   `yaml:"enterprise_url" json:"enterprise_url"`
-	SDKWebSearch  bool     `yaml:"sdk_web_search" json:"sdk_web_search"`
-	SDKTools      []string `yaml:"sdk_available_tools" json:"sdk_available_tools"`
+	Mode             string   `yaml:"mode" json:"mode"`
+	AuthMode         string   `yaml:"auth_mode" json:"auth_mode"`
+	BaseURL          string   `yaml:"base_url" json:"base_url"`
+	EnterpriseURL    string   `yaml:"enterprise_url" json:"enterprise_url"`
+	SDKWebSearch     bool     `yaml:"sdk_web_search" json:"sdk_web_search"`
+	SDKWebSearchMode string   `yaml:"sdk_web_search_mode" json:"sdk_web_search_mode"`
+	SDKTools         []string `yaml:"sdk_available_tools" json:"sdk_available_tools"`
 }
 
 type GatewayConfig struct {
@@ -298,6 +304,17 @@ func (s Settings) DisplayIDsForModel(model string) []string {
 	return aliases
 }
 
+func normalizeCopilotSDKWebSearchMode(mode string, legacyEnabled bool) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		if legacyEnabled {
+			return "empty"
+		}
+		return "off"
+	}
+	return mode
+}
+
 func LoadSettings(path string) (Settings, error) {
 	if path == "" {
 		path = firstNonEmpty(os.Getenv("GHCP_CONFIG"), "config.yaml")
@@ -334,12 +351,13 @@ func LoadSettings(path string) (Settings, error) {
 		Usage:    g.Usage,
 		Login:    g.Login,
 		Copilot: CopilotConfig{
-			Mode:          firstNonEmpty(os.Getenv("GHCP_COPILOT_MODE"), g.Copilot.Mode),
-			AuthMode:      firstNonEmpty(os.Getenv("GHCP_COPILOT_AUTH_MODE"), g.Copilot.AuthMode),
-			BaseURL:       firstNonEmpty(os.Getenv("GHCP_COPILOT_API_BASE_URL"), g.Copilot.BaseURL),
-			EnterpriseURL: firstNonEmpty(os.Getenv("GHCP_GITHUB_ENTERPRISE_URL"), g.Copilot.EnterpriseURL),
-			SDKWebSearch:  envBool("GHCP_COPILOT_SDK_WEB_SEARCH", g.Copilot.SDKWebSearch),
-			SDKTools:      firstStringSlice(os.Getenv("GHCP_COPILOT_SDK_AVAILABLE_TOOLS"), g.Copilot.SDKTools),
+			Mode:             firstNonEmpty(os.Getenv("GHCP_COPILOT_MODE"), g.Copilot.Mode),
+			AuthMode:         firstNonEmpty(os.Getenv("GHCP_COPILOT_AUTH_MODE"), g.Copilot.AuthMode),
+			BaseURL:          firstNonEmpty(os.Getenv("GHCP_COPILOT_API_BASE_URL"), g.Copilot.BaseURL),
+			EnterpriseURL:    firstNonEmpty(os.Getenv("GHCP_GITHUB_ENTERPRISE_URL"), g.Copilot.EnterpriseURL),
+			SDKWebSearch:     envBool("GHCP_COPILOT_SDK_WEB_SEARCH", g.Copilot.SDKWebSearch),
+			SDKWebSearchMode: firstNonEmpty(os.Getenv("GHCP_COPILOT_SDK_WEB_SEARCH_MODE"), g.Copilot.SDKWebSearchMode),
+			SDKTools:         firstStringSlice(os.Getenv("GHCP_COPILOT_SDK_AVAILABLE_TOOLS"), g.Copilot.SDKTools),
 		},
 		Debug:            g.Debug,
 		ReasoningEfforts: map[string]string{},
@@ -375,6 +393,10 @@ func LoadSettings(path string) (Settings, error) {
 	settings.Copilot.AuthMode = normalizeCopilotAuthMode(defaultCopilotAuthMode(settings.Copilot.Mode, settings.Copilot.AuthMode))
 	if !ValidCopilotAuthModes[settings.Copilot.AuthMode] {
 		return Settings{}, fmt.Errorf("invalid copilot auth_mode %q; valid: exchange, oauth", settings.Copilot.AuthMode)
+	}
+	settings.Copilot.SDKWebSearchMode = normalizeCopilotSDKWebSearchMode(settings.Copilot.SDKWebSearchMode, settings.Copilot.SDKWebSearch)
+	if !ValidCopilotSDKWebSearchModes[settings.Copilot.SDKWebSearchMode] {
+		return Settings{}, fmt.Errorf("invalid copilot sdk_web_search_mode %q; valid: off, empty, cli", settings.Copilot.SDKWebSearchMode)
 	}
 	settings.Copilot.EnterpriseURL = normalizeDomain(settings.Copilot.EnterpriseURL)
 	if settings.Copilot.BaseURL == "" && settings.Copilot.EnterpriseURL != "" {

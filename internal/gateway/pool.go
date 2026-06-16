@@ -419,11 +419,18 @@ func copilotBackendOptions(defaults CopilotConfig, cfg *AccountConfig) (CopilotB
 	if cfg.CopilotSDKWebSearch != nil {
 		sdkWebSearch = *cfg.CopilotSDKWebSearch
 	}
+	sdkWebSearchMode := defaults.SDKWebSearchMode
+	if cfg.CopilotSDKWebSearchMode != "" {
+		sdkWebSearchMode = normalizeCopilotSDKWebSearchMode(cfg.CopilotSDKWebSearchMode, sdkWebSearch)
+		if !ValidCopilotSDKWebSearchModes[sdkWebSearchMode] {
+			return CopilotBackendOptions{}, fmt.Errorf("invalid copilot sdk web search mode %q for account %q; valid: off, empty, cli", cfg.CopilotSDKWebSearchMode, cfg.ID)
+		}
+	}
 	sdkTools := defaults.SDKTools
 	if len(cfg.CopilotSDKTools) > 0 {
 		sdkTools = cfg.CopilotSDKTools
 	}
-	return CopilotBackendOptions{Mode: mode, AuthMode: authMode, BaseURL: baseURL, SDKWebSearch: sdkWebSearch, SDKTools: sdkTools}, nil
+	return CopilotBackendOptions{Mode: mode, AuthMode: authMode, BaseURL: baseURL, SDKWebSearch: sdkWebSearch, SDKWebSearchMode: sdkWebSearchMode, SDKTools: sdkTools}, nil
 }
 
 func (p *PoolManager) Start(ctx context.Context) error {
@@ -579,7 +586,8 @@ func isNonRetryableClientError(message string) bool {
 	text := strings.ToLower(message)
 	return strings.Contains(text, "copilot upstream error 400") ||
 		strings.Contains(text, "invalid_request_error") ||
-		strings.Contains(text, "bad request")
+		strings.Contains(text, "bad request") ||
+		strings.Contains(text, "copilot sdk mode does not support this request shape")
 }
 
 func rateLimitRPM(bucket *TokenBucket) int {

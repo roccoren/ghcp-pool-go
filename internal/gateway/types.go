@@ -39,11 +39,15 @@ func (tc ToolCall) normalized() ToolCall {
 }
 
 type ChatResult struct {
-	Content      string     `json:"content"`
-	Model        string     `json:"model"`
-	Usage        Usage      `json:"usage"`
-	FinishReason string     `json:"finish_reason"`
-	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
+	ID               string           `json:"id,omitempty"`
+	Status           string           `json:"status,omitempty"`
+	Content          string           `json:"content"`
+	Model            string           `json:"model"`
+	Usage            Usage            `json:"usage"`
+	FinishReason     string           `json:"finish_reason"`
+	ToolCalls        []ToolCall       `json:"tool_calls,omitempty"`
+	ResponsesOutput  []map[string]any `json:"responses_output,omitempty"`
+	AnthropicContent []map[string]any `json:"anthropic_content,omitempty"`
 }
 
 type EmbeddingResult struct {
@@ -72,11 +76,13 @@ type ModelSpec struct {
 }
 
 type CacheRecord struct {
-	Content      string     `json:"content"`
-	Model        string     `json:"model"`
-	FinishReason string     `json:"finish_reason"`
-	Usage        Usage      `json:"usage"`
-	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
+	Content          string           `json:"content"`
+	Model            string           `json:"model"`
+	FinishReason     string           `json:"finish_reason"`
+	Usage            Usage            `json:"usage"`
+	ToolCalls        []ToolCall       `json:"tool_calls,omitempty"`
+	ResponsesOutput  []map[string]any `json:"responses_output,omitempty"`
+	AnthropicContent []map[string]any `json:"anthropic_content,omitempty"`
 }
 
 type NeutralMessage struct {

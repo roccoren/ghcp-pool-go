@@ -21,6 +21,10 @@ func NewServer(gw *Gateway) http.Handler {
 	mux.HandleFunc("GET /v1/models", s.listModels)
 	mux.HandleFunc("POST /v1/chat/completions", s.chatCompletions)
 	mux.HandleFunc("POST /v1/responses", s.responses)
+	mux.HandleFunc("GET /v1/responses/{response_id}", s.getResponse)
+	mux.HandleFunc("DELETE /v1/responses/{response_id}", s.deleteResponse)
+	mux.HandleFunc("POST /v1/responses/{response_id}/cancel", s.cancelResponse)
+	mux.HandleFunc("GET /v1/responses/{response_id}/input_items", s.responseInputItems)
 	mux.HandleFunc("POST /v1/messages", s.anthropicMessages)
 	mux.HandleFunc("POST /v1/messages/count_tokens", s.anthropicCountTokens)
 	mux.HandleFunc("POST /v1/embeddings", s.embeddings)
@@ -186,7 +190,86 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	headers := plan.Headers()
 	headers["x-ghcp-account"] = accountID
-	writeJSON(w, http.StatusOK, responseResponse(result.Model, result.Content, result.FinishReason, result.Usage, result.ToolCalls, chat.ResponseOptions), headers)
+	response := responseResponse(result, chat.ResponseOptions)
+	s.gw.Responses.Store(response, responseInputItemsFromRaw(rawBody))
+	writeJSON(w, http.StatusOK, response, headers)
+}
+
+func (s *server) getResponse(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, "inference"); !ok {
+		return
+	}
+	id := r.PathValue("response_id")
+	rec, ok := s.gw.Responses.Get(id)
+	if !ok {
+		writeOpenAIError(w, http.StatusNotFound, "not_found_error", "response not found: "+id)
+		return
+	}
+	writeJSON(w, http.StatusOK, rec.Response, nil)
+}
+
+func (s *server) deleteResponse(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, "inference"); !ok {
+		return
+	}
+	id := r.PathValue("response_id")
+	if !s.gw.Responses.Delete(id) {
+		writeOpenAIError(w, http.StatusNotFound, "not_found_error", "response not found: "+id)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "object": "response.deleted", "deleted": true}, nil)
+}
+
+func (s *server) cancelResponse(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, "inference"); !ok {
+		return
+	}
+	id := r.PathValue("response_id")
+	response, ok := s.gw.Responses.Update(id, func(obj map[string]any) map[string]any {
+		status := stringFromAny(obj["status"])
+		if status == "" || status == "in_progress" || status == "queued" {
+			obj["status"] = "cancelled"
+			obj["cancelled_at"] = time.Now().Unix()
+		}
+		return obj
+	})
+	if !ok {
+		writeOpenAIError(w, http.StatusNotFound, "not_found_error", "response not found: "+id)
+		return
+	}
+	if stringFromAny(response["status"]) == "completed" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "completed responses cannot be cancelled")
+		return
+	}
+	writeJSON(w, http.StatusOK, response, nil)
+}
+
+func (s *server) responseInputItems(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, "inference"); !ok {
+		return
+	}
+	id := r.PathValue("response_id")
+	rec, ok := s.gw.Responses.Get(id)
+	if !ok {
+		writeOpenAIError(w, http.StatusNotFound, "not_found_error", "response not found: "+id)
+		return
+	}
+	firstID, lastID := "", ""
+	if len(rec.InputItems) > 0 {
+		if first, ok := rec.InputItems[0].(map[string]any); ok {
+			firstID = stringFromAny(first["id"])
+		}
+		if last, ok := rec.InputItems[len(rec.InputItems)-1].(map[string]any); ok {
+			lastID = stringFromAny(last["id"])
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"object":   "list",
+		"data":     rec.InputItems,
+		"has_more": false,
+		"first_id": emptyToNilString(firstID),
+		"last_id":  emptyToNilString(lastID),
+	}, nil)
 }
 
 func (s *server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
@@ -236,7 +319,7 @@ func (s *server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	headers := plan.Headers()
 	headers["x-ghcp-account"] = accountID
-	writeJSON(w, http.StatusOK, anthropicResponse(result.Model, result.Content, result.FinishReason, result.Usage, result.ToolCalls, chat.ResponseOptions), headers)
+	writeJSON(w, http.StatusOK, anthropicResponse(result, chat.ResponseOptions), headers)
 }
 
 func (s *server) anthropicCountTokens(w http.ResponseWriter, r *http.Request) {
@@ -404,24 +487,25 @@ func (s *server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 		baseDir = resolved
 	}
 	cfg := AccountConfig{
-		ID:                  id,
-		Label:               firstNonEmpty(stringFromAny(payload["label"]), id),
-		TokenEnv:            stringsTrim(stringFromAny(payload["token_env"])),
-		TokenKeyVaultSecret: stringsTrim(stringFromAny(payload["token_key_vault_secret"])),
-		KeyVaultURL:         stringsTrim(stringFromAny(payload["key_vault_url"])),
-		BaseDirectory:       baseDir,
-		CopilotMode:         stringsTrim(stringFromAny(payload["copilot_mode"])),
-		CopilotAuthMode:     stringsTrim(stringFromAny(payload["copilot_auth_mode"])),
-		CopilotBaseURL:      stringsTrim(stringFromAny(payload["copilot_base_url"])),
-		CopilotSDKWebSearch: boolPtrFromPayload(payload["copilot_sdk_web_search"]),
-		CopilotSDKTools:     stringSliceFromAny(payload["copilot_sdk_available_tools"]),
-		GitHubEnterpriseURL: stringsTrim(stringFromAny(payload["github_enterprise_url"])),
-		MaxConcurrency:      intFromPayload(payload["max_concurrency"], 32),
-		Weight:              intFromPayload(payload["weight"], 1),
-		RateLimitRPM:        intPtrFromPayload(payload["rate_limit_rpm"]),
-		Allow:               stringSliceFromAny(firstAny(payload["allow"], []any{"*"})),
-		Deny:                stringSliceFromAny(payload["deny"]),
-		Models:              stringSliceFromAny(payload["models"]),
+		ID:                      id,
+		Label:                   firstNonEmpty(stringFromAny(payload["label"]), id),
+		TokenEnv:                stringsTrim(stringFromAny(payload["token_env"])),
+		TokenKeyVaultSecret:     stringsTrim(stringFromAny(payload["token_key_vault_secret"])),
+		KeyVaultURL:             stringsTrim(stringFromAny(payload["key_vault_url"])),
+		BaseDirectory:           baseDir,
+		CopilotMode:             stringsTrim(stringFromAny(payload["copilot_mode"])),
+		CopilotAuthMode:         stringsTrim(stringFromAny(payload["copilot_auth_mode"])),
+		CopilotBaseURL:          stringsTrim(stringFromAny(payload["copilot_base_url"])),
+		CopilotSDKWebSearch:     boolPtrFromPayload(payload["copilot_sdk_web_search"]),
+		CopilotSDKWebSearchMode: stringsTrim(stringFromAny(payload["copilot_sdk_web_search_mode"])),
+		CopilotSDKTools:         stringSliceFromAny(payload["copilot_sdk_available_tools"]),
+		GitHubEnterpriseURL:     stringsTrim(stringFromAny(payload["github_enterprise_url"])),
+		MaxConcurrency:          intFromPayload(payload["max_concurrency"], 32),
+		Weight:                  intFromPayload(payload["weight"], 1),
+		RateLimitRPM:            intPtrFromPayload(payload["rate_limit_rpm"]),
+		Allow:                   stringSliceFromAny(firstAny(payload["allow"], []any{"*"})),
+		Deny:                    stringSliceFromAny(payload["deny"]),
+		Models:                  stringSliceFromAny(payload["models"]),
 	}
 	enabled := true
 	if v, ok := payload["enabled"].(bool); ok {
@@ -1023,6 +1107,23 @@ func writeError(w http.ResponseWriter, status int, detail string) {
 
 func writeErrorWithHeaders(w http.ResponseWriter, status int, detail string, headers map[string]string) {
 	writeJSON(w, status, map[string]any{"detail": detail}, headers)
+}
+
+func writeOpenAIError(w http.ResponseWriter, status int, errorType, message string) {
+	if errorType == "" {
+		errorType = "api_error"
+	}
+	if message == "" {
+		message = http.StatusText(status)
+	}
+	writeJSON(w, status, map[string]any{
+		"error": map[string]any{
+			"message": message,
+			"type":    errorType,
+			"code":    nil,
+			"param":   nil,
+		},
+	}, nil)
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, errorType, message string) {

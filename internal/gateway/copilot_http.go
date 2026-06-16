@@ -6,12 +6,12 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,20 +58,23 @@ var copilotHTTPClient = &http.Client{
 	},
 }
 
+var sdkWebHTTPClient = &http.Client{Timeout: 20 * time.Second}
+
 var copilotModelListFallbackBaseURLs = []string{
 	copilotPublicAPIBaseURL,
 	defaultCopilotAPIBaseURL,
 }
 
 type CopilotBackend struct {
-	accountID    string
-	githubToken  string
-	homeDir      string
-	mode         string
-	authMode     string
-	baseURL      string
-	sdkWebSearch bool
-	sdkTools     []string
+	accountID        string
+	githubToken      string
+	homeDir          string
+	mode             string
+	authMode         string
+	baseURL          string
+	sdkWebSearch     bool
+	sdkWebSearchMode string
+	sdkTools         []string
 
 	mu        sync.Mutex
 	access    copilotAccessToken
@@ -96,11 +99,12 @@ func (e *copilotTokenExchangeError) Error() string {
 }
 
 type CopilotBackendOptions struct {
-	Mode         string
-	AuthMode     string
-	BaseURL      string
-	SDKWebSearch bool
-	SDKTools     []string
+	Mode             string
+	AuthMode         string
+	BaseURL          string
+	SDKWebSearch     bool
+	SDKWebSearchMode string
+	SDKTools         []string
 }
 
 func NewCopilotBackend(accountID, token, homeDir string) *CopilotBackend {
@@ -109,14 +113,15 @@ func NewCopilotBackend(accountID, token, homeDir string) *CopilotBackend {
 
 func NewCopilotBackendWithOptions(accountID, token, homeDir string, options CopilotBackendOptions) *CopilotBackend {
 	return &CopilotBackend{
-		accountID:    accountID,
-		githubToken:  strings.TrimSpace(token),
-		homeDir:      homeDir,
-		mode:         normalizeCopilotBackendMode(options.Mode),
-		authMode:     normalizeCopilotAuthMode(defaultCopilotAuthMode(options.Mode, options.AuthMode)),
-		baseURL:      normalizeBaseURLOrEmpty(options.BaseURL),
-		sdkWebSearch: options.SDKWebSearch,
-		sdkTools:     normalizeStringList(options.SDKTools),
+		accountID:        accountID,
+		githubToken:      strings.TrimSpace(token),
+		homeDir:          homeDir,
+		mode:             normalizeCopilotBackendMode(options.Mode),
+		authMode:         normalizeCopilotAuthMode(defaultCopilotAuthMode(options.Mode, options.AuthMode)),
+		baseURL:          normalizeBaseURLOrEmpty(options.BaseURL),
+		sdkWebSearch:     options.SDKWebSearch,
+		sdkWebSearchMode: normalizeCopilotSDKWebSearchMode(options.SDKWebSearchMode, options.SDKWebSearch),
+		sdkTools:         normalizeStringList(options.SDKTools),
 	}
 }
 
@@ -130,23 +135,14 @@ func (b *CopilotBackend) Start(ctx context.Context) error {
 		return nil
 	}
 	if b.sdkClient == nil {
-		options := &sdk.ClientOptions{
-			BaseDirectory:             b.homeDir,
-			GitHubToken:               b.sdkGitHubToken(),
-			UseLoggedInUser:           sdk.Bool(b.sdkGitHubToken() == ""),
-			Mode:                      sdk.ModeEmpty,
-			SessionIdleTimeoutSeconds: 60,
-		}
-		if options.BaseDirectory == "" {
-			options.BaseDirectory = "runtime-home/" + b.accountID
-		}
-		b.sdkClient = sdk.NewClient(options)
+		b.sdkClient = sdk.NewClient(b.sdkClientOptions(sdk.ModeEmpty, ""))
 	}
 	client := b.sdkClient
 	b.mu.Unlock()
 
 	if err := client.Start(ctx); err != nil {
 		b.mu.Lock()
+		b.sdkReady = false
 		b.sdkErr = err
 		b.mu.Unlock()
 		if b.githubToken != "" {
@@ -162,13 +158,15 @@ func (b *CopilotBackend) Start(ctx context.Context) error {
 }
 
 func (b *CopilotBackend) ListModels(ctx context.Context) ([]ModelSpec, error) {
-	if b.mode != copilotBackendModeOpencode && b.sdkGitHubToken() != "" {
-		if specs, err := b.listModelsSDK(ctx); err == nil && len(specs) > 0 {
-			if httpSpecs, httpErr := b.listModelsDirect(ctx); httpErr == nil {
-				mergeModelEndpointMetadata(specs, httpSpecs)
-			}
-			return specs, nil
+	if b.mode != copilotBackendModeOpencode {
+		specs, err := b.listModelsSDK(ctx)
+		if err != nil {
+			return nil, err
 		}
+		if len(specs) == 0 {
+			return nil, fmt.Errorf("sdk model discovery returned no models")
+		}
+		return specs, nil
 	}
 	return b.listModelsDirect(ctx)
 }
@@ -205,6 +203,9 @@ func (b *CopilotBackend) listModelsDirect(ctx context.Context) ([]ModelSpec, err
 	}
 	if len(merged) > 0 {
 		return merged, nil
+	}
+	if directErr == nil {
+		return nil, fmt.Errorf("copilot model discovery returned no models")
 	}
 	return nil, directErr
 }
@@ -317,10 +318,11 @@ func parseCopilotModels(data []byte) ([]ModelSpec, error) {
 func (b *CopilotBackend) Chat(ctx context.Context, model string, messages []NeutralMessage, params map[string]any) (ChatResult, error) {
 	endpoint := endpointFromParams(params, endpointChatCompletions)
 	clean := cleanBackendParams(params)
-	if endpointMatches(endpoint, endpointChatCompletions) && b.canUseSDK(messages, clean) {
-		if result, err := b.chatSDK(ctx, model, messages, clean, false); err == nil {
-			return result, nil
+	if b.mode != copilotBackendModeOpencode {
+		if b.canUseSDK(messages, clean) {
+			return b.chatSDK(ctx, model, messages, clean, false)
 		}
+		return ChatResult{}, unsupportedSDKModeRequest(endpoint)
 	}
 	var body any
 	switch {
@@ -347,6 +349,9 @@ func (b *CopilotBackend) Chat(ctx context.Context, model string, messages []Neut
 }
 
 func (b *CopilotBackend) Embeddings(ctx context.Context, model string, inputs []string, params map[string]any) (EmbeddingResult, error) {
+	if b.mode != copilotBackendModeOpencode {
+		return EmbeddingResult{}, ErrEmbeddingsUnsupported
+	}
 	body := map[string]any{"model": model, "input": inputs}
 	for _, key := range []string{"encoding_format", "dimensions", "user"} {
 		if value := params[key]; value != nil {
@@ -386,6 +391,12 @@ func (b *CopilotBackend) Embeddings(ctx context.Context, model string, inputs []
 func (b *CopilotBackend) ChatStream(ctx context.Context, model string, messages []NeutralMessage, params map[string]any) (<-chan StreamItem, error) {
 	endpoint := endpointFromParams(params, endpointChatCompletions)
 	clean := cleanBackendParams(params)
+	if b.mode != copilotBackendModeOpencode {
+		if b.canUseSDK(messages, clean) {
+			return b.chatStreamSDK(ctx, model, messages, clean)
+		}
+		return nil, unsupportedSDKModeRequest(endpoint)
+	}
 	var body any
 	switch {
 	case endpointMatches(endpoint, endpointResponses):
@@ -414,6 +425,10 @@ func (b *CopilotBackend) ChatStream(ctx context.Context, model string, messages 
 		}
 	}()
 	return out, nil
+}
+
+func unsupportedSDKModeRequest(endpoint string) error {
+	return fmt.Errorf("copilot sdk mode does not support this request shape on endpoint %q; use sdk-compatible single-turn chat or explicit opencode mode for direct API behavior", endpoint)
 }
 
 func (b *CopilotBackend) Close() error {
@@ -455,10 +470,45 @@ func (b *CopilotBackend) sdk(ctx context.Context) (*sdk.Client, error) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.sdkReady && b.sdkClient != nil {
+		return b.sdkClient, nil
+	}
+	if b.sdkErr != nil {
+		return nil, b.sdkErr
+	}
 	if b.sdkClient == nil {
 		return nil, fmt.Errorf("sdk client not available")
 	}
-	return b.sdkClient, nil
+	return nil, fmt.Errorf("sdk client not connected")
+}
+
+func (b *CopilotBackend) sdkForParams(ctx context.Context, params map[string]any) (*sdk.Client, func(), error) {
+	if !b.useSDKCLIWebSearch(params) {
+		client, err := b.sdk(ctx)
+		return client, func() {}, err
+	}
+	client := sdk.NewClient(b.sdkClientOptions(sdk.ModeCopilotCli, "cli-web-search"))
+	if err := client.Start(ctx); err != nil {
+		return nil, func() {}, err
+	}
+	return client, func() { _ = client.Stop() }, nil
+}
+
+func (b *CopilotBackend) sdkClientOptions(mode sdk.ClientMode, suffix string) *sdk.ClientOptions {
+	baseDir := b.homeDir
+	if baseDir == "" {
+		baseDir = "runtime-home/" + b.accountID
+	}
+	if suffix != "" {
+		baseDir = filepath.Join(baseDir, suffix)
+	}
+	return &sdk.ClientOptions{
+		BaseDirectory:             baseDir,
+		GitHubToken:               b.sdkGitHubToken(),
+		UseLoggedInUser:           sdk.Bool(b.sdkGitHubToken() == ""),
+		Mode:                      mode,
+		SessionIdleTimeoutSeconds: 60,
+	}
 }
 
 func (b *CopilotBackend) listModelsSDK(ctx context.Context) ([]ModelSpec, error) {
@@ -474,7 +524,7 @@ func (b *CopilotBackend) listModelsSDK(ctx context.Context) ([]ModelSpec, error)
 	for _, model := range models {
 		specs = append(specs, ModelSpec{
 			ID:                 model.ID,
-			SupportedEndpoints: []string{endpointChatCompletions},
+			SupportedEndpoints: copilotSDKModelEndpoints(model.ID),
 			Capabilities: map[string]any{
 				"name":                        model.Name,
 				"supports_reasoning_effort":   model.Capabilities.Supports.ReasoningEffort,
@@ -489,146 +539,476 @@ func (b *CopilotBackend) listModelsSDK(ctx context.Context) ([]ModelSpec, error)
 	return specs, nil
 }
 
+func copilotSDKModelEndpoints(model string) []string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.HasPrefix(model, "claude"):
+		return []string{endpointMessages, endpointChatCompletions}
+	case strings.Contains(model, "embed"):
+		return []string{endpointEmbeddings}
+	case copilotPrefersResponses(model):
+		return []string{endpointResponses, endpointChatCompletions}
+	default:
+		return []string{endpointChatCompletions, endpointResponses}
+	}
+}
+
 func (b *CopilotBackend) canUseSDK(messages []NeutralMessage, params map[string]any) bool {
 	if !b.sdkConfigured() {
 		return false
 	}
-	if len(messages) != 1 || messages[0].Role != "user" || messages[0].ToolCallID != "" || len(messages[0].ToolCalls) > 0 {
+	if params["n"] != nil && intFromAny(params["n"], 1) != 1 {
 		return false
-	}
-	if tools, _ := params["tools"].([]map[string]any); len(tools) > 0 {
-		return false
-	}
-	if choice := params["tool_choice"]; choice != nil {
-		if s, ok := choice.(string); !ok || (s != "" && s != "auto" && s != "none") {
-			return false
-		}
-	}
-	for _, key := range []string{
-		"temperature", "top_p", "max_tokens", "stop", "n", "presence_penalty",
-		"frequency_penalty", "response_format", "parallel_tool_calls",
-	} {
-		if params[key] != nil {
-			return false
-		}
 	}
 	return true
 }
 
 func (b *CopilotBackend) chatSDK(ctx context.Context, model string, messages []NeutralMessage, params map[string]any, stream bool) (ChatResult, error) {
-	client, err := b.sdk(ctx)
+	client, cleanup, err := b.sdkForParams(ctx, params)
 	if err != nil {
 		return ChatResult{}, err
 	}
+	defer cleanup()
 	session, err := client.CreateSession(ctx, b.sdkSessionConfig(model, params, stream))
 	if err != nil {
 		return ChatResult{}, err
 	}
 	defer session.Disconnect()
-	prompt := messages[0].Content
-	event, err := session.SendAndWait(ctx, sdk.MessageOptions{Prompt: prompt})
+	prompt := sdkPrompt(messages, params)
+	result, err := b.sendSDKAndCollect(ctx, session, model, prompt, params)
 	if err != nil {
 		return ChatResult{}, err
 	}
-	content := ""
-	outputTokens := 0
-	if event != nil {
-		if data, ok := event.Data.(*sdk.AssistantMessageData); ok {
-			content = data.Content
-			if data.OutputTokens != nil {
-				outputTokens = int(*data.OutputTokens)
-			}
-			if data.Model != nil {
-				model = *data.Model
-			}
+	return applySDKOutputConstraints(result, params), nil
+}
+
+func (b *CopilotBackend) sendSDKAndCollect(ctx context.Context, session *sdk.Session, model, prompt string, params map[string]any) (ChatResult, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+	}
+	endpoint := sdkUsageEndpoint(params)
+	result := ChatResult{
+		Model:        model,
+		FinishReason: "stop",
+		Usage:        Usage{InputTokens: approxTokens(prompt), APIEndpoint: endpoint}.Normalized(),
+	}
+	var mu sync.Mutex
+	idleCh := make(chan struct{}, 1)
+	toolCh := make(chan struct{}, 1)
+	errCh := make(chan error, 1)
+	signal := func(ch chan struct{}) {
+		select {
+		case ch <- struct{}{}:
+		default:
 		}
 	}
-	usage := Usage{InputTokens: approxTokens(prompt), OutputTokens: outputTokens, APIEndpoint: endpointChatCompletions}.Normalized()
-	if usage.OutputTokens == 0 {
-		usage.OutputTokens = approxTokens(content)
-		usage = usage.Normalized()
+	unsubscribe := session.On(func(event sdk.SessionEvent) {
+		switch data := event.Data.(type) {
+		case *sdk.AssistantMessageData:
+			mu.Lock()
+			result.Content = data.Content
+			if data.Model != nil && *data.Model != "" {
+				result.Model = *data.Model
+			}
+			if data.OutputTokens != nil {
+				result.Usage.OutputTokens = int(*data.OutputTokens)
+			}
+			for _, request := range data.ToolRequests {
+				if b.useSDKCLIWebSearch(params) && isSDKWebSearchInternalTool(request.Name) {
+					continue
+				}
+				result.ToolCalls = appendToolCallUnique(result.ToolCalls, toolCallFromSDKRequest(request))
+			}
+			hasTools := len(result.ToolCalls) > 0
+			mu.Unlock()
+			if hasTools {
+				signal(toolCh)
+			}
+		case *sdk.ExternalToolRequestedData:
+			if b.useSDKCLIWebSearch(params) && isSDKWebSearchInternalTool(data.ToolName) {
+				return
+			}
+			mu.Lock()
+			result.ToolCalls = appendToolCallUnique(result.ToolCalls, toolCallFromSDKExternalTool(data))
+			mu.Unlock()
+			signal(toolCh)
+		case *sdk.AssistantUsageData:
+			mu.Lock()
+			result.Usage = mergeSDKUsage(result.Usage, sdkUsageFromEvent(data, endpoint))
+			if data.Model != "" {
+				result.Model = data.Model
+			}
+			mu.Unlock()
+		case *sdk.SessionIdleData:
+			signal(idleCh)
+		case *sdk.SessionErrorData:
+			select {
+			case errCh <- fmt.Errorf("session error: %s", data.Message):
+			default:
+			}
+		}
+	})
+	defer unsubscribe()
+
+	if _, err := session.Send(ctx, sdk.MessageOptions{Prompt: prompt}); err != nil {
+		return ChatResult{}, err
 	}
-	return ChatResult{Content: content, Model: model, Usage: usage, FinishReason: "stop"}, nil
+
+	select {
+	case <-toolCh:
+		waitForSDKToolSettle(ctx, toolCh)
+		abortCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = session.Abort(abortCtx)
+		cancel()
+		mu.Lock()
+		out := finalizeSDKResult(result, prompt, endpoint)
+		mu.Unlock()
+		out.FinishReason = "tool_calls"
+		return out, nil
+	case <-idleCh:
+		mu.Lock()
+		out := finalizeSDKResult(result, prompt, endpoint)
+		mu.Unlock()
+		return out, nil
+	case err := <-errCh:
+		return ChatResult{}, err
+	case <-ctx.Done():
+		return ChatResult{}, fmt.Errorf("waiting for sdk session: %w", ctx.Err())
+	}
+}
+
+func waitForSDKToolSettle(ctx context.Context, toolCh <-chan struct{}) {
+	timer := time.NewTimer(50 * time.Millisecond)
+	defer timer.Stop()
+	for {
+		select {
+		case <-toolCh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(50 * time.Millisecond)
+		case <-timer.C:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func finalizeSDKResult(result ChatResult, prompt, endpoint string) ChatResult {
+	if result.Model == "" {
+		result.Model = "unknown"
+	}
+	if result.FinishReason == "" {
+		result.FinishReason = "stop"
+	}
+	if len(result.ToolCalls) > 0 {
+		result.FinishReason = "tool_calls"
+	}
+	if result.Usage.APIEndpoint == "" {
+		result.Usage.APIEndpoint = endpoint
+	}
+	if result.Usage.InputTokens == 0 {
+		result.Usage.InputTokens = approxTokens(prompt)
+	}
+	if result.Usage.OutputTokens == 0 && result.Content != "" {
+		result.Usage.OutputTokens = approxTokens(result.Content)
+	}
+	result.Usage = result.Usage.Normalized()
+	return result
+}
+
+func appendToolCallUnique(calls []ToolCall, next ToolCall) []ToolCall {
+	next = next.normalized()
+	if next.Name == "" {
+		return calls
+	}
+	for i := range calls {
+		if calls[i].ID != "" && next.ID != "" && calls[i].ID == next.ID {
+			if calls[i].Name == "" {
+				calls[i].Name = next.Name
+			}
+			if calls[i].Arguments == "" || calls[i].Arguments == "{}" {
+				calls[i].Arguments = next.Arguments
+			}
+			if calls[i].Kind == "" {
+				calls[i].Kind = next.Kind
+			}
+			return calls
+		}
+	}
+	return append(calls, next)
+}
+
+func toolCallFromSDKRequest(request sdk.AssistantMessageToolRequest) ToolCall {
+	kind := "function"
+	if request.Type != nil && string(*request.Type) != "" {
+		kind = string(*request.Type)
+	}
+	return ToolCall{
+		ID:        firstNonEmpty(request.ToolCallID, newID("call")),
+		Name:      request.Name,
+		Arguments: toolArgumentsString(request.Arguments),
+		Kind:      kind,
+	}
+}
+
+func toolCallFromSDKExternalTool(request *sdk.ExternalToolRequestedData) ToolCall {
+	if request == nil {
+		return ToolCall{}
+	}
+	return ToolCall{
+		ID:        firstNonEmpty(request.ToolCallID, newID("call")),
+		Name:      request.ToolName,
+		Arguments: toolArgumentsString(request.Arguments),
+		Kind:      "function",
+	}
+}
+
+func toolArgumentsString(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return "{}"
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return "{}"
+		}
+		return v
+	default:
+		data, err := json.Marshal(v)
+		if err != nil || len(data) == 0 {
+			return "{}"
+		}
+		return string(data)
+	}
+}
+
+func sdkUsageEndpoint(params map[string]any) string {
+	return endpointFromParams(params, endpointChatCompletions)
+}
+
+func sdkUsageFromEvent(data *sdk.AssistantUsageData, fallbackEndpoint string) Usage {
+	if data == nil {
+		return Usage{APIEndpoint: fallbackEndpoint}
+	}
+	endpoint := fallbackEndpoint
+	if data.APIEndpoint != nil && string(*data.APIEndpoint) != "" {
+		endpoint = string(*data.APIEndpoint)
+	}
+	usage := Usage{
+		APIEndpoint: endpoint,
+	}
+	if data.InputTokens != nil {
+		usage.InputTokens = int(*data.InputTokens)
+	}
+	if data.OutputTokens != nil {
+		usage.OutputTokens = int(*data.OutputTokens)
+	}
+	if data.CacheReadTokens != nil {
+		usage.CachedTokens = int(*data.CacheReadTokens)
+	}
+	if data.Cost != nil {
+		usage.Credits = *data.Cost
+	}
+	if data.Duration != nil {
+		usage.DurationMS = int(*data.Duration)
+	}
+	if data.ProviderCallID != nil {
+		usage.ProviderCallID = *data.ProviderCallID
+	} else if data.APICallID != nil {
+		usage.ProviderCallID = *data.APICallID
+	}
+	if len(data.QuotaSnapshots) > 0 {
+		if raw, err := json.Marshal(data.QuotaSnapshots); err == nil {
+			usage.QuotaSnapshots = raw
+		}
+	}
+	return usage.Normalized()
+}
+
+func mergeSDKUsage(base, next Usage) Usage {
+	if next.APIEndpoint != "" {
+		base.APIEndpoint = next.APIEndpoint
+	}
+	if next.InputTokens != 0 {
+		base.InputTokens = next.InputTokens
+	}
+	if next.OutputTokens != 0 {
+		base.OutputTokens = next.OutputTokens
+	}
+	if next.TotalTokens != 0 {
+		base.TotalTokens = next.TotalTokens
+	}
+	if next.CachedTokens != 0 {
+		base.CachedTokens = next.CachedTokens
+	}
+	if next.Credits != 0 {
+		base.Credits = next.Credits
+	}
+	if next.DurationMS != 0 {
+		base.DurationMS = next.DurationMS
+	}
+	if next.ProviderCallID != "" {
+		base.ProviderCallID = next.ProviderCallID
+	}
+	if len(next.QuotaSnapshots) > 0 {
+		base.QuotaSnapshots = next.QuotaSnapshots
+	}
+	return base.Normalized()
 }
 
 func (b *CopilotBackend) chatStreamSDK(ctx context.Context, model string, messages []NeutralMessage, params map[string]any) (<-chan StreamItem, error) {
-	client, err := b.sdk(ctx)
+	result, err := b.chatSDK(ctx, model, messages, params, false)
 	if err != nil {
 		return nil, err
 	}
-	session, err := client.CreateSession(ctx, b.sdkSessionConfig(model, params, true))
-	if err != nil {
-		return nil, err
-	}
-	prompt := messages[0].Content
 	out := make(chan StreamItem)
 	go func() {
 		defer close(out)
-		defer session.Disconnect()
-		done := make(chan struct{})
-		errCh := make(chan error, 1)
-		var once sync.Once
-		var finalContent string
-		outputTokens := 0
-		markDone := func() { once.Do(func() { close(done) }) }
-		unsubscribe := session.On(func(event sdk.SessionEvent) {
-			switch data := event.Data.(type) {
-			case *sdk.AssistantMessageDeltaData:
-				emitStreamItem(ctx, out, StreamItem{Kind: "delta", Text: data.DeltaContent})
-			case *sdk.AssistantMessageData:
-				finalContent = data.Content
-				if data.OutputTokens != nil {
-					outputTokens = int(*data.OutputTokens)
-				}
-			case *sdk.SessionErrorData:
-				msg := data.Message
-				if data.StatusCode != nil {
-					msg = fmt.Sprintf("sdk session error %d: %s", *data.StatusCode, msg)
-				} else if data.ErrorType != "" {
-					msg = fmt.Sprintf("sdk session error %s: %s", data.ErrorType, msg)
-				}
-				select {
-				case errCh <- fmt.Errorf("%s", msg):
-				default:
-				}
-				markDone()
-			case *sdk.SessionIdleData:
-				markDone()
-			}
-		})
-		defer unsubscribe()
-		if _, err := session.Send(ctx, sdk.MessageOptions{Prompt: prompt}); err != nil {
-			emitStreamItem(ctx, out, StreamItem{Kind: "error", Err: err})
-			return
-		}
-		select {
-		case <-done:
+		if result.Content != "" {
 			select {
-			case err := <-errCh:
-				emitStreamItem(ctx, out, StreamItem{Kind: "error", Err: err})
+			case out <- StreamItem{Kind: "delta", Text: result.Content}:
+			case <-ctx.Done():
+				emitStreamItem(context.Background(), out, StreamItem{Kind: "error", Err: ctx.Err()})
 				return
-			default:
 			}
-			usage := Usage{InputTokens: approxTokens(prompt), OutputTokens: outputTokens, APIEndpoint: endpointChatCompletions}.Normalized()
-			if usage.OutputTokens == 0 {
-				usage.OutputTokens = approxTokens(finalContent)
-				usage = usage.Normalized()
-			}
-			emitStreamItem(ctx, out, StreamItem{Kind: "done", Usage: usage, FinishReason: "stop"})
-		case <-ctx.Done():
-			_ = session.Abort(context.Background())
-			emitStreamItem(context.Background(), out, StreamItem{Kind: "error", Err: ctx.Err()})
 		}
+		for i, tc := range result.ToolCalls {
+			if !emitStreamItem(ctx, out, StreamItem{Kind: "tool_call", ToolCall: tc, Index: i}) {
+				return
+			}
+		}
+		emitStreamItem(ctx, out, StreamItem{Kind: "done", Usage: result.Usage, FinishReason: result.FinishReason})
 	}()
 	return out, nil
 }
 
+func sdkPrompt(messages []NeutralMessage, params map[string]any) string {
+	prompt := ""
+	if len(messages) == 1 && strings.EqualFold(messages[0].Role, "user") {
+		prompt = messages[0].Content
+	} else {
+		prompt = renderPrompt(messages)
+	}
+	format := anyMap(params["response_format"])
+	if typ := strings.ToLower(stringFromAny(format["type"])); strings.Contains(typ, "json") {
+		prompt = strings.TrimSpace(prompt) + "\n\nRespond with valid JSON only."
+	}
+	if instruction := sdkToolChoiceInstruction(params); instruction != "" {
+		prompt = strings.TrimSpace(prompt) + "\n\n" + instruction
+	}
+	return prompt
+}
+
+func sdkToolChoiceInstruction(params map[string]any) string {
+	if !hasSDKRequestTools(params) || toolChoiceIsNone(params["tool_choice"]) {
+		return ""
+	}
+	if name := forcedToolName(params["tool_choice"]); name != "" {
+		return "Use the " + name + " tool for this turn and return the tool request if more information is needed."
+	}
+	switch choice := strings.ToLower(stringFromAny(params["tool_choice"])); choice {
+	case "required", "any":
+		return "Use one of the available tools for this turn and return the tool request if more information is needed."
+	default:
+		return ""
+	}
+}
+
+func applySDKOutputConstraints(result ChatResult, params map[string]any) ChatResult {
+	if len(result.ToolCalls) > 0 {
+		result.FinishReason = "tool_calls"
+		result.Usage = result.Usage.Normalized()
+		return result
+	}
+	content, stopped := applyStopSequences(result.Content, params["stop"])
+	if stopped {
+		result.Content = content
+		result.FinishReason = "stop"
+	}
+	if maxTokens := sdkMaxOutputTokens(params); maxTokens > 0 {
+		if truncated, ok := truncateApproxTokens(result.Content, maxTokens); ok {
+			result.Content = truncated
+			result.FinishReason = "length"
+		}
+	}
+	result.Usage.OutputTokens = approxTokens(result.Content)
+	result.Usage = result.Usage.Normalized()
+	return result
+}
+
+func sdkMaxOutputTokens(params map[string]any) int {
+	if n := intFromAny(params["max_tokens"], 0); n > 0 {
+		return n
+	}
+	options := anyMap(params["response_options"])
+	return intFromAny(firstAny(options["max_tokens"], options["max_output_tokens"]), 0)
+}
+
+func applyStopSequences(content string, value any) (string, bool) {
+	stops := []string{}
+	switch v := value.(type) {
+	case nil:
+	case string:
+		stops = append(stops, v)
+	case []string:
+		stops = append(stops, v...)
+	case []any:
+		for _, item := range v {
+			if stop := stringFromAny(item); stop != "" {
+				stops = append(stops, stop)
+			}
+		}
+	}
+	cut := -1
+	for _, stop := range stops {
+		if stop == "" {
+			continue
+		}
+		if idx := strings.Index(content, stop); idx >= 0 && (cut < 0 || idx < cut) {
+			cut = idx
+		}
+	}
+	if cut < 0 {
+		return content, false
+	}
+	return content[:cut], true
+}
+
+func truncateApproxTokens(content string, maxTokens int) (string, bool) {
+	if maxTokens <= 0 {
+		return content, false
+	}
+	fields := strings.Fields(content)
+	if len(fields) <= maxTokens {
+		return content, false
+	}
+	return strings.Join(fields[:maxTokens], " "), true
+}
+
 func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, stream bool) *sdk.SessionConfig {
+	if b.useSDKCLIWebSearch(params) {
+		cfg := &sdk.SessionConfig{
+			ClientName:     "ghcp-pool-go",
+			Model:          model,
+			Streaming:      sdk.Bool(stream),
+			Tools:          sdkCLIWebSearchTools(),
+			AvailableTools: b.sdkAvailableToolsForParams(params),
+		}
+		b.applySDKModelOptions(cfg, params)
+		return cfg
+	}
 	cfg := &sdk.SessionConfig{
 		ClientName:              "ghcp-pool-go",
 		Model:                   model,
 		Streaming:               sdk.Bool(stream),
-		AvailableTools:          b.sdkAvailableTools(),
+		Tools:                   sdkCustomToolsFromParams(params),
+		AvailableTools:          b.sdkAvailableToolsForParams(params),
 		EnableConfigDiscovery:   sdk.Bool(false),
 		SkipEmbeddingRetrieval:  sdk.Bool(true),
 		EmbeddingCacheStorage:   sdk.String("in-memory"),
@@ -637,24 +1017,225 @@ func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, s
 		EnableSessionStore:      sdk.Bool(false),
 		EnableSkills:            sdk.Bool(false),
 	}
+	b.applySDKModelOptions(cfg, params)
+	return cfg
+}
+
+func (b *CopilotBackend) applySDKModelOptions(cfg *sdk.SessionConfig, params map[string]any) {
 	if effort := stringParam(params, "reasoning_effort"); effort != "" && effort != "none" {
 		cfg.ReasoningEffort = effort
 	}
 	if tier := stringParam(params, "context_tier"); tier != "" && tier != "default" {
 		cfg.ContextTier = sdk.ContextTier(tier)
 	}
-	return cfg
 }
 
 func (b *CopilotBackend) sdkAvailableTools() []string {
 	tools := normalizeStringList(b.sdkTools)
-	if b.sdkWebSearch && !containsString(tools, "web_search") && !containsString(tools, "builtin:web_search") {
+	if b.sdkWebSearch && b.sdkWebSearchMode == "empty" && !containsString(tools, "web_search") && !containsString(tools, "builtin:web_search") {
 		tools = append(tools, "web_search")
 	}
 	if tools == nil {
 		return []string{}
 	}
 	return tools
+}
+
+func (b *CopilotBackend) sdkAvailableToolsForParams(params map[string]any) []string {
+	if toolChoiceIsNone(params["tool_choice"]) {
+		return []string{}
+	}
+	if b.useSDKCLIWebSearch(params) {
+		tools := []string{"builtin:*", "web_fetch", "report_intent"}
+		for _, tool := range sdkCustomToolsFromParams(params) {
+			if tool.Name != "" && !containsString(tools, tool.Name) && !containsString(tools, "custom:"+tool.Name) {
+				tools = append(tools, tool.Name)
+			}
+		}
+		return tools
+	}
+	tools := b.sdkAvailableTools()
+	if b.sdkWebSearchMode == "empty" && requestHasWebSearchTool(params) && !containsString(tools, "web_search") && !containsString(tools, "builtin:web_search") {
+		tools = append(tools, "web_search")
+	}
+	for _, tool := range sdkCustomToolsFromParams(params) {
+		if tool.Name != "" && !containsString(tools, tool.Name) && !containsString(tools, "custom:"+tool.Name) {
+			tools = append(tools, tool.Name)
+		}
+	}
+	if tools == nil {
+		return []string{}
+	}
+	tools = normalizeStringList(tools)
+	if tools == nil {
+		return []string{}
+	}
+	return tools
+}
+
+func (b *CopilotBackend) useSDKCLIWebSearch(params map[string]any) bool {
+	return b.sdkWebSearchMode == "cli" && requestHasWebSearchTool(params)
+}
+
+func sdkCLIWebSearchTools() []sdk.Tool {
+	return []sdk.Tool{
+		{
+			Name:                 "report_intent",
+			Description:          "Report intent before using web tools.",
+			Parameters:           map[string]any{"type": "object", "properties": map[string]any{"intent": map[string]any{"type": "string"}}},
+			OverridesBuiltInTool: true,
+			SkipPermission:       true,
+			Handler: func(sdk.ToolInvocation) (sdk.ToolResult, error) {
+				return sdk.ToolResult{TextResultForLLM: "Intent acknowledged.", ResultType: "success"}, nil
+			},
+		},
+		{
+			Name:        "web_fetch",
+			Description: "Fetch a web page by URL and return text for the model.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"url":        map[string]any{"type": "string", "description": "URL to fetch"},
+					"max_length": map[string]any{"type": "integer", "description": "Maximum number of characters to return"},
+				},
+				"required": []string{"url"},
+			},
+			OverridesBuiltInTool: true,
+			SkipPermission:       true,
+			Handler:              sdkWebFetchHandler,
+		},
+	}
+}
+
+func isSDKWebSearchInternalTool(name string) bool {
+	switch name {
+	case "report_intent", "web_fetch":
+		return true
+	default:
+		return false
+	}
+}
+
+func sdkWebFetchHandler(inv sdk.ToolInvocation) (sdk.ToolResult, error) {
+	args := anyMap(inv.Arguments)
+	rawURL := stringFromAny(args["url"])
+	if rawURL == "" {
+		return sdk.ToolResult{TextResultForLLM: "missing url", ResultType: "failure", Error: "missing url"}, nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return sdk.ToolResult{TextResultForLLM: "invalid url", ResultType: "failure", Error: "invalid url"}, nil
+	}
+	maxLength := intFromAny(args["max_length"], 12000)
+	if maxLength <= 0 {
+		maxLength = 12000
+	}
+	if maxLength > 20000 {
+		maxLength = 20000
+	}
+	ctx, cancel := context.WithTimeout(inv.TraceContext, 20*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return sdk.ToolResult{TextResultForLLM: err.Error(), ResultType: "failure", Error: err.Error()}, nil
+	}
+	req.Header.Set("User-Agent", copilotUserAgent)
+	resp, err := sdkWebHTTPClient.Do(req)
+	if err != nil {
+		return sdk.ToolResult{TextResultForLLM: err.Error(), ResultType: "failure", Error: err.Error()}, nil
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxLength)+1))
+	if err != nil {
+		return sdk.ToolResult{TextResultForLLM: err.Error(), ResultType: "failure", Error: err.Error()}, nil
+	}
+	text := string(data)
+	if len(text) > maxLength {
+		text = text[:maxLength] + "\n[truncated]"
+	}
+	return sdk.ToolResult{
+		TextResultForLLM: fmt.Sprintf("Fetched %s (HTTP %d):\n%s", u.String(), resp.StatusCode, text),
+		ResultType:       "success",
+		ToolTelemetry: map[string]any{
+			"url":         u.String(),
+			"status_code": resp.StatusCode,
+		},
+	}, nil
+}
+
+func sdkCustomToolsFromParams(params map[string]any) []sdk.Tool {
+	if toolChoiceIsNone(params["tool_choice"]) {
+		return nil
+	}
+	tools, _ := params["tools"].([]map[string]any)
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]sdk.Tool, 0, len(tools))
+	seen := map[string]bool{}
+	for _, tool := range tools {
+		if isWebSearchToolSpec(tool) {
+			continue
+		}
+		kind := strings.ToLower(stringFromAny(tool["type"]))
+		if kind != "" && kind != "function" && kind != "custom" && kind != "tool" {
+			continue
+		}
+		name := stringFromAny(tool["name"])
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, sdk.Tool{
+			Name:        name,
+			Description: stringFromAny(tool["description"]),
+			Parameters:  sdkToolParameters(tool),
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func sdkToolParameters(tool map[string]any) map[string]any {
+	for _, key := range []string{"parameters", "input_schema"} {
+		if params := anyMap(tool[key]); params != nil {
+			return params
+		}
+	}
+	return map[string]any{"type": "object", "properties": map[string]any{}}
+}
+
+func hasSDKRequestTools(params map[string]any) bool {
+	tools, _ := params["tools"].([]map[string]any)
+	return len(tools) > 0
+}
+
+func requestHasWebSearchTool(params map[string]any) bool {
+	if toolChoiceIsNone(params["tool_choice"]) {
+		return false
+	}
+	tools, _ := params["tools"].([]map[string]any)
+	for _, tool := range tools {
+		if isWebSearchToolSpec(tool) {
+			return true
+		}
+	}
+	return false
+}
+
+func toolChoiceIsNone(choice any) bool {
+	switch v := choice.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "none")
+	case map[string]any:
+		return strings.EqualFold(strings.TrimSpace(stringFromAny(v["type"])), "none")
+	default:
+		return false
+	}
 }
 
 func (b *CopilotBackend) doCopilot(ctx context.Context, method, endpoint string, body any, stream bool) (*http.Response, []byte, error) {
@@ -729,13 +1310,6 @@ func (b *CopilotBackend) validAccessToken(ctx context.Context) (copilotAccessTok
 	}
 	token, err := exchangeGitHubTokenForCopilot(ctx, b.githubToken)
 	if err != nil {
-		if b.canUseOAuthTokenAfterExchangeFailure(err) {
-			b.access = copilotAccessToken{
-				Token:   b.githubToken,
-				BaseURL: firstNonEmpty(b.baseURL, copilotPublicAPIBaseURL),
-			}
-			return b.access, nil
-		}
 		return copilotAccessToken{}, err
 	}
 	if b.baseURL != "" {
@@ -755,21 +1329,12 @@ func (t copilotAccessToken) usable() bool {
 	return time.Until(t.ExpiresAt) > 5*time.Minute
 }
 
-func (b *CopilotBackend) canUseOAuthTokenAfterExchangeFailure(err error) bool {
-	var exchangeErr *copilotTokenExchangeError
-	return errors.As(err, &exchangeErr) &&
-		exchangeErr.StatusCode == http.StatusNotFound &&
-		looksLikeGitHubOAuthToken(b.githubToken)
-}
-
 func exchangeGitHubTokenForCopilot(ctx context.Context, githubToken string) (copilotAccessToken, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, copilotTokenURL, nil)
 	if err != nil {
 		return copilotAccessToken{}, err
 	}
-	req.Header.Set("Authorization", "Bearer "+githubToken)
-	req.Header.Set("User-Agent", copilotUserAgent)
-	req.Header.Set("Accept", "application/json")
+	addGitHubCopilotTokenHeaders(req, githubToken)
 	resp, err := copilotHTTPClient.Do(req)
 	if err != nil {
 		return copilotAccessToken{}, fmt.Errorf("exchange GitHub token for Copilot token: %w", err)
@@ -855,6 +1420,15 @@ func addCopilotModelHeaders(req *http.Request, token string) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Github-Api-Version", copilotAPIVersion)
 	req.Header.Set("X-Request-Id", newID("req"))
+}
+
+func addGitHubCopilotTokenHeaders(req *http.Request, token string) {
+	req.Header.Set("Authorization", "token "+token)
+	req.Header.Set("User-Agent", copilotUserAgent)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Editor-Version", copilotEditorVersion)
+	req.Header.Set("Editor-Plugin-Version", copilotPluginVersion)
+	req.Header.Set("X-Github-Api-Version", copilotAPIVersion)
 }
 
 func copilotRequestMetadata(body any, endpoint string) copilotRequestInfo {
@@ -961,10 +1535,6 @@ func containsCopilotVision(value any) bool {
 
 func looksLikeCopilotBearer(token string) bool {
 	return strings.Contains(token, "proxy-ep=") || strings.HasPrefix(token, "tid=")
-}
-
-func looksLikeGitHubOAuthToken(token string) bool {
-	return strings.HasPrefix(strings.TrimSpace(token), "gho_")
 }
 
 func copilotBaseURLFromBearer(token string) string {
@@ -1586,6 +2156,10 @@ func openAITools(value any) []map[string]any {
 	tools, _ := value.([]map[string]any)
 	out := make([]map[string]any, 0, len(tools))
 	for _, tool := range tools {
+		if isWebSearchToolSpec(tool) {
+			out = append(out, compactMap(cloneMap(tool)))
+			continue
+		}
 		if stringFromAny(tool["name"]) == "" {
 			continue
 		}
@@ -1686,6 +2260,10 @@ func anthropicTools(value any) []map[string]any {
 	tools, _ := value.([]map[string]any)
 	out := make([]map[string]any, 0, len(tools))
 	for _, tool := range tools {
+		if isWebSearchToolSpec(tool) {
+			out = append(out, compactMap(cloneMap(tool)))
+			continue
+		}
 		name := stringFromAny(tool["name"])
 		if name == "" {
 			continue
@@ -1849,6 +2427,7 @@ func parseChatResult(data []byte, model string) (ChatResult, error) {
 
 func parseResponsesResult(data []byte, model string) (ChatResult, error) {
 	var payload struct {
+		ID         string           `json:"id"`
 		Model      string           `json:"model"`
 		Status     string           `json:"status"`
 		OutputText string           `json:"output_text"`
@@ -1873,16 +2452,20 @@ func parseResponsesResult(data []byte, model string) (ChatResult, error) {
 		content = responseTextFromOutput(payload.Output)
 	}
 	return ChatResult{
-		Model:        firstNonEmpty(payload.Model, model),
-		Content:      content,
-		Usage:        payload.Usage.toUsage(endpointResponses),
-		FinishReason: "stop",
-		ToolCalls:    toolCallsFromResponsesOutput(payload.Output),
+		ID:              payload.ID,
+		Status:          firstNonEmpty(payload.Status, "completed"),
+		Model:           firstNonEmpty(payload.Model, model),
+		Content:         content,
+		Usage:           payload.Usage.toUsage(endpointResponses),
+		FinishReason:    "stop",
+		ToolCalls:       toolCallsFromResponsesOutput(payload.Output),
+		ResponsesOutput: payload.Output,
 	}, nil
 }
 
 func parseAnthropicResult(data []byte, model string) (ChatResult, error) {
 	var payload struct {
+		ID         string           `json:"id"`
 		Model      string           `json:"model"`
 		Content    []map[string]any `json:"content"`
 		StopReason string           `json:"stop_reason"`
@@ -1898,13 +2481,13 @@ func parseAnthropicResult(data []byte, model string) (ChatResult, error) {
 	toolCalls := []ToolCall{}
 	for _, block := range payload.Content {
 		switch stringFromAny(block["type"]) {
-		case "text":
-			if value := stringFromAny(block["text"]); value != "" {
-				text = append(text, value)
-			}
 		case "tool_use":
 			args, _ := json.Marshal(firstAny(block["input"], map[string]any{}))
 			toolCalls = append(toolCalls, ToolCall{ID: stringFromAny(block["id"]), Name: stringFromAny(block["name"]), Arguments: string(args), Kind: "function"})
+		default:
+			if value := coerceText(block); value != "" {
+				text = append(text, value)
+			}
 		}
 	}
 	finish := "stop"
@@ -1914,11 +2497,13 @@ func parseAnthropicResult(data []byte, model string) (ChatResult, error) {
 		finish = "length"
 	}
 	return ChatResult{
-		Model:        firstNonEmpty(payload.Model, model),
-		Content:      strings.Join(text, "\n\n"),
-		Usage:        Usage{InputTokens: payload.Usage.InputTokens, OutputTokens: payload.Usage.OutputTokens, APIEndpoint: endpointMessages}.Normalized(),
-		FinishReason: finish,
-		ToolCalls:    toolCalls,
+		ID:               payload.ID,
+		Model:            firstNonEmpty(payload.Model, model),
+		Content:          strings.Join(text, "\n\n"),
+		Usage:            Usage{InputTokens: payload.Usage.InputTokens, OutputTokens: payload.Usage.OutputTokens, APIEndpoint: endpointMessages}.Normalized(),
+		FinishReason:     finish,
+		ToolCalls:        toolCalls,
+		AnthropicContent: payload.Content,
 	}, nil
 }
 
@@ -1943,9 +2528,18 @@ func responseTextFromOutput(output []map[string]any) string {
 	parts := []string{}
 	for _, item := range output {
 		for _, content := range anySlice(item["content"]) {
-			if block, ok := content.(map[string]any); ok && stringFromAny(block["type"]) == "output_text" {
-				if text := stringFromAny(block["text"]); text != "" {
+			block, ok := content.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch stringFromAny(block["type"]) {
+			case "output_text", "summary_text", "text":
+				if text := stringFromAny(firstAny(block["text"], block["summary"])); text != "" {
 					parts = append(parts, text)
+				}
+			case "refusal":
+				if refusal := stringFromAny(block["refusal"]); refusal != "" {
+					parts = append(parts, refusal)
 				}
 			}
 		}
@@ -2362,6 +2956,12 @@ func anySlice(value any) []any {
 	switch v := value.(type) {
 	case []any:
 		return v
+	case []map[string]any:
+		out := make([]any, 0, len(v))
+		for _, item := range v {
+			out = append(out, item)
+		}
+		return out
 	default:
 		return nil
 	}
