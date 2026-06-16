@@ -174,6 +174,12 @@ SDK turns still use empty mode. The legacy `sdk_web_search: true` setting keeps
 the older empty-mode allowlist behavior, which may not expose a usable web
 search tool in current SDK runtimes.
 
+`sdk_web_search_mode: native_cli` is also available as an experimental mode. It
+uses the temporary CLI-mode SDK client but exposes Copilot CLI native
+`web_search`/`web_fetch` instead of the gateway-owned `ghcp_web_search` and
+`ghcp_web_fetch` handlers. Native tools can be smoother when available, but
+their network access is controlled by Copilot's service-side egress policy.
+
 For advanced SDK tool allowlists, use `sdk_available_tools`:
 
 ```yaml

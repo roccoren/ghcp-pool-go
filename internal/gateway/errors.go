@@ -33,7 +33,25 @@ func isNonRetryableBackendError(err error) bool {
 	return isNonRetryableClientError(err.Error())
 }
 
+func isTransientOverloadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var upstream *CopilotUpstreamError
+	if errors.As(err, &upstream) {
+		return upstream.StatusCode == 529 || upstream.StatusCode == 500 || upstream.StatusCode == 502 || upstream.StatusCode == 503 || upstream.StatusCode == 504
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "529") ||
+		strings.Contains(msg, "overloaded") ||
+		strings.Contains(msg, "at capacity") ||
+		strings.Contains(msg, "capacity")
+}
+
 func anthropicErrorFromBackend(err error) (status int, errorType string, message string) {
+	if isTransientOverloadError(err) {
+		return 503, "overloaded_error", err.Error()
+	}
 	var upstream *CopilotUpstreamError
 	if errors.As(err, &upstream) {
 		errorType, message = anthropicErrorFromBody(upstream.Body)

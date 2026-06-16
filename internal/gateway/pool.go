@@ -423,7 +423,7 @@ func copilotBackendOptions(defaults CopilotConfig, cfg *AccountConfig) (CopilotB
 	if cfg.CopilotSDKWebSearchMode != "" {
 		sdkWebSearchMode = normalizeCopilotSDKWebSearchMode(cfg.CopilotSDKWebSearchMode, sdkWebSearch)
 		if !ValidCopilotSDKWebSearchModes[sdkWebSearchMode] {
-			return CopilotBackendOptions{}, fmt.Errorf("invalid copilot sdk web search mode %q for account %q; valid: off, empty, cli", cfg.CopilotSDKWebSearchMode, cfg.ID)
+			return CopilotBackendOptions{}, fmt.Errorf("invalid copilot sdk web search mode %q for account %q; valid: off, empty, cli, native_cli", cfg.CopilotSDKWebSearchMode, cfg.ID)
 		}
 	}
 	sdkTools := defaults.SDKTools
@@ -587,6 +587,7 @@ func isNonRetryableClientError(message string) bool {
 	return strings.Contains(text, "copilot upstream error 400") ||
 		strings.Contains(text, "invalid_request_error") ||
 		strings.Contains(text, "bad request") ||
+		strings.Contains(text, "does not support reasoning effort configuration") ||
 		strings.Contains(text, "copilot sdk mode does not support this request shape")
 }
 

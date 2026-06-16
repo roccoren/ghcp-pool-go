@@ -7,11 +7,13 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,6 +61,13 @@ var copilotHTTPClient = &http.Client{
 }
 
 var sdkWebHTTPClient = &http.Client{Timeout: 20 * time.Second}
+
+var (
+	ddgResultRE    = regexp.MustCompile(`(?is)<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>`)
+	ddgSnippetRE   = regexp.MustCompile(`(?is)<a[^>]+class="result__snippet"[^>]*>(.*?)</a>`)
+	bingResultRE   = regexp.MustCompile(`(?is)<li class="b_algo".*?<a href="([^"]+)"[^>]*>(.*?)</a>.*?(?:<p>(.*?)</p>)?`)
+	htmlTagStripRE = regexp.MustCompile(`(?is)<[^>]+>`)
+)
 
 var copilotModelListFallbackBaseURLs = []string{
 	copilotPublicAPIBaseURL,
@@ -564,6 +573,24 @@ func (b *CopilotBackend) canUseSDK(messages []NeutralMessage, params map[string]
 }
 
 func (b *CopilotBackend) chatSDK(ctx context.Context, model string, messages []NeutralMessage, params map[string]any, stream bool) (ChatResult, error) {
+	var lastErr error
+	for attempt := 0; attempt < transientRetryAttempts(params); attempt++ {
+		result, err := b.chatSDKOnce(ctx, model, messages, params, stream)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if !isTransientOverloadError(err) || attempt == transientRetryAttempts(params)-1 {
+			return ChatResult{}, err
+		}
+		if !sleepTransientRetry(ctx, attempt) {
+			return ChatResult{}, ctx.Err()
+		}
+	}
+	return ChatResult{}, lastErr
+}
+
+func (b *CopilotBackend) chatSDKOnce(ctx context.Context, model string, messages []NeutralMessage, params map[string]any, stream bool) (ChatResult, error) {
 	client, cleanup, err := b.sdkForParams(ctx, params)
 	if err != nil {
 		return ChatResult{}, err
@@ -574,7 +601,7 @@ func (b *CopilotBackend) chatSDK(ctx context.Context, model string, messages []N
 		return ChatResult{}, err
 	}
 	defer session.Disconnect()
-	prompt := sdkPrompt(messages, params)
+	prompt := b.sdkPrompt(messages, params)
 	result, err := b.sendSDKAndCollect(ctx, session, model, prompt, params)
 	if err != nil {
 		return ChatResult{}, err
@@ -582,10 +609,31 @@ func (b *CopilotBackend) chatSDK(ctx context.Context, model string, messages []N
 	return applySDKOutputConstraints(result, params), nil
 }
 
+func transientRetryAttempts(params map[string]any) int {
+	if requestHasWebSearchTool(params) {
+		return 2
+	}
+	return 3
+}
+
+func sleepTransientRetry(ctx context.Context, attempt int) bool {
+	delay := time.Duration(750*(attempt+1)) * time.Millisecond
+	select {
+	case <-time.After(delay):
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 func (b *CopilotBackend) sendSDKAndCollect(ctx context.Context, session *sdk.Session, model, prompt string, params map[string]any) (ChatResult, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 60*time.Second)
+		timeout := 60 * time.Second
+		if b.useSDKCLIWebSearch(params) {
+			timeout = 180 * time.Second
+		}
+		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
 	endpoint := sdkUsageEndpoint(params)
@@ -616,7 +664,10 @@ func (b *CopilotBackend) sendSDKAndCollect(ctx context.Context, session *sdk.Ses
 				result.Usage.OutputTokens = int(*data.OutputTokens)
 			}
 			for _, request := range data.ToolRequests {
-				if b.useSDKCLIWebSearch(params) && isSDKWebSearchInternalTool(request.Name) {
+				if b.useSDKControlledCLIWebSearch(params) && isSDKWebSearchInternalTool(request.Name) {
+					continue
+				}
+				if b.useSDKNativeCLIWebSearch(params) && isSDKNativeWebTool(request.Name) {
 					continue
 				}
 				result.ToolCalls = appendToolCallUnique(result.ToolCalls, toolCallFromSDKRequest(request))
@@ -627,7 +678,10 @@ func (b *CopilotBackend) sendSDKAndCollect(ctx context.Context, session *sdk.Ses
 				signal(toolCh)
 			}
 		case *sdk.ExternalToolRequestedData:
-			if b.useSDKCLIWebSearch(params) && isSDKWebSearchInternalTool(data.ToolName) {
+			if b.useSDKControlledCLIWebSearch(params) && isSDKWebSearchInternalTool(data.ToolName) {
+				return
+			}
+			if b.useSDKNativeCLIWebSearch(params) && isSDKNativeWebTool(data.ToolName) {
 				return
 			}
 			mu.Lock()
@@ -888,7 +942,7 @@ func (b *CopilotBackend) chatStreamSDK(ctx context.Context, model string, messag
 	return out, nil
 }
 
-func sdkPrompt(messages []NeutralMessage, params map[string]any) string {
+func (b *CopilotBackend) sdkPrompt(messages []NeutralMessage, params map[string]any) string {
 	prompt := ""
 	if len(messages) == 1 && strings.EqualFold(messages[0].Role, "user") {
 		prompt = messages[0].Content
@@ -899,15 +953,24 @@ func sdkPrompt(messages []NeutralMessage, params map[string]any) string {
 	if typ := strings.ToLower(stringFromAny(format["type"])); strings.Contains(typ, "json") {
 		prompt = strings.TrimSpace(prompt) + "\n\nRespond with valid JSON only."
 	}
-	if instruction := sdkToolChoiceInstruction(params); instruction != "" {
+	if instruction := b.sdkToolChoiceInstruction(params); instruction != "" {
 		prompt = strings.TrimSpace(prompt) + "\n\n" + instruction
 	}
 	return prompt
 }
 
-func sdkToolChoiceInstruction(params map[string]any) string {
+func (b *CopilotBackend) sdkToolChoiceInstruction(params map[string]any) string {
 	if !hasSDKRequestTools(params) || toolChoiceIsNone(params["tool_choice"]) {
 		return ""
+	}
+	if requestHasWebSearchTool(params) {
+		if b.useSDKControlledCLIWebSearch(params) {
+			return "Use the ghcp_web_search tool for web searches and ghcp_web_fetch for fetching URLs. Do not use built-in web_search or web_fetch tools."
+		}
+		if b.useSDKNativeCLIWebSearch(params) {
+			return "Use Copilot CLI native web_search for web searches and native web_fetch for fetching URLs. Do not use ghcp_web_search or ghcp_web_fetch tools."
+		}
+		return "Use the web_search tool for web searches and web_fetch for fetching URLs if it is available."
 	}
 	if name := forcedToolName(params["tool_choice"]); name != "" {
 		return "Use the " + name + " tool for this turn and return the tool request if more information is needed."
@@ -992,13 +1055,25 @@ func truncateApproxTokens(content string, maxTokens int) (string, bool) {
 }
 
 func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, stream bool) *sdk.SessionConfig {
-	if b.useSDKCLIWebSearch(params) {
+	if b.useSDKControlledCLIWebSearch(params) {
 		cfg := &sdk.SessionConfig{
 			ClientName:     "ghcp-pool-go",
 			Model:          model,
 			Streaming:      sdk.Bool(stream),
 			Tools:          sdkCLIWebSearchTools(),
 			AvailableTools: b.sdkAvailableToolsForParams(params),
+		}
+		b.applySDKModelOptions(cfg, params)
+		return cfg
+	}
+	if b.useSDKNativeCLIWebSearch(params) {
+		cfg := &sdk.SessionConfig{
+			ClientName:          "ghcp-pool-go",
+			Model:               model,
+			Streaming:           sdk.Bool(stream),
+			Tools:               sdkCustomToolsFromParams(params),
+			AvailableTools:      b.sdkAvailableToolsForParams(params),
+			OnPermissionRequest: sdk.PermissionHandler.ApproveAll,
 		}
 		b.applySDKModelOptions(cfg, params)
 		return cfg
@@ -1023,11 +1098,18 @@ func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, s
 
 func (b *CopilotBackend) applySDKModelOptions(cfg *sdk.SessionConfig, params map[string]any) {
 	if effort := stringParam(params, "reasoning_effort"); effort != "" && effort != "none" {
-		cfg.ReasoningEffort = effort
+		if modelSupportsSDKReasoningEffort(cfg.Model) {
+			cfg.ReasoningEffort = effort
+		}
 	}
 	if tier := stringParam(params, "context_tier"); tier != "" && tier != "default" {
 		cfg.ContextTier = sdk.ContextTier(tier)
 	}
+}
+
+func modelSupportsSDKReasoningEffort(model string) bool {
+	model = strings.ToLower(model)
+	return !strings.HasPrefix(model, "claude-haiku-")
 }
 
 func (b *CopilotBackend) sdkAvailableTools() []string {
@@ -1045,8 +1127,18 @@ func (b *CopilotBackend) sdkAvailableToolsForParams(params map[string]any) []str
 	if toolChoiceIsNone(params["tool_choice"]) {
 		return []string{}
 	}
-	if b.useSDKCLIWebSearch(params) {
-		tools := []string{"builtin:*", "web_fetch", "report_intent"}
+	if b.useSDKNativeCLIWebSearch(params) {
+		tools := []string{"builtin:web_search", "builtin:web_fetch"}
+		for _, tool := range sdkCustomToolsFromParams(params) {
+			name := "custom:" + tool.Name
+			if tool.Name != "" && !containsString(tools, name) {
+				tools = append(tools, name)
+			}
+		}
+		return tools
+	}
+	if b.useSDKControlledCLIWebSearch(params) {
+		tools := []string{"ghcp_web_search", "ghcp_web_fetch", "ghcp_report_intent"}
 		for _, tool := range sdkCustomToolsFromParams(params) {
 			if tool.Name != "" && !containsString(tools, tool.Name) && !containsString(tools, "custom:"+tool.Name) {
 				tools = append(tools, tool.Name)
@@ -1074,13 +1166,35 @@ func (b *CopilotBackend) sdkAvailableToolsForParams(params map[string]any) []str
 }
 
 func (b *CopilotBackend) useSDKCLIWebSearch(params map[string]any) bool {
+	return (b.sdkWebSearchMode == "cli" || b.sdkWebSearchMode == "native_cli") && requestHasWebSearchTool(params)
+}
+
+func (b *CopilotBackend) useSDKControlledCLIWebSearch(params map[string]any) bool {
 	return b.sdkWebSearchMode == "cli" && requestHasWebSearchTool(params)
+}
+
+func (b *CopilotBackend) useSDKNativeCLIWebSearch(params map[string]any) bool {
+	return b.sdkWebSearchMode == "native_cli" && requestHasWebSearchTool(params)
 }
 
 func sdkCLIWebSearchTools() []sdk.Tool {
 	return []sdk.Tool{
 		{
-			Name:                 "report_intent",
+			Name:        "ghcp_web_search",
+			Description: "Search the web for current information and return relevant results. Use this instead of built-in web_search.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query":   map[string]any{"type": "string", "description": "Search query"},
+					"queries": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Search queries"},
+				},
+			},
+			OverridesBuiltInTool: true,
+			SkipPermission:       true,
+			Handler:              sdkWebSearchHandler,
+		},
+		{
+			Name:                 "ghcp_report_intent",
 			Description:          "Report intent before using web tools.",
 			Parameters:           map[string]any{"type": "object", "properties": map[string]any{"intent": map[string]any{"type": "string"}}},
 			OverridesBuiltInTool: true,
@@ -1090,8 +1204,8 @@ func sdkCLIWebSearchTools() []sdk.Tool {
 			},
 		},
 		{
-			Name:        "web_fetch",
-			Description: "Fetch a web page by URL and return text for the model.",
+			Name:        "ghcp_web_fetch",
+			Description: "Fetch a web page by URL and return text for the model. Use this instead of built-in web_fetch.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -1109,11 +1223,171 @@ func sdkCLIWebSearchTools() []sdk.Tool {
 
 func isSDKWebSearchInternalTool(name string) bool {
 	switch name {
-	case "report_intent", "web_fetch":
+	case "ghcp_report_intent", "ghcp_web_fetch", "ghcp_web_search":
 		return true
 	default:
 		return false
 	}
+}
+
+func isSDKNativeWebTool(name string) bool {
+	switch strings.TrimPrefix(name, "builtin:") {
+	case "web_fetch", "web_search":
+		return true
+	default:
+		return false
+	}
+}
+
+func sdkWebSearchHandler(inv sdk.ToolInvocation) (sdk.ToolResult, error) {
+	args := anyMap(inv.Arguments)
+	queries := []string{}
+	if query := stringFromAny(args["query"]); query != "" {
+		queries = append(queries, query)
+	}
+	for _, item := range anySlice(args["queries"]) {
+		if query := stringFromAny(item); query != "" {
+			queries = append(queries, query)
+		}
+	}
+	if len(queries) == 0 {
+		return sdk.ToolResult{TextResultForLLM: "missing query", ResultType: "failure", Error: "missing query"}, nil
+	}
+	parts := []string{}
+	for _, query := range queries {
+		results, err := performSDKWebSearch(inv.TraceContext, query, 5)
+		if err != nil {
+			parts = append(parts, fmt.Sprintf("Query: %s\nError: %s", query, err.Error()))
+			continue
+		}
+		if len(results) == 0 {
+			parts = append(parts, "Query: "+query+"\nNo results found.")
+			continue
+		}
+		lines := []string{"Query: " + query}
+		for i, result := range results {
+			line := fmt.Sprintf("%d. %s\n   URL: %s", i+1, result.Title, result.URL)
+			if result.Snippet != "" {
+				line += "\n   Snippet: " + result.Snippet
+			}
+			lines = append(lines, line)
+		}
+		parts = append(parts, strings.Join(lines, "\n"))
+	}
+	return sdk.ToolResult{TextResultForLLM: strings.Join(parts, "\n\n"), ResultType: "success"}, nil
+}
+
+type sdkSearchResult struct {
+	Title   string
+	URL     string
+	Snippet string
+}
+
+func performSDKWebSearch(ctx context.Context, query string, limit int) ([]sdkSearchResult, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	if results, err := searchDuckDuckGo(ctx, query, limit); err == nil && len(results) > 0 {
+		return results, nil
+	}
+	return searchBing(ctx, query, limit)
+}
+
+func searchDuckDuckGo(ctx context.Context, query string, limit int) ([]sdkSearchResult, error) {
+	searchURL := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(query)
+	body, err := fetchSearchPage(ctx, searchURL)
+	if err != nil {
+		return nil, err
+	}
+	matches := ddgResultRE.FindAllStringSubmatch(body, limit)
+	snippets := ddgSnippetRE.FindAllStringSubmatch(body, limit)
+	results := make([]sdkSearchResult, 0, len(matches))
+	for i, match := range matches {
+		resultURL := decodeDuckDuckGoURL(match[1])
+		title := cleanHTMLText(match[2])
+		if title == "" || resultURL == "" {
+			continue
+		}
+		snippet := ""
+		if i < len(snippets) {
+			snippet = cleanHTMLText(snippets[i][1])
+		}
+		results = append(results, sdkSearchResult{Title: title, URL: resultURL, Snippet: snippet})
+	}
+	return results, nil
+}
+
+func searchBing(ctx context.Context, query string, limit int) ([]sdkSearchResult, error) {
+	searchURL := "https://www.bing.com/search?q=" + url.QueryEscape(query)
+	body, err := fetchSearchPage(ctx, searchURL)
+	if err != nil {
+		return nil, err
+	}
+	matches := bingResultRE.FindAllStringSubmatch(body, limit)
+	results := make([]sdkSearchResult, 0, len(matches))
+	for _, match := range matches {
+		title := cleanHTMLText(match[2])
+		resultURL := html.UnescapeString(match[1])
+		if title == "" || resultURL == "" {
+			continue
+		}
+		snippet := ""
+		if len(match) > 3 {
+			snippet = cleanHTMLText(match[3])
+		}
+		results = append(results, sdkSearchResult{Title: title, URL: resultURL, Snippet: snippet})
+	}
+	return results, nil
+}
+
+func fetchSearchPage(ctx context.Context, rawURL string) (string, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", copilotUserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	resp, err := sdkWebHTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("search request failed with status %d", resp.StatusCode)
+	}
+	return string(data), nil
+}
+
+func decodeDuckDuckGoURL(raw string) string {
+	raw = html.UnescapeString(raw)
+	if strings.HasPrefix(raw, "//") {
+		raw = "https:" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if strings.Contains(u.Host, "duckduckgo.com") {
+		if uddg := u.Query().Get("uddg"); uddg != "" {
+			if decoded, err := url.QueryUnescape(uddg); err == nil {
+				return decoded
+			}
+			return uddg
+		}
+	}
+	return raw
+}
+
+func cleanHTMLText(value string) string {
+	value = htmlTagStripRE.ReplaceAllString(value, " ")
+	value = html.UnescapeString(value)
+	return strings.Join(strings.Fields(value), " ")
 }
 
 func sdkWebFetchHandler(inv sdk.ToolInvocation) (sdk.ToolResult, error) {
@@ -1122,6 +1396,7 @@ func sdkWebFetchHandler(inv sdk.ToolInvocation) (sdk.ToolResult, error) {
 	if rawURL == "" {
 		return sdk.ToolResult{TextResultForLLM: "missing url", ResultType: "failure", Error: "missing url"}, nil
 	}
+	rawURL = normalizeSDKWebFetchURL(rawURL)
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return sdk.ToolResult{TextResultForLLM: "invalid url", ResultType: "failure", Error: "invalid url"}, nil
@@ -1161,6 +1436,30 @@ func sdkWebFetchHandler(inv sdk.ToolInvocation) (sdk.ToolResult, error) {
 			"status_code": resp.StatusCode,
 		},
 	}, nil
+}
+
+func normalizeSDKWebFetchURL(rawURL string) string {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Host == "" {
+		return rawURL
+	}
+	host := strings.ToLower(u.Host)
+	if host != "github.com" && host != "gh.hereis.app" {
+		return rawURL
+	}
+	parts := strings.Split(strings.TrimPrefix(u.EscapedPath(), "/"), "/")
+	if len(parts) < 5 {
+		return rawURL
+	}
+	owner, repo, marker, branch := parts[0], parts[1], parts[2], parts[3]
+	if marker != "blob" && marker != "raw" {
+		return rawURL
+	}
+	rest := strings.Join(parts[4:], "/")
+	if rest == "" {
+		return rawURL
+	}
+	return "https://raw.githubusercontent.com/" + owner + "/" + repo + "/" + branch + "/" + rest
 }
 
 func sdkCustomToolsFromParams(params map[string]any) []sdk.Tool {
@@ -1243,42 +1542,69 @@ func (b *CopilotBackend) doCopilot(ctx context.Context, method, endpoint string,
 	if err != nil {
 		return nil, nil, err
 	}
-	reader, err := requestBody(body)
+	bodyBytes, err := requestBodyBytes(body)
 	if err != nil {
 		return nil, nil, err
 	}
-	reqCtx := ctx
-	var cancel context.CancelFunc
+	attempts := 1
 	if !stream {
-		reqCtx, cancel = context.WithTimeout(ctx, 5*time.Minute)
-		defer cancel()
+		attempts = 3
 	}
-	req, err := http.NewRequestWithContext(reqCtx, method, access.BaseURL+endpoint, reader)
-	if err != nil {
-		return nil, nil, err
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		reqCtx := ctx
+		var cancel context.CancelFunc
+		if !stream {
+			reqCtx, cancel = context.WithTimeout(ctx, 5*time.Minute)
+		}
+		req, err := http.NewRequestWithContext(reqCtx, method, access.BaseURL+endpoint, bytes.NewReader(bodyBytes))
+		if err != nil {
+			if cancel != nil {
+				cancel()
+			}
+			return nil, nil, err
+		}
+		addCopilotHeaders(req, access.Token, endpoint, copilotRequestMetadata(body, endpoint))
+		if stream {
+			req.Header.Set("Accept", "text/event-stream")
+		}
+		resp, err := copilotHTTPClient.Do(req)
+		if err != nil {
+			if cancel != nil {
+				cancel()
+			}
+			lastErr = fmt.Errorf("copilot request failed: %w", err)
+			if attempt < attempts-1 && sleepTransientRetry(ctx, attempt) {
+				continue
+			}
+			return nil, nil, lastErr
+		}
+		if resp.StatusCode >= 400 {
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			if cancel != nil {
+				cancel()
+			}
+			lastErr = &CopilotUpstreamError{StatusCode: resp.StatusCode, Body: errBody}
+			if attempt < attempts-1 && isTransientOverloadError(lastErr) && sleepTransientRetry(ctx, attempt) {
+				continue
+			}
+			return nil, nil, lastErr
+		}
+		if stream {
+			return resp, nil, nil
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 50<<20))
+		resp.Body.Close()
+		if cancel != nil {
+			cancel()
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("read copilot response: %w", err)
+		}
+		return nil, data, nil
 	}
-	addCopilotHeaders(req, access.Token, endpoint, copilotRequestMetadata(body, endpoint))
-	if stream {
-		req.Header.Set("Accept", "text/event-stream")
-	}
-	resp, err := copilotHTTPClient.Do(req)
-	if err != nil {
-		return nil, nil, fmt.Errorf("copilot request failed: %w", err)
-	}
-	if resp.StatusCode >= 400 {
-		defer resp.Body.Close()
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return nil, nil, &CopilotUpstreamError{StatusCode: resp.StatusCode, Body: errBody}
-	}
-	if stream {
-		return resp, nil, nil
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 50<<20))
-	if err != nil {
-		return nil, nil, fmt.Errorf("read copilot response: %w", err)
-	}
-	return nil, data, nil
+	return nil, nil, lastErr
 }
 
 func (b *CopilotBackend) validAccessToken(ctx context.Context) (copilotAccessToken, error) {
@@ -1368,19 +1694,30 @@ func exchangeGitHubTokenForCopilot(ctx context.Context, githubToken string) (cop
 }
 
 func requestBody(body any) (io.Reader, error) {
+	data, err := requestBodyBytes(body)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, nil
+	}
+	return bytes.NewReader(data), nil
+}
+
+func requestBodyBytes(body any) ([]byte, error) {
 	switch v := body.(type) {
 	case nil:
 		return nil, nil
 	case []byte:
-		return bytes.NewReader(v), nil
-	case io.Reader:
 		return v, nil
+	case io.Reader:
+		return io.ReadAll(v)
 	default:
 		data, err := json.Marshal(v)
 		if err != nil {
 			return nil, err
 		}
-		return bytes.NewReader(data), nil
+		return data, nil
 	}
 }
 

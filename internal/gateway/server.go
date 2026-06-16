@@ -143,7 +143,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	result, accountID, err := s.gw.CompleteResult(r.Context(), plan)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "backend error: "+err.Error())
+		writeBackendError(w, err)
 		return
 	}
 	headers := plan.Headers()
@@ -185,7 +185,7 @@ func (s *server) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	result, accountID, err := s.gw.CompleteResult(r.Context(), plan)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "backend error: "+err.Error())
+		writeBackendError(w, err)
 		return
 	}
 	headers := plan.Headers()
@@ -1107,6 +1107,14 @@ func writeError(w http.ResponseWriter, status int, detail string) {
 
 func writeErrorWithHeaders(w http.ResponseWriter, status int, detail string, headers map[string]string) {
 	writeJSON(w, status, map[string]any{"detail": detail}, headers)
+}
+
+func writeBackendError(w http.ResponseWriter, err error) {
+	if isTransientOverloadError(err) {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "overloaded_error", err.Error())
+		return
+	}
+	writeError(w, http.StatusBadGateway, "backend error: "+err.Error())
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, errorType, message string) {

@@ -22,7 +22,7 @@ var ValidContextTiers = map[string]bool{
 }
 
 var ValidCopilotSDKWebSearchModes = map[string]bool{
-	"off": true, "empty": true, "cli": true,
+	"off": true, "empty": true, "cli": true, "native_cli": true,
 }
 
 var ValidStrategies = map[string]bool{
@@ -312,6 +312,10 @@ func normalizeCopilotSDKWebSearchMode(mode string, legacyEnabled bool) string {
 		}
 		return "off"
 	}
+	switch strings.ReplaceAll(mode, "-", "_") {
+	case "native", "cli_native", "native_cli":
+		return "native_cli"
+	}
 	return mode
 }
 
@@ -396,7 +400,7 @@ func LoadSettings(path string) (Settings, error) {
 	}
 	settings.Copilot.SDKWebSearchMode = normalizeCopilotSDKWebSearchMode(settings.Copilot.SDKWebSearchMode, settings.Copilot.SDKWebSearch)
 	if !ValidCopilotSDKWebSearchModes[settings.Copilot.SDKWebSearchMode] {
-		return Settings{}, fmt.Errorf("invalid copilot sdk_web_search_mode %q; valid: off, empty, cli", settings.Copilot.SDKWebSearchMode)
+		return Settings{}, fmt.Errorf("invalid copilot sdk_web_search_mode %q; valid: off, empty, cli, native_cli", settings.Copilot.SDKWebSearchMode)
 	}
 	settings.Copilot.EnterpriseURL = normalizeDomain(settings.Copilot.EnterpriseURL)
 	if settings.Copilot.BaseURL == "" && settings.Copilot.EnterpriseURL != "" {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -253,6 +254,14 @@ func TestLoadSettingsSDKWebSearchAndToolsFlags(t *testing.T) {
 	if settings.Copilot.SDKWebSearchMode != "cli" {
 		t.Fatalf("sdk web search mode override=%q", settings.Copilot.SDKWebSearchMode)
 	}
+	t.Setenv("GHCP_COPILOT_SDK_WEB_SEARCH_MODE", "native")
+	settings, err = LoadSettings("/does/not/exist.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.Copilot.SDKWebSearchMode != "native_cli" {
+		t.Fatalf("sdk web search mode native alias=%q", settings.Copilot.SDKWebSearchMode)
+	}
 }
 
 func TestLoadSettingsDerivesEnterpriseCopilotProviderURLs(t *testing.T) {
@@ -303,13 +312,13 @@ func TestCopilotBackendOptionsAllowPerAccountSDKWebSearchOverride(t *testing.T) 
 	}, &AccountConfig{
 		ID:                      "acct-sdk",
 		CopilotSDKWebSearch:     &enabled,
-		CopilotSDKWebSearchMode: "cli",
+		CopilotSDKWebSearchMode: "native-cli",
 		CopilotSDKTools:         []string{"grep"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !options.SDKWebSearch || options.SDKWebSearchMode != "cli" || strings.Join(options.SDKTools, ",") != "grep" {
+	if !options.SDKWebSearch || options.SDKWebSearchMode != "native_cli" || strings.Join(options.SDKTools, ",") != "grep" {
 		t.Fatalf("options=%+v", options)
 	}
 }
@@ -560,6 +569,19 @@ func TestNativeOutputBlocksArePreserved(t *testing.T) {
 	blocks := anthropic["content"].([]any)
 	if blocks[0].(map[string]any)["type"] != "thinking" || blocks[1].(map[string]any)["citations"] == nil {
 		t.Fatalf("anthropic blocks=%v", blocks)
+	}
+}
+
+func TestSDKSearchResultHelpers(t *testing.T) {
+	raw := `https://duckduckgo.com/l/?uddg=https%3A%2F%2Fnews.microsoft.com%2Fbuild-2026-book-of-news%2F`
+	if got := decodeDuckDuckGoURL(raw); got != "https://news.microsoft.com/build-2026-book-of-news/" {
+		t.Fatalf("decoded=%q", got)
+	}
+	if got := normalizeSDKWebFetchURL("https://gh.hereis.app/microsoft/Build26-news/blob/main/news.md"); got != "https://raw.githubusercontent.com/microsoft/Build26-news/main/news.md" {
+		t.Fatalf("normalized fetch url=%q", got)
+	}
+	if got := cleanHTMLText(`<b>Build</b> &amp; Fabric&nbsp;news`); got != "Build & Fabric news" {
+		t.Fatalf("cleaned=%q", got)
 	}
 }
 
@@ -1348,6 +1370,21 @@ func TestCopilotNativeThinkingNormalizesClaudeCodeShape(t *testing.T) {
 	}
 }
 
+func TestSDKReasoningEffortStrippedForHaiku(t *testing.T) {
+	backend := NewCopilotBackend("acct", "gh-token", "")
+	haiku := &sdk.SessionConfig{Model: "claude-haiku-4.5"}
+	backend.applySDKModelOptions(haiku, map[string]any{"reasoning_effort": "medium"})
+	if haiku.ReasoningEffort != "" {
+		t.Fatalf("haiku reasoning effort should be stripped, got %q", haiku.ReasoningEffort)
+	}
+
+	sonnet := &sdk.SessionConfig{Model: "claude-sonnet-4.6"}
+	backend.applySDKModelOptions(sonnet, map[string]any{"reasoning_effort": "medium"})
+	if sonnet.ReasoningEffort != "medium" {
+		t.Fatalf("sonnet reasoning effort=%q", sonnet.ReasoningEffort)
+	}
+}
+
 func TestNativeAnthropicPayloadPreservesRawBlocks(t *testing.T) {
 	raw := map[string]any{
 		"model": "claude-sonnet-4.6",
@@ -1484,6 +1521,47 @@ func TestAnthropicBackendInvalidRequestPreservesStatusAndShape(t *testing.T) {
 	}
 }
 
+func TestCopilotDirectRetriesTransient529(t *testing.T) {
+	oldClient := copilotHTTPClient
+	defer func() { copilotHTTPClient = oldClient }()
+	attempts := 0
+	copilotHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return &http.Response{
+				StatusCode: 529,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"Overloaded"}}`)),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: 200,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"model":"gpt-5.5","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)),
+		}, nil
+	})}
+	backend := NewCopilotBackendWithOptions("acct", "gh-token", "", CopilotBackendOptions{Mode: copilotBackendModeOpencode, AuthMode: copilotAuthModeOAuth, BaseURL: "https://example.test"})
+	result, err := backend.Chat(context.Background(), "gpt-5.5", []NeutralMessage{{Role: "user", Content: "hi"}}, map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || result.Content != "ok" {
+		t.Fatalf("attempts=%d result=%+v", attempts, result)
+	}
+}
+
+func TestTransientOverloadClassification(t *testing.T) {
+	if !isTransientOverloadError(&CopilotUpstreamError{StatusCode: 529, Body: []byte("overloaded")}) {
+		t.Fatalf("529 should be transient overload")
+	}
+	if !isTransientOverloadError(errors.New("session error: Repeated 529 Overloaded errors. The API is at capacity")) {
+		t.Fatalf("sdk overload string should be transient")
+	}
+	if isTransientOverloadError(&CopilotUpstreamError{StatusCode: 400, Body: []byte("bad request")}) {
+		t.Fatalf("400 should not be transient overload")
+	}
+}
+
 func TestSDKEligibilityRequiresSinglePlainUserMessage(t *testing.T) {
 	backend := NewCopilotBackend("acct", "gh-token", "")
 	if !backend.canUseSDK([]NeutralMessage{{Role: "user", Content: "hello"}}, map[string]any{}) {
@@ -1515,11 +1593,34 @@ func TestSDKEligibilityRequiresSinglePlainUserMessage(t *testing.T) {
 	}
 	cliWeb := NewCopilotBackendWithOptions("acct", "gh-token", "", CopilotBackendOptions{SDKWebSearchMode: "cli"})
 	cfg = cliWeb.sdkSessionConfig("gpt-4.1", toolParams, false)
-	if strings.Join(cfg.AvailableTools, ",") != "builtin:*,web_fetch,report_intent,lookup" {
+	if strings.Join(cfg.AvailableTools, ",") != "ghcp_web_search,ghcp_web_fetch,ghcp_report_intent,lookup" {
 		t.Fatalf("cli web search tools=%v", cfg.AvailableTools)
 	}
 	if !cliWeb.useSDKCLIWebSearch(toolParams) {
 		t.Fatalf("expected cli web search path")
+	}
+	if !strings.Contains(cliWeb.sdkPrompt([]NeutralMessage{{Role: "user", Content: "search"}}, toolParams), "ghcp_web_search") {
+		t.Fatalf("expected controlled cli web prompt")
+	}
+	nativeWeb := NewCopilotBackendWithOptions("acct", "gh-token", "", CopilotBackendOptions{SDKWebSearchMode: "native_cli"})
+	cfg = nativeWeb.sdkSessionConfig("gpt-4.1", toolParams, false)
+	if len(cfg.Tools) != 1 || cfg.Tools[0].Name != "lookup" {
+		t.Fatalf("native cli custom tools=%v", cfg.Tools)
+	}
+	if strings.Join(cfg.AvailableTools, ",") != "builtin:web_search,builtin:web_fetch,custom:lookup" {
+		t.Fatalf("native cli web search tools=%v", cfg.AvailableTools)
+	}
+	if cfg.OnPermissionRequest == nil {
+		t.Fatalf("native cli web search should approve allowed native web tool permissions")
+	}
+	if !nativeWeb.useSDKCLIWebSearch(toolParams) || !nativeWeb.useSDKNativeCLIWebSearch(toolParams) || nativeWeb.useSDKControlledCLIWebSearch(toolParams) {
+		t.Fatalf("expected native cli web search path")
+	}
+	if !isSDKNativeWebTool("web_fetch") || !isSDKNativeWebTool("builtin:web_search") || isSDKNativeWebTool("lookup") {
+		t.Fatalf("native web tool filter mismatch")
+	}
+	if !strings.Contains(nativeWeb.sdkPrompt([]NeutralMessage{{Role: "user", Content: "search"}}, toolParams), "native web_search") {
+		t.Fatalf("expected native cli web prompt")
 	}
 	cfg = backend.sdkSessionConfig("gpt-4.1", map[string]any{}, false)
 	if cfg.AvailableTools == nil || len(cfg.AvailableTools) != 0 {
