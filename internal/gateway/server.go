@@ -410,6 +410,12 @@ func (s *server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 		TokenKeyVaultSecret: stringsTrim(stringFromAny(payload["token_key_vault_secret"])),
 		KeyVaultURL:         stringsTrim(stringFromAny(payload["key_vault_url"])),
 		BaseDirectory:       baseDir,
+		CopilotMode:         stringsTrim(stringFromAny(payload["copilot_mode"])),
+		CopilotAuthMode:     stringsTrim(stringFromAny(payload["copilot_auth_mode"])),
+		CopilotBaseURL:      stringsTrim(stringFromAny(payload["copilot_base_url"])),
+		CopilotSDKWebSearch: boolPtrFromPayload(payload["copilot_sdk_web_search"]),
+		CopilotSDKTools:     stringSliceFromAny(payload["copilot_sdk_available_tools"]),
+		GitHubEnterpriseURL: stringsTrim(stringFromAny(payload["github_enterprise_url"])),
 		MaxConcurrency:      intFromPayload(payload["max_concurrency"], 32),
 		Weight:              intFromPayload(payload["weight"], 1),
 		RateLimitRPM:        intPtrFromPayload(payload["rate_limit_rpm"]),
@@ -1127,6 +1133,14 @@ func intPtrFromPayload(value any) *int {
 		return nil
 	}
 	v := intFromAny(value, 0)
+	return &v
+}
+
+func boolPtrFromPayload(value any) *bool {
+	v, ok := value.(bool)
+	if !ok {
+		return nil
+	}
 	return &v
 }
 

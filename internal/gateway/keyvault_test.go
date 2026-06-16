@@ -64,6 +64,30 @@ func TestAPIKeyResolvesFromKeyVault(t *testing.T) {
 	}
 }
 
+func TestAPIKeyResolvesMultipleValuesFromKeyVault(t *testing.T) {
+	kv := &memoryKeyVaultClient{secrets: map[string]string{"ghcp-api-key": "sk-from-kv-a, sk-from-kv-b\nsk-from-kv-c"}}
+	withMemoryKeyVault(t, kv)
+
+	settings := testSettings()
+	settings.KeyVaultURL = "test-kv"
+	settings.APIKeys = []APIKeyConfig{{
+		KeyVaultSecret: "ghcp-api-key",
+		Scopes:         []string{"admin", "inference"},
+		ModelAllow:     []string{"*"},
+		CacheNamespace: "default",
+	}}
+	gw, err := NewGateway(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"sk-from-kv-a", "sk-from-kv-b", "sk-from-kv-c"} {
+		principal, ok := gw.Authenticator.Authenticate("Bearer " + key)
+		if !ok || !principal.HasScope("admin") || !principal.HasScope("inference") {
+			t.Fatalf("expected Key Vault API key %q to authenticate with admin and inference scopes", key)
+		}
+	}
+}
+
 func TestEnvKeyVaultSecretDefaults(t *testing.T) {
 	t.Setenv("GHCP_BACKEND", "copilot")
 	t.Setenv("AZURE_KEY_VAULT_URL", "test-kv")

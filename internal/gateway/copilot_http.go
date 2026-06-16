@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -83,6 +84,15 @@ type copilotAccessToken struct {
 	Token     string
 	BaseURL   string
 	ExpiresAt time.Time
+}
+
+type copilotTokenExchangeError struct {
+	StatusCode int
+	Body       []byte
+}
+
+func (e *copilotTokenExchangeError) Error() string {
+	return fmt.Sprintf("Copilot token request failed with status %d: %s", e.StatusCode, strings.TrimSpace(string(e.Body)))
 }
 
 type CopilotBackendOptions struct {
@@ -719,6 +729,13 @@ func (b *CopilotBackend) validAccessToken(ctx context.Context) (copilotAccessTok
 	}
 	token, err := exchangeGitHubTokenForCopilot(ctx, b.githubToken)
 	if err != nil {
+		if b.canUseOAuthTokenAfterExchangeFailure(err) {
+			b.access = copilotAccessToken{
+				Token:   b.githubToken,
+				BaseURL: firstNonEmpty(b.baseURL, copilotPublicAPIBaseURL),
+			}
+			return b.access, nil
+		}
 		return copilotAccessToken{}, err
 	}
 	if b.baseURL != "" {
@@ -736,6 +753,13 @@ func (t copilotAccessToken) usable() bool {
 		return true
 	}
 	return time.Until(t.ExpiresAt) > 5*time.Minute
+}
+
+func (b *CopilotBackend) canUseOAuthTokenAfterExchangeFailure(err error) bool {
+	var exchangeErr *copilotTokenExchangeError
+	return errors.As(err, &exchangeErr) &&
+		exchangeErr.StatusCode == http.StatusNotFound &&
+		looksLikeGitHubOAuthToken(b.githubToken)
 }
 
 func exchangeGitHubTokenForCopilot(ctx context.Context, githubToken string) (copilotAccessToken, error) {
@@ -756,7 +780,7 @@ func exchangeGitHubTokenForCopilot(ctx context.Context, githubToken string) (cop
 		return copilotAccessToken{}, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return copilotAccessToken{}, fmt.Errorf("Copilot token request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+		return copilotAccessToken{}, &copilotTokenExchangeError{StatusCode: resp.StatusCode, Body: data}
 	}
 	var payload struct {
 		Token     string `json:"token"`
@@ -937,6 +961,10 @@ func containsCopilotVision(value any) bool {
 
 func looksLikeCopilotBearer(token string) bool {
 	return strings.Contains(token, "proxy-ep=") || strings.HasPrefix(token, "tid=")
+}
+
+func looksLikeGitHubOAuthToken(token string) bool {
+	return strings.HasPrefix(strings.TrimSpace(token), "gho_")
 }
 
 func copilotBaseURLFromBearer(token string) string {

@@ -133,6 +133,21 @@ func copilotModelFixture(id string, endpoints []string) map[string]any {
 	}
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func jsonHTTPResponse(t *testing.T, status int, body any) *http.Response {
+	t.Helper()
+	return &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(bytes.NewReader(mustJSON(t, body))),
+	}
+}
+
 func TestHealthAndAuth(t *testing.T) {
 	_, h := testServer(t)
 	if rr := request(t, h, "GET", "/healthz", nil, nil); rr.Code != 200 {
@@ -157,6 +172,30 @@ func TestEnvAPIKeyOverridesDefaultKey(t *testing.T) {
 	}
 	if got := settings.APIKeys[0].Key; got != "sk-env" {
 		t.Fatalf("api key=%q", got)
+	}
+}
+
+func TestEnvAPIKeysAcceptMultipleValues(t *testing.T) {
+	t.Setenv("GHCP_API_KEYS", "sk-env-a, sk-env-b\nsk-env-c")
+	settings, err := LoadSettings("/does/not/exist.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(settings.APIKeys) != 3 {
+		t.Fatalf("api keys=%d", len(settings.APIKeys))
+	}
+	gw, err := NewGateway(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"sk-env-a", "sk-env-b", "sk-env-c"} {
+		principal, ok := gw.Authenticator.Authenticate("Bearer " + key)
+		if !ok || !principal.HasScope("admin") || !principal.HasScope("inference") {
+			t.Fatalf("expected env API key %q to authenticate with admin and inference scopes", key)
+		}
+	}
+	if _, ok := gw.Authenticator.Authenticate("Bearer sk-missing"); ok {
+		t.Fatal("unexpected authentication with missing key")
 	}
 }
 
@@ -967,6 +1006,55 @@ func TestCopilotDirectOAuthModeUsesProviderBaseURL(t *testing.T) {
 	}
 }
 
+func TestCopilotExchange404WithOAuthTokenUsesDirectProvider(t *testing.T) {
+	oldClient := copilotHTTPClient
+	oldFallbacks := copilotModelListFallbackBaseURLs
+	defer func() {
+		copilotHTTPClient = oldClient
+		copilotModelListFallbackBaseURLs = oldFallbacks
+	}()
+	copilotModelListFallbackBaseURLs = nil
+
+	tokenRequests := 0
+	modelRequests := 0
+	copilotHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Host {
+		case "api.github.com":
+			tokenRequests++
+			return jsonHTTPResponse(t, http.StatusNotFound, map[string]any{"message": "Not Found"}), nil
+		case "api.githubcopilot.com":
+			modelRequests++
+			if req.URL.Path != "/models" {
+				t.Fatalf("unexpected provider path %q", req.URL.Path)
+			}
+			if got := req.Header.Get("Authorization"); got != "Bearer gho_oauth_token" {
+				t.Fatalf("authorization=%q", got)
+			}
+			return jsonHTTPResponse(t, http.StatusOK, map[string]any{"data": []any{
+				copilotModelFixture("gpt-5.5", []string{"/chat/completions"}),
+			}}), nil
+		default:
+			t.Fatalf("unexpected host %q", req.URL.Host)
+			return nil, nil
+		}
+	})}
+
+	backend := NewCopilotBackendWithOptions("acct", "gho_oauth_token", "", CopilotBackendOptions{AuthMode: copilotAuthModeExchange})
+	specs, err := backend.listModelsDirect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokenRequests != 1 || modelRequests != 1 {
+		t.Fatalf("requests token=%d model=%d", tokenRequests, modelRequests)
+	}
+	if len(specs) != 1 || specs[0].ID != "gpt-5.5" {
+		t.Fatalf("specs=%v", specs)
+	}
+	if backend.access.Token != "gho_oauth_token" || backend.access.BaseURL != copilotPublicAPIBaseURL {
+		t.Fatalf("access=%+v", backend.access)
+	}
+}
+
 func TestCopilotModelParserFiltersIncompleteAndDisabledRecords(t *testing.T) {
 	disabled := copilotModelFixture("disabled-model", []string{"/chat/completions"})
 	disabled["policy"] = map[string]any{"state": "disabled"}
@@ -1401,7 +1489,7 @@ func TestRateLimits(t *testing.T) {
 }
 
 func TestUsageAndUsers(t *testing.T) {
-	_, h := testServer(t)
+	gw, h := testServer(t)
 	request(t, h, "POST", "/v1/chat/completions", chatBody("gpt-4.1", "credit one"), userHeaders)
 	request(t, h, "POST", "/v1/chat/completions", chatBody("gpt-4.1", "credit one"), userHeaders)
 	usage := decodeBody(t, request(t, h, "GET", "/admin/usage?model=gpt-4.1", nil, adminHeaders))
@@ -1416,6 +1504,29 @@ func TestUsageAndUsers(t *testing.T) {
 	models := decodeBody(t, request(t, h, "GET", "/admin/users/u_alice/models", nil, adminHeaders))
 	if models["models"].([]any)[0] != "gpt-4.1" {
 		t.Fatalf("models=%v", models)
+	}
+	overrides := request(t, h, "POST", "/admin/users", map[string]any{
+		"id":                          "u_copilot",
+		"models":                      []string{"gpt-4.1"},
+		"copilot_mode":                "opencode",
+		"copilot_auth_mode":           "oauth",
+		"copilot_base_url":            "https://api.githubcopilot.com",
+		"copilot_sdk_web_search":      true,
+		"copilot_sdk_available_tools": []string{"web_search", "view"},
+		"github_enterprise_url":       "https://ghe.example.com/org",
+	}, adminHeaders)
+	if overrides.Code != 200 {
+		t.Fatal(overrides.Body.String())
+	}
+	cfg := gw.Pool.Get("u_copilot").Config
+	if cfg.CopilotMode != "opencode" || cfg.CopilotAuthMode != "oauth" || cfg.CopilotBaseURL != "https://api.githubcopilot.com" {
+		t.Fatalf("copilot overrides=%+v", cfg)
+	}
+	if cfg.CopilotSDKWebSearch == nil || !*cfg.CopilotSDKWebSearch || strings.Join(cfg.CopilotSDKTools, ",") != "web_search,view" {
+		t.Fatalf("sdk overrides=%+v tools=%v", cfg.CopilotSDKWebSearch, cfg.CopilotSDKTools)
+	}
+	if cfg.GitHubEnterpriseURL != "https://ghe.example.com/org" {
+		t.Fatalf("enterprise=%q", cfg.GitHubEnterpriseURL)
 	}
 	deleted := request(t, h, "DELETE", "/admin/users/u_alice", nil, adminHeaders)
 	if deleted.Code != 200 {

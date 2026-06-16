@@ -45,11 +45,14 @@ func NewAuthenticator(ctx context.Context, settings Settings) (*Authenticator, e
 		if err != nil {
 			return nil, err
 		}
-		if resolved == "" {
+		resolvedKeys := firstStringSlice(resolved)
+		if len(resolvedKeys) == 0 {
 			return nil, fmt.Errorf("api key %d has no key, key_env, or key_vault_secret", i)
 		}
-		key.Key = resolved
-		keys[resolved] = key
+		for _, resolved := range resolvedKeys {
+			key.Key = resolved
+			keys[resolved] = key
+		}
 	}
 	return &Authenticator{keys: keys}, nil
 }

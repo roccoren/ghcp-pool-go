@@ -241,6 +241,39 @@ func (s Settings) Addr() string {
 	return net.JoinHostPort(s.Host, strconv.Itoa(s.Port))
 }
 
+func envStringList(names ...string) []string {
+	values := []string{}
+	for _, name := range names {
+		values = append(values, firstStringSlice(os.Getenv(name))...)
+	}
+	return normalizeStringList(values)
+}
+
+func defaultAPIKeyConfigs(keys, keyVaultSecrets []string) []APIKeyConfig {
+	if len(keys) > 0 {
+		configs := make([]APIKeyConfig, 0, len(keys))
+		for _, key := range keys {
+			configs = append(configs, defaultAPIKeyConfig(key, ""))
+		}
+		return configs
+	}
+	configs := make([]APIKeyConfig, 0, len(keyVaultSecrets))
+	for _, secret := range keyVaultSecrets {
+		configs = append(configs, defaultAPIKeyConfig("", secret))
+	}
+	return configs
+}
+
+func defaultAPIKeyConfig(key, keyVaultSecret string) APIKeyConfig {
+	return APIKeyConfig{
+		Key:            key,
+		KeyVaultSecret: keyVaultSecret,
+		Scopes:         []string{"admin", "inference"},
+		ModelAllow:     []string{"*"},
+		CacheNamespace: "default",
+	}
+}
+
 func (s Settings) ResolveModelAlias(model string) string {
 	if s.ModelAliases == nil {
 		return model
@@ -401,18 +434,14 @@ func LoadSettings(path string) (Settings, error) {
 		settings.Routes = []RouteConfig{{Model: "*", Accounts: ids, Strategy: "least_busy"}}
 	}
 	if len(settings.APIKeys) == 0 {
-		apiKey := os.Getenv("GHCP_API_KEY")
-		adminKey := os.Getenv("GHCP_ADMIN_API_KEY")
-		apiKeySecret := firstNonEmpty(os.Getenv("GHCP_API_KEY_KEY_VAULT_SECRET"), os.Getenv("GHCP_API_KEY_KEYVAULT_SECRET"))
-		adminKeySecret := firstNonEmpty(os.Getenv("GHCP_ADMIN_API_KEY_KEY_VAULT_SECRET"), os.Getenv("GHCP_ADMIN_API_KEY_KEYVAULT_SECRET"))
-		if apiKey != "" || adminKey != "" || apiKeySecret != "" || adminKeySecret != "" {
-			if apiKey != "" || apiKeySecret != "" {
-				settings.APIKeys = append(settings.APIKeys, APIKeyConfig{Key: apiKey, KeyVaultSecret: apiKeySecret, Scopes: []string{"admin", "inference"}, ModelAllow: []string{"*"}, CacheNamespace: "default"})
-			}
-			if adminKey != "" || adminKeySecret != "" || len(settings.APIKeys) == 0 {
-				settings.APIKeys = append(settings.APIKeys, APIKeyConfig{Key: adminKey, KeyVaultSecret: adminKeySecret, Scopes: []string{"admin", "inference"}, ModelAllow: []string{"*"}, CacheNamespace: "default"})
-			}
-		}
+		settings.APIKeys = append(settings.APIKeys, defaultAPIKeyConfigs(
+			envStringList("GHCP_API_KEY", "GHCP_API_KEYS"),
+			envStringList("GHCP_API_KEY_KEY_VAULT_SECRET", "GHCP_API_KEY_KEYVAULT_SECRET", "GHCP_API_KEY_KEY_VAULT_SECRETS", "GHCP_API_KEY_KEYVAULT_SECRETS"),
+		)...)
+		settings.APIKeys = append(settings.APIKeys, defaultAPIKeyConfigs(
+			envStringList("GHCP_ADMIN_API_KEY", "GHCP_ADMIN_API_KEYS"),
+			envStringList("GHCP_ADMIN_API_KEY_KEY_VAULT_SECRET", "GHCP_ADMIN_API_KEY_KEYVAULT_SECRET", "GHCP_ADMIN_API_KEY_KEY_VAULT_SECRETS", "GHCP_ADMIN_API_KEY_KEYVAULT_SECRETS"),
+		)...)
 	}
 	if len(settings.APIKeys) == 0 {
 		settings.APIKeys = []APIKeyConfig{{Key: "sk-local-dev", Scopes: []string{"admin", "inference"}, ModelAllow: []string{"*"}, CacheNamespace: "default"}}

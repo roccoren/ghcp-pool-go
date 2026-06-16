@@ -72,10 +72,13 @@ Equivalent environment-only defaults are supported for container deployments:
 | `AZURE_KEY_VAULT_URL` | Default vault URL for API keys and account tokens. |
 | `AZURE_CLIENT_ID` | User-assigned managed identity client ID, when using one. |
 | `GHCP_API_KEY_KEY_VAULT_SECRET` | Gateway API key secret name. |
+| `GHCP_API_KEY_KEY_VAULT_SECRETS` | Optional comma/whitespace-separated gateway API key secret names. |
 | `GHCP_ADMIN_API_KEY_KEY_VAULT_SECRET` | Optional separate admin key secret name. |
 | `GHCP_COPILOT_TOKEN_KEY_VAULT_SECRET` | Default account Copilot token secret name. |
 
 For multi-account pools, set `accounts[].token_key_vault_secret` per account.
+Gateway API key secret values can contain a single key or multiple keys
+separated by commas, spaces, tabs, or newlines.
 When admin login or `POST /admin/users/{id}/token` sets a token for an account
 with `token_key_vault_secret`, the gateway stores the new token in that Key
 Vault secret before rebuilding the account backend.

@@ -57,8 +57,11 @@ Configuration defaults match the Python project: without `config.yaml`, the
 server starts on port 8000 with one fake account exposing `gpt-4.1` and
 `gpt-4o-mini`, and API key `sk-local-dev`.
 
-For public deployments, set `GHCP_API_KEY` (or `GHCP_ADMIN_API_KEY`) so the
-container does not expose the local-development default key.
+For public deployments, set `GHCP_API_KEY`/`GHCP_API_KEYS` (or
+`GHCP_ADMIN_API_KEY`/`GHCP_ADMIN_API_KEYS`) so the container does not expose the
+local-development default key. Multiple keys can be separated with commas,
+spaces, tabs, or newlines. YAML config can also list multiple
+`gateway.api_keys` entries with separate scopes and model allow-lists.
 
 ## Container
 
@@ -73,7 +76,8 @@ Supported deployment environment overrides include `GHCP_HOST`, `GHCP_PORT`,
 `GHCP_PER_ACCOUNT_RATE_LIMIT_RPM`. For Azure Key Vault-backed deployments, set
 `AZURE_KEY_VAULT_URL` plus `GHCP_API_KEY_KEY_VAULT_SECRET` and/or
 `GHCP_COPILOT_TOKEN_KEY_VAULT_SECRET` to resolve secrets at runtime through
-managed identity.
+managed identity. API-key secrets may contain one key or a comma/whitespace
+separated list.
 
 For Azure Container Apps deployments that keep `GHCP_API_KEY` and
 `GHCP_COPILOT_TOKEN` in Azure Key Vault, including the minimum Azure resource
