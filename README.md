@@ -69,6 +69,20 @@ docker build -t ghcp-pool-go .
 docker run --rm -p 8000:8000 -e GHCP_API_KEY=sk-change-me ghcp-pool-go
 ```
 
+### Published image (GitHub Container Registry)
+
+The [`Build and Publish Container Image`](.github/workflows/docker-publish.yml)
+workflow builds the container on every push to `main` and every `v*` tag, then
+publishes it to GitHub Container Registry at
+`ghcr.io/roccoren/ghcp-pool-go`. Image tags include `latest` (default branch),
+the branch name, the commit SHA, and semantic-version tags for releases.
+
+```bash
+docker pull ghcr.io/roccoren/ghcp-pool-go:latest
+docker run --rm -p 8000:8000 -e GHCP_API_KEY=sk-change-me \
+  ghcr.io/roccoren/ghcp-pool-go:latest
+```
+
 Supported deployment environment overrides include `GHCP_HOST`, `GHCP_PORT`,
 `GHCP_BACKEND`, `GHCP_CACHE_SALT`, `GHCP_USAGE_SQLITE_PATH`,
 `GHCP_MODEL_MAP_PATH`, `GHCP_GLOBAL_RATE_LIMIT_RPM`, and
