@@ -627,15 +627,19 @@ func sleepTransientRetry(ctx context.Context, attempt int) bool {
 }
 
 func (b *CopilotBackend) sendSDKAndCollect(ctx context.Context, session *sdk.Session, model, prompt string, params map[string]any) (ChatResult, error) {
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		timeout := 60 * time.Second
-		if b.useSDKCLIWebSearch(params) {
-			timeout = 180 * time.Second
-		}
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
+	// Always enforce maximum timeout, even if parent context has a deadline
+	timeout := 60 * time.Second
+	if b.useSDKCLIWebSearch(params) {
+		timeout = 180 * time.Second
 	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining > 0 && remaining < timeout {
+			timeout = remaining
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	endpoint := sdkUsageEndpoint(params)
 	result := ChatResult{
 		Model:        model,
@@ -712,10 +716,13 @@ func (b *CopilotBackend) sendSDKAndCollect(ctx context.Context, session *sdk.Ses
 
 	select {
 	case <-toolCh:
-		waitForSDKToolSettle(ctx, toolCh)
-		abortCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Add fallback timeout for tool settle to prevent infinite waits
+		settleCtx, settleCancel := context.WithTimeout(ctx, 5*time.Second)
+		waitForSDKToolSettle(settleCtx, toolCh)
+		settleCancel()
+		abortCtx, abortCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = session.Abort(abortCtx)
-		cancel()
+		abortCancel()
 		mu.Lock()
 		out := finalizeSDKResult(result, prompt, endpoint)
 		mu.Unlock()
