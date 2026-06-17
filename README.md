@@ -122,10 +122,10 @@ web search without direct Copilot API calls, set
 `GHCP_COPILOT_SDK_WEB_SEARCH_MODE=cli` or
 `gateway.copilot.sdk_web_search_mode: cli`; web-search requests then use a
 temporary Copilot CLI-mode SDK client with controlled `ghcp_web_search` and
-`ghcp_web_fetch` handlers. To experiment with Copilot CLI native web tools
-instead, set `GHCP_COPILOT_SDK_WEB_SEARCH_MODE=native_cli`; this exposes native
-`web_search`/`web_fetch` through the CLI-mode SDK client and remains subject to
-Copilot's own tool availability and egress policy.
+`ghcp_web_fetch` handlers. To experiment with Copilot CLI native search instead,
+set `GHCP_COPILOT_SDK_WEB_SEARCH_MODE=native_cli`; this exposes native
+`web_search` through the CLI-mode SDK client, while `web_fetch` is handled by
+the gateway so GitHub blob/raw URLs can be normalized before fetching.
 
 Models that support a long-context tier, such as Copilot-exposed Claude Opus
 variants, can be pinned with request field `context_tier: "long_context"` or

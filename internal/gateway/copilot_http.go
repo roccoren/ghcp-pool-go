@@ -968,7 +968,7 @@ func (b *CopilotBackend) sdkToolChoiceInstruction(params map[string]any) string 
 			return "Use the ghcp_web_search tool for web searches and ghcp_web_fetch for fetching URLs. Do not use built-in web_search or web_fetch tools."
 		}
 		if b.useSDKNativeCLIWebSearch(params) {
-			return "Use Copilot CLI native web_search for web searches and native web_fetch for fetching URLs. Do not use ghcp_web_search or ghcp_web_fetch tools."
+			return "Use Copilot CLI native web_search for web searches and web_fetch for fetching URLs. The web_fetch tool is gateway-provided and can fetch GitHub raw/blob URLs."
 		}
 		return "Use the web_search tool for web searches and web_fetch for fetching URLs if it is available."
 	}
@@ -1071,7 +1071,7 @@ func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, s
 			ClientName:          "ghcp-pool-go",
 			Model:               model,
 			Streaming:           sdk.Bool(stream),
-			Tools:               sdkCustomToolsFromParams(params),
+			Tools:               sdkNativeCLIWebSearchTools(params),
 			AvailableTools:      b.sdkAvailableToolsForParams(params),
 			OnPermissionRequest: sdk.PermissionHandler.ApproveAll,
 		}
@@ -1128,11 +1128,10 @@ func (b *CopilotBackend) sdkAvailableToolsForParams(params map[string]any) []str
 		return []string{}
 	}
 	if b.useSDKNativeCLIWebSearch(params) {
-		tools := []string{"builtin:web_search", "builtin:web_fetch"}
+		tools := []string{"builtin:web_search", "web_fetch"}
 		for _, tool := range sdkCustomToolsFromParams(params) {
-			name := "custom:" + tool.Name
-			if tool.Name != "" && !containsString(tools, name) {
-				tools = append(tools, name)
+			if tool.Name != "" && !containsString(tools, tool.Name) && !containsString(tools, "custom:"+tool.Name) {
+				tools = append(tools, tool.Name)
 			}
 		}
 		return tools
@@ -1219,6 +1218,27 @@ func sdkCLIWebSearchTools() []sdk.Tool {
 			Handler:              sdkWebFetchHandler,
 		},
 	}
+}
+
+func sdkNativeCLIWebSearchTools(params map[string]any) []sdk.Tool {
+	tools := []sdk.Tool{
+		{
+			Name:        "web_fetch",
+			Description: "Fetch a web page by URL and return text for the model. GitHub blob/raw URLs are normalized to raw.githubusercontent.com before fetching.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"url":        map[string]any{"type": "string", "description": "URL to fetch"},
+					"max_length": map[string]any{"type": "integer", "description": "Maximum number of characters to return"},
+				},
+				"required": []string{"url"},
+			},
+			OverridesBuiltInTool: true,
+			SkipPermission:       true,
+			Handler:              sdkWebFetchHandler,
+		},
+	}
+	return append(tools, sdkCustomToolsFromParams(params)...)
 }
 
 func isSDKWebSearchInternalTool(name string) bool {
@@ -1592,6 +1612,11 @@ func (b *CopilotBackend) doCopilot(ctx context.Context, method, endpoint string,
 			return nil, nil, lastErr
 		}
 		if stream {
+			// Streaming requests use ctx directly (no per-attempt timeout), so
+			// cancel is nil here; reference it to keep the lifetime explicit.
+			if cancel != nil {
+				cancel()
+			}
 			return resp, nil, nil
 		}
 		data, err := io.ReadAll(io.LimitReader(resp.Body, 50<<20))

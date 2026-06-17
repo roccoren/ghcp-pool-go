@@ -11,6 +11,13 @@ import (
 	"time"
 )
 
+// streamKeepaliveInterval bounds how long an SSE stream may stay silent before
+// the gateway emits a heartbeat comment. Backends such as the native CLI web
+// search can block for tens of seconds while collecting a turn; without a
+// heartbeat, clients (e.g. Claude Code) treat the idle stream as an interrupted
+// response. It is a var so tests can shorten it.
+var streamKeepaliveInterval = 10 * time.Second
+
 func NewServer(gw *Gateway) http.Handler {
 	mux := http.NewServeMux()
 	s := &server{gw: gw}
@@ -1195,12 +1202,31 @@ func writeStream(w http.ResponseWriter, headers map[string]string, stream <-chan
 	}
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
-	for chunk := range stream {
-		if _, err := w.Write([]byte(chunk)); err != nil {
-			cancel()
-			return
-		}
-		if strings.HasSuffix(chunk, "\n\n") {
+	keepalive := time.NewTicker(streamKeepaliveInterval)
+	defer keepalive.Stop()
+	for {
+		select {
+		case chunk, ok := <-stream:
+			if !ok {
+				return
+			}
+			if _, err := w.Write([]byte(chunk)); err != nil {
+				cancel()
+				return
+			}
+			if strings.HasSuffix(chunk, "\n\n") {
+				flusher.Flush()
+			}
+			keepalive.Reset(streamKeepaliveInterval)
+		case <-keepalive.C:
+			// SSE comment line: a spec-compliant heartbeat that every SSE client
+			// ignores. It keeps the connection alive while the backend is doing
+			// slow work (e.g. native web search) so clients do not treat the idle
+			// stream as an interrupted response.
+			if _, err := w.Write([]byte(": keepalive\n\n")); err != nil {
+				cancel()
+				return
+			}
 			flusher.Flush()
 		}
 	}

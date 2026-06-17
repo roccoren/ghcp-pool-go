@@ -366,9 +366,10 @@ func (g *Gateway) StreamResponses(ctx context.Context, plan Plan) <-chan string 
 		if !emitSSE(ctx, out, namedSSE(responseInProgress(responseID, plan.ResponseModel, next(), options))) {
 			return
 		}
+		webSearch := responseOptionsHaveWebSearchTool(options)
 		if plan.CacheHit != nil {
 			rec := plan.CacheHit
-			events, output := responseReplayEvents(rec.Content, rec.ToolCalls, &seq)
+			events, output := responseReplayEvents(rec.Content, rec.ToolCalls, webSearch && len(rec.ToolCalls) == 0, &seq)
 			for _, event := range events {
 				if !emitSSE(ctx, out, namedSSE(event)) {
 					return
@@ -402,7 +403,7 @@ func (g *Gateway) StreamResponses(ctx context.Context, plan Plan) <-chan string 
 			g.Meter.Observe(&id, plan.Model, usage, "miss", false, "backend_error")
 			return
 		}
-		events, output := responseReplayEvents(content, toolCalls, &seq)
+		events, output := responseReplayEvents(content, toolCalls, webSearch && len(toolCalls) == 0, &seq)
 		for _, event := range events {
 			if !emitSSE(ctx, out, namedSSE(event)) {
 				return
@@ -543,11 +544,24 @@ func chatToolCallDelta(index int, tc ToolCall) map[string]any {
 	return map[string]any{"index": index, "id": tc.ID, "type": "function", "function": map[string]any{"name": tc.Name, "arguments": tc.Arguments}}
 }
 
-func responseReplayEvents(content string, toolCalls []ToolCall, seq *int) ([]map[string]any, []any) {
+func responseReplayEvents(content string, toolCalls []ToolCall, webSearch bool, seq *int) ([]map[string]any, []any) {
 	next := func() int { *seq++; return *seq }
 	events := []map[string]any{}
 	output := []any{}
 	outputIndex := 0
+	if webSearch {
+		itemID := newID("ws")
+		searchItem := map[string]any{"id": itemID, "type": "web_search_call", "status": "completed"}
+		events = append(events,
+			map[string]any{"type": "response.output_item.added", "sequence_number": next(), "output_index": outputIndex, "item": map[string]any{"id": itemID, "type": "web_search_call", "status": "in_progress"}},
+			map[string]any{"type": "response.web_search_call.in_progress", "sequence_number": next(), "output_index": outputIndex, "item_id": itemID},
+			map[string]any{"type": "response.web_search_call.searching", "sequence_number": next(), "output_index": outputIndex, "item_id": itemID},
+			map[string]any{"type": "response.web_search_call.completed", "sequence_number": next(), "output_index": outputIndex, "item_id": itemID},
+			map[string]any{"type": "response.output_item.done", "sequence_number": next(), "output_index": outputIndex, "item": searchItem},
+		)
+		output = append(output, searchItem)
+		outputIndex++
+	}
 	if content != "" {
 		itemID := newID("msg")
 		events = append(events,

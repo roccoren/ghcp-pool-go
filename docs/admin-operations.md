@@ -175,10 +175,10 @@ the older empty-mode allowlist behavior, which may not expose a usable web
 search tool in current SDK runtimes.
 
 `sdk_web_search_mode: native_cli` is also available as an experimental mode. It
-uses the temporary CLI-mode SDK client but exposes Copilot CLI native
-`web_search`/`web_fetch` instead of the gateway-owned `ghcp_web_search` and
-`ghcp_web_fetch` handlers. Native tools can be smoother when available, but
-their network access is controlled by Copilot's service-side egress policy.
+uses the temporary CLI-mode SDK client and exposes Copilot CLI native
+`web_search`. The `web_fetch` name is intentionally handled by the gateway so
+GitHub blob/raw URLs can be normalized before fetching; native fetch can be
+blocked by Copilot's service-side egress policy for some URLs.
 
 For advanced SDK tool allowlists, use `sdk_available_tools`:
 

@@ -889,6 +889,67 @@ func TestChatSSERequiresDone(t *testing.T) {
 	}
 }
 
+func TestWriteStreamEmitsKeepaliveDuringSilence(t *testing.T) {
+	orig := streamKeepaliveInterval
+	streamKeepaliveInterval = 20 * time.Millisecond
+	defer func() { streamKeepaliveInterval = orig }()
+
+	stream := make(chan string)
+	go func() {
+		time.Sleep(80 * time.Millisecond) // stay silent across several intervals
+		stream <- "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+		close(stream)
+	}()
+	rr := httptest.NewRecorder()
+	writeStream(rr, map[string]string{}, stream, func() {})
+	body := rr.Body.String()
+	if !strings.Contains(body, ": keepalive") {
+		t.Fatalf("expected keepalive heartbeat during silence, got %q", body)
+	}
+	if !strings.Contains(body, "message_stop") {
+		t.Fatalf("expected real data to follow keepalive, got %q", body)
+	}
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+}
+
+func TestResponseReplayEventsEmitsWebSearchCall(t *testing.T) {
+	seq := 0
+	events, output := responseReplayEvents("Here are the results.", nil, true, &seq)
+	if len(output) < 2 {
+		t.Fatalf("expected web_search_call and message output items, got %v", output)
+	}
+	first, _ := output[0].(map[string]any)
+	if first["type"] != "web_search_call" || first["status"] != "completed" {
+		t.Fatalf("first output item should be a completed web_search_call, got %v", output[0])
+	}
+	var sawAdded, sawDone bool
+	for _, event := range events {
+		if event["type"] == "response.output_item.added" {
+			if item, ok := event["item"].(map[string]any); ok && item["type"] == "web_search_call" {
+				sawAdded = true
+			}
+		}
+		if event["type"] == "response.output_item.done" {
+			if item, ok := event["item"].(map[string]any); ok && item["type"] == "web_search_call" {
+				sawDone = true
+			}
+		}
+	}
+	if !sawAdded || !sawDone {
+		t.Fatalf("expected web_search_call output_item.added and done events, added=%v done=%v", sawAdded, sawDone)
+	}
+	// Without the flag the search item must not appear (parity with non-search turns).
+	seq = 0
+	_, plainOutput := responseReplayEvents("Plain answer.", nil, false, &seq)
+	for _, item := range plainOutput {
+		if m, ok := item.(map[string]any); ok && m["type"] == "web_search_call" {
+			t.Fatalf("web_search_call must not be emitted when webSearch is false")
+		}
+	}
+}
+
 func TestResponsesStreamMergesToolCallByOutputIndex(t *testing.T) {
 	body := strings.Join([]string{
 		"event: response.function_call_arguments.delta",
@@ -1604,10 +1665,10 @@ func TestSDKEligibilityRequiresSinglePlainUserMessage(t *testing.T) {
 	}
 	nativeWeb := NewCopilotBackendWithOptions("acct", "gh-token", "", CopilotBackendOptions{SDKWebSearchMode: "native_cli"})
 	cfg = nativeWeb.sdkSessionConfig("gpt-4.1", toolParams, false)
-	if len(cfg.Tools) != 1 || cfg.Tools[0].Name != "lookup" {
+	if len(cfg.Tools) != 2 || cfg.Tools[0].Name != "web_fetch" || cfg.Tools[1].Name != "lookup" {
 		t.Fatalf("native cli custom tools=%v", cfg.Tools)
 	}
-	if strings.Join(cfg.AvailableTools, ",") != "builtin:web_search,builtin:web_fetch,custom:lookup" {
+	if strings.Join(cfg.AvailableTools, ",") != "builtin:web_search,web_fetch,lookup" {
 		t.Fatalf("native cli web search tools=%v", cfg.AvailableTools)
 	}
 	if cfg.OnPermissionRequest == nil {

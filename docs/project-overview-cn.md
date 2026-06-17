@@ -12,7 +12,7 @@ ghcp-pool-go 是一个面向 GitHub Copilot 能力的高并发网关。它把一
 | --- | --- |
 | 官方链路 | 认证、模型发现和 SDK 支持的简单聊天请求走官方 SDK 行为，减少协议漂移风险。 |
 | 安全边界清晰 | `sdk` 模式不直接调用 Copilot API；SDK 不支持的请求形态会显式失败，而不是静默降级到直接 HTTP。 |
-| 多租户友好 | SDK 默认运行在 empty mode，不暴露内置工具；需要 web search 时可通过 `GHCP_COPILOT_SDK_WEB_SEARCH_MODE=cli` 显式开启受控桥接。该桥接使用临时 CLI-mode SDK 会话，但由网关自己的 `ghcp_web_search` / `ghcp_web_fetch` handler 执行网络访问，避免触发 Copilot CLI 内置抓取工具的 egress allowlist 限制。也可以用实验模式 `native_cli` 直接暴露 Copilot CLI 原生 `web_search` / `web_fetch`，但其可用性和外网访问仍受 Copilot 服务侧策略控制。 |
+| 多租户友好 | SDK 默认运行在 empty mode，不暴露内置工具；需要 web search 时可通过 `GHCP_COPILOT_SDK_WEB_SEARCH_MODE=cli` 显式开启受控桥接。该桥接使用临时 CLI-mode SDK 会话，但由网关自己的 `ghcp_web_search` / `ghcp_web_fetch` handler 执行网络访问，避免触发 Copilot CLI 内置抓取工具的 egress allowlist 限制。也可以用实验模式 `native_cli` 暴露 Copilot CLI 原生 `web_search`；其中 `web_fetch` 由网关同名 handler 接管，便于把 GitHub blob/raw URL 规范化后再抓取，避免部分原生 fetch egress 限制。 |
 | 模型发现一致 | 每个账号的模型列表由 SDK 发现并保存在模型注册表中，路由时按账号能力选择可用模型。 |
 
 ### API 兼容
