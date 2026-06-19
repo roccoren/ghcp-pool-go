@@ -228,6 +228,9 @@ func TestAnthropicModelsUsesOfficialSchema(t *testing.T) {
 		t.Fatal(rr.Body.String())
 	}
 	body := decodeBody(t, rr)
+	if _, ok := body["object"]; ok {
+		t.Fatalf("Anthropic list schema should not include OpenAI object field: %v", body)
+	}
 	model := modelByID(t, body, "claude-opus-4.8")
 	if model["type"] != "model" {
 		t.Fatalf("type=%v", model["type"])
@@ -237,6 +240,9 @@ func TestAnthropicModelsUsesOfficialSchema(t *testing.T) {
 	}
 	if got := intModelField(t, model, "max_input_tokens"); got != 1000000 {
 		t.Fatalf("max_input_tokens=%d", got)
+	}
+	if got := intModelField(t, model, "max_tokens"); got <= 0 {
+		t.Fatalf("max_tokens=%d", got)
 	}
 	caps := model["capabilities"].(map[string]any)
 	effort := caps["effort"].(map[string]any)
@@ -259,6 +265,21 @@ func TestAnthropicModelsUsesOfficialSchema(t *testing.T) {
 	}
 	if got := intModelField(t, single, "max_input_tokens"); got != 1000000 {
 		t.Fatalf("single max_input_tokens=%d", got)
+	}
+
+	uaHeaders := map[string]string{"Authorization": "Bearer sk-user", "User-Agent": "Claude Desktop"}
+	uaBody := decodeBody(t, request(t, h, "GET", "/v1/models", nil, uaHeaders))
+	if _, ok := uaBody["object"]; ok {
+		t.Fatalf("Claude user-agent should receive Anthropic list schema: %v", uaBody)
+	}
+	uaModel := modelByID(t, uaBody, "claude-opus-4.8")
+	if got := intModelField(t, uaModel, "max_input_tokens"); got != 1000000 {
+		t.Fatalf("ua max_input_tokens=%d", got)
+	}
+
+	rootBody := decodeBody(t, request(t, h, "GET", "/models", nil, userHeaders))
+	if _, ok := rootBody["object"]; ok {
+		t.Fatalf("/models should receive Anthropic list schema: %v", rootBody)
 	}
 }
 

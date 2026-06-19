@@ -124,7 +124,11 @@ func (s *server) listModels(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	resp := map[string]any{"object": "list", "type": "list", "data": data, "has_more": false}
+	resp := map[string]any{"data": data, "has_more": false}
+	if !prefersAnthropicModelSchema(r) {
+		resp["object"] = "list"
+		resp["type"] = "list"
+	}
 	if len(data) > 0 {
 		if first, ok := data[0].(map[string]any); ok {
 			resp["first_id"] = first["id"]
@@ -162,7 +166,14 @@ func (s *server) modelDataForRequest(r *http.Request, spec ModelSpec, displayID 
 }
 
 func prefersAnthropicModelSchema(r *http.Request) bool {
-	return r.Header.Get("anthropic-version") != "" || r.Header.Get("anthropic-beta") != "" || r.Header.Get("x-api-key") != ""
+	ua := strings.ToLower(r.Header.Get("User-Agent"))
+	return r.URL.Path == "/models" ||
+		strings.HasPrefix(r.URL.Path, "/models/") ||
+		r.Header.Get("anthropic-version") != "" ||
+		r.Header.Get("anthropic-beta") != "" ||
+		r.Header.Get("x-api-key") != "" ||
+		strings.Contains(ua, "anthropic") ||
+		strings.Contains(ua, "claude")
 }
 
 func anthropicModelData(model map[string]any) map[string]any {
@@ -273,6 +284,9 @@ func (s *server) publicModelData(spec ModelSpec, displayID string, created int64
 		intFromAny(limits["max_output_tokens"], 0),
 		intFromAny(caps["output_token_limit"], 0),
 	)
+	if maxOutputTokens == 0 {
+		maxOutputTokens = defaultMaxOutputTokens(spec.ID)
+	}
 	if maxOutputTokens > 0 {
 		caps["max_output_tokens"] = maxOutputTokens
 		limits["max_output_tokens"] = maxOutputTokens
@@ -408,6 +422,22 @@ func publicModelOwner(model string) string {
 		return "google"
 	default:
 		return "github-copilot"
+	}
+}
+
+func defaultMaxOutputTokens(model string) int {
+	model = strings.ToLower(model)
+	switch {
+	case strings.HasPrefix(model, "claude-opus-4."), strings.HasPrefix(model, "claude-sonnet-4."):
+		return 64000
+	case strings.HasPrefix(model, "claude-"):
+		return 8192
+	case strings.HasPrefix(model, "gpt-5."), strings.HasPrefix(model, "gpt-6."):
+		return 32768
+	case strings.HasPrefix(model, "gemini-"):
+		return 8192
+	default:
+		return 0
 	}
 }
 

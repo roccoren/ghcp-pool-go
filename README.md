@@ -212,11 +212,12 @@ Valid `context_tier` values: `default`, `long_context`.
 `/v1/models` adapts to the client protocol. OpenAI-style requests get
 compatibility fields such as `context_window`, `max_context_window_tokens`,
 `supported_reasoning_efforts`, and nested `capabilities.limits` /
-`capabilities.supports`. Anthropic-style requests (for example, requests with
-`anthropic-version` or `x-api-key`) get the official Anthropic Models API shape:
-`type`, `display_name`, `created_at`, `max_input_tokens`, `max_tokens`, and
-`capabilities.effort.{low,medium,high,xhigh,max}.supported`. The model list only
-advertises real upstream model IDs plus aliases explicitly configured in
+`capabilities.supports`. Anthropic-style requests (for example, requests to
+`/models`, requests with `anthropic-version` or `x-api-key`, or Claude/Anthropic
+user agents) get the official Anthropic Models API shape: `type`,
+`display_name`, `created_at`, `max_input_tokens`, `max_tokens`, and
+`capabilities.effort.{low,medium,high,xhigh,max}.supported`. The model list
+only advertises real upstream model IDs plus aliases explicitly configured in
 `gateway.model_aliases`; long context is represented by `max_input_tokens` and
 `context_tier`, not by extra generated model IDs.
 
