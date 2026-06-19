@@ -227,32 +227,69 @@ model IDs.
 
 ### Using with Claude Code / Claude Desktop (Anthropic clients)
 
-Point the client at the gateway with the standard Anthropic env vars:
+Point the client at the gateway with the standard Anthropic settings (env vars
+for the Claude Code CLI, or the managed config for the Claude Desktop app):
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8000   # your gateway URL
 export ANTHROPIC_AUTH_TOKEN=$GHCP_API_KEY         # sent as Authorization: Bearer
 ```
 
-Claude Code decides whether to show the **1M context window** and the
-**reasoning-effort (`/effort`) menu** from its own built-in model registry — it
-does **not** read `/v1/models` unless you opt in. To make these options appear:
+Important asymmetry: **reasoning effort is an advertisable capability** that
+clients read from `/v1/models` (`capabilities.effort`), but the **1M context
+window is not discovered from the gateway at all** — clients treat it as a
+client-side opt-in. That is why effort can appear automatically while the 1M
+window stays hidden until you enable it in the client. The gateway already
+returns `max_input_tokens: 1000000` and honors the
+`anthropic-beta: context-1m-2025-08-07` header (and the `[1m]` model suffix) by
+routing to the upstream long-context tier; the missing piece is the client-side
+toggle below.
 
-- **1M context window** — select a `[1m]` model in the picker: `/model opus[1m]`
-  or `/model sonnet[1m]` (or pin it with
-  `export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-8[1m]`). Claude Code then
-  sends the `anthropic-beta: context-1m-2025-08-07` header, which the gateway
-  honors by routing to the upstream long-context tier. The gateway also accepts
-  the `[1m]` suffix directly on a model name (`claude-opus-4-8[1m]`).
-- **Reasoning effort** — use `/effort low|medium|high|xhigh|max`. Claude Code
-  sends `output_config: {effort: "..."}`, which the gateway maps to the upstream
-  `reasoning_effort`. The menu only appears for models Claude Code recognizes as
-  effort-capable (Opus 4.6+/4.7/4.8, Sonnet 4.6+), keyed by the official
-  dash-style ID.
-- **Populate the picker from the gateway** — set
-  `export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` (Claude Code v2.1.129+)
-  so the gateway's `/v1/models` models (already exposed with dash-style IDs and
-  full `capabilities`) are added to `/model`, each labeled "From gateway".
+**Reasoning effort (both clients).** Use `/effort low|medium|high|xhigh|max` in
+the CLI, or the effort control in Desktop. The client sends
+`output_config: {effort: "..."}`, which the gateway maps to the upstream
+`reasoning_effort`. The option appears for models the client recognizes as
+effort-capable (Opus 4.6+/4.7/4.8, Sonnet 4.6+), keyed by the official dash-style
+ID, or when declared with
+`ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES=effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking`.
+
+**1M context window — Claude Code CLI.** Select a `[1m]` variant, most reliably
+by pinning the alias:
+
+```bash
+export ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-4-8[1m]'
+export ANTHROPIC_DEFAULT_SONNET_MODEL='claude-sonnet-4-6[1m]'
+```
+
+or pick it live with `/model opus[1m]` (or type the full name
+`/model claude-opus-4-8[1m]` even if it is not listed). Claude Code strips the
+`[1m]` suffix and adds the `context-1m-2025-08-07` beta; the gateway honors it.
+`CLAUDE_CODE_DISABLE_1M_CONTEXT=1` hides it.
+
+**1M context window — Claude Desktop (Cowork on 3P).** Desktop never probes the
+gateway for 1M support; you assert it per model with `supports1m: true` in the
+`inferenceModels` managed configuration. The `name` **must be the exact ID the
+gateway's `/v1/models` returns** — which for Anthropic clients is the dash-style
+ID (for example `claude-opus-4-8`):
+
+```json
+"inferenceModels": [
+  { "name": "claude-opus-4-8",  "supports1m": true, "anthropicFamilyTier": "opus",   "isFamilyDefault": true },
+  { "name": "claude-sonnet-4-6", "supports1m": true, "anthropicFamilyTier": "sonnet" },
+  { "name": "claude-haiku-4-5",  "anthropicFamilyTier": "haiku" }
+]
+```
+
+Set this via **Developer → Configure third-party inference** in the app, or in
+the exported `.mobileconfig` / registry policy, then fully quit and reopen
+Desktop. A separate 1M picker entry then appears for each `supports1m` model.
+
+**Populate the picker from the gateway.** The Claude Desktop app auto-discovers
+models from `/v1/models` by default; the Claude Code CLI needs
+`export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` (v2.1.129+). Either way the
+gateway already exposes dash-style IDs with full `capabilities`; discovery does
+not synthesize the 1M variant, so still apply the CLI `[1m]` pin or the Desktop
+`supports1m` entry above.
 
 The gateway also stubs `POST /api/event_logging/batch` (returns
 `{"status":"ok"}`) so Claude Code telemetry posts do not error.
