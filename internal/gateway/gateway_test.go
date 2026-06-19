@@ -231,7 +231,7 @@ func TestAnthropicModelsUsesOfficialSchema(t *testing.T) {
 	if _, ok := body["object"]; ok {
 		t.Fatalf("Anthropic list schema should not include OpenAI object field: %v", body)
 	}
-	model := modelByID(t, body, "claude-opus-4.8")
+	model := modelByID(t, body, "claude-opus-4-8")
 	if model["type"] != "model" {
 		t.Fatalf("type=%v", model["type"])
 	}
@@ -260,7 +260,7 @@ func TestAnthropicModelsUsesOfficialSchema(t *testing.T) {
 	}
 
 	single := decodeBody(t, request(t, h, "GET", "/v1/models/claude-opus-4.8", nil, headers))
-	if single["id"] != "claude-opus-4.8" {
+	if single["id"] != "claude-opus-4-8" {
 		t.Fatalf("single id=%v", single["id"])
 	}
 	if got := intModelField(t, single, "max_input_tokens"); got != 1000000 {
@@ -272,7 +272,7 @@ func TestAnthropicModelsUsesOfficialSchema(t *testing.T) {
 	if _, ok := uaBody["object"]; ok {
 		t.Fatalf("Claude user-agent should receive Anthropic list schema: %v", uaBody)
 	}
-	uaModel := modelByID(t, uaBody, "claude-opus-4.8")
+	uaModel := modelByID(t, uaBody, "claude-opus-4-8")
 	if got := intModelField(t, uaModel, "max_input_tokens"); got != 1000000 {
 		t.Fatalf("ua max_input_tokens=%d", got)
 	}
@@ -306,6 +306,43 @@ func TestPublicModelDataAdjustsNestedCapabilities(t *testing.T) {
 		t.Fatalf("nested max_prompt_tokens=%d", got)
 	}
 	assertStringListContains(t, caps["supported_reasoning_efforts"], "xhigh")
+}
+
+func TestCanonicalAnthropicModelID(t *testing.T) {
+	cases := map[string]string{
+		"claude-opus-4.8":   "claude-opus-4-8",
+		"claude-sonnet-4.6": "claude-sonnet-4-6",
+		"claude-haiku-4.5":  "claude-haiku-4-5",
+		"claude-opus-4-8":   "claude-opus-4-8",
+		"gpt-5.5":           "gpt-5.5",
+		"gemini-3.1-pro":    "gemini-3.1-pro",
+	}
+	for in, want := range cases {
+		if got := canonicalAnthropicModelID(in); got != want {
+			t.Fatalf("canonicalAnthropicModelID(%q)=%q want %q", in, got, want)
+		}
+	}
+}
+
+func TestNormalizeAnthropicModelWithContext(t *testing.T) {
+	cases := []struct {
+		model  string
+		beta   string
+		want   string
+		want1M bool
+	}{
+		{"claude-opus-4-8[1m]", "", "claude-opus-4.8", true},
+		{"claude-opus-4.8", "context-1m-2025-08-07", "claude-opus-4.8", true},
+		{"claude-opus-4-8", "fast-mode-2026-02-01,context-1m-2025-08-07", "claude-opus-4.8", true},
+		{"claude-opus-4-8", "", "claude-opus-4.8", false},
+		{"claude-sonnet-4-6-20260101[1m]", "", "claude-sonnet-4.6", true},
+	}
+	for _, c := range cases {
+		got, got1M := normalizeAnthropicModelWithContext(c.model, c.beta)
+		if got != c.want || got1M != c.want1M {
+			t.Fatalf("normalizeAnthropicModelWithContext(%q,%q)=(%q,%v) want (%q,%v)", c.model, c.beta, got, got1M, c.want, c.want1M)
+		}
+	}
 }
 
 func modelByID(t *testing.T, body map[string]any, id string) map[string]any {

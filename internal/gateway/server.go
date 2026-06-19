@@ -39,6 +39,7 @@ func NewServer(gw *Gateway) http.Handler {
 	mux.HandleFunc("POST /messages", s.anthropicMessages)
 	mux.HandleFunc("POST /v1/messages/count_tokens", s.anthropicCountTokens)
 	mux.HandleFunc("POST /messages/count_tokens", s.anthropicCountTokens)
+	mux.HandleFunc("POST /api/event_logging/batch", s.anthropicEventLogging)
 	mux.HandleFunc("POST /v1/embeddings", s.embeddings)
 	mux.HandleFunc("GET /v1beta/models", s.geminiModels)
 	mux.HandleFunc("POST /v1beta/models/{model_action...}", s.geminiModelAction)
@@ -178,7 +179,7 @@ func prefersAnthropicModelSchema(r *http.Request) bool {
 
 func anthropicModelData(model map[string]any) map[string]any {
 	return map[string]any{
-		"id":               model["id"],
+		"id":               canonicalAnthropicModelID(stringFromAny(model["id"])),
 		"type":             "model",
 		"display_name":     model["display_name"],
 		"created_at":       firstNonEmpty(stringFromAny(model["created_at"]), time.Unix(int64(intFromAny(model["created"], 0)), 0).UTC().Format(time.RFC3339)),
@@ -186,6 +187,22 @@ func anthropicModelData(model map[string]any) map[string]any {
 		"max_tokens":       intFromAny(model["max_tokens"], 0),
 		"capabilities":     anthropicModelCapabilities(model),
 	}
+}
+
+// canonicalAnthropicModelID converts the gateway's internal dot-style Claude IDs
+// (claude-opus-4.8) into Anthropic's official dash-style IDs (claude-opus-4-8).
+// Claude Code recognizes models for 1M context and effort levels by matching the
+// dash-style ID against its built-in registry, so the Anthropic Models API view
+// must advertise that exact form. Non-Claude IDs are returned unchanged.
+func canonicalAnthropicModelID(model string) string {
+	trimmed := strings.TrimSpace(model)
+	lower := strings.ToLower(trimmed)
+	for _, prefix := range []string{"claude-opus-", "claude-sonnet-", "claude-haiku-"} {
+		if strings.HasPrefix(lower, prefix) {
+			return prefix + strings.ReplaceAll(strings.TrimPrefix(lower, prefix), ".", "-")
+		}
+	}
+	return trimmed
 }
 
 func anthropicModelCapabilities(model map[string]any) map[string]any {
@@ -636,7 +653,8 @@ func (s *server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	body.Model = normalizeAnthropicRequestedModel(body.Model, r.Header.Get("anthropic-beta"))
+	normalizedModel, wants1MContext := normalizeAnthropicModelWithContext(body.Model, r.Header.Get("anthropic-beta"))
+	body.Model = normalizedModel
 	rawBody["model"] = body.Model
 	rawBody = sanitizeNativeAnthropicRaw(rawBody)
 	resolvedModel := s.gw.Settings.ResolveModelAlias(body.Model)
@@ -650,6 +668,9 @@ func (s *server) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	chat := body.ToChatRequest()
 	chat.AnthropicRaw = rawBody
+	if wants1MContext {
+		chat.ContextTier = "long_context"
+	}
 	chat.PreferredEndpoint = endpointMessages
 	chat.FallbackEndpoints = []string{endpointResponses, endpointChatCompletions}
 	if !s.modelAllowed(w, chat.Model, p) {
@@ -1537,8 +1558,43 @@ func writeAnthropicErrorWithHeaders(w http.ResponseWriter, status int, errorType
 }
 
 func normalizeAnthropicRequestedModel(model string, betaHeader string) string {
-	model = normalizeAnthropicModelAlias(model)
-	return model
+	normalized, _ := normalizeAnthropicModelWithContext(model, betaHeader)
+	return normalized
+}
+
+// normalizeAnthropicModelWithContext resolves a client-supplied Anthropic model
+// name and reports whether the 1M context window was requested. Claude Code
+// expresses the 1M tier with the official `[1m]` model suffix (for example
+// `claude-opus-4-8[1m]`) and the `context-1m-2025-08-07` beta header; both are
+// honored here so the upstream Copilot request engages the long-context tier.
+func normalizeAnthropicModelWithContext(model string, betaHeader string) (string, bool) {
+	stripped, suffix1m := stripContext1MSuffix(model)
+	wants1M := suffix1m || betaRequestsContext1M(betaHeader)
+	return normalizeAnthropicModelAlias(stripped), wants1M
+}
+
+func stripContext1MSuffix(model string) (string, bool) {
+	trimmed := strings.TrimSpace(model)
+	if len(trimmed) >= 4 && strings.EqualFold(trimmed[len(trimmed)-4:], "[1m]") {
+		return strings.TrimSpace(trimmed[:len(trimmed)-4]), true
+	}
+	return trimmed, false
+}
+
+func betaRequestsContext1M(betaHeader string) bool {
+	if betaHeader == "" {
+		return false
+	}
+	for _, part := range strings.Split(betaHeader, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), "context-1m-2025-08-07") {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *server) anthropicEventLogging(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"}, nil)
 }
 
 func normalizeAnthropicModelAlias(model string) string {

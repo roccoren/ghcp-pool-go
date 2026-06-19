@@ -216,10 +216,46 @@ compatibility fields such as `context_window`, `max_context_window_tokens`,
 `/models`, requests with `anthropic-version` or `x-api-key`, or Claude/Anthropic
 user agents) get the official Anthropic Models API shape: `type`,
 `display_name`, `created_at`, `max_input_tokens`, `max_tokens`, and
-`capabilities.effort.{low,medium,high,xhigh,max}.supported`. The model list
-only advertises real upstream model IDs plus aliases explicitly configured in
-`gateway.model_aliases`; long context is represented by `max_input_tokens` and
-`context_tier`, not by extra generated model IDs.
+`capabilities.effort.{low,medium,high,xhigh,max}.supported`. Anthropic-style
+responses advertise the official dash-style model IDs (for example
+`claude-opus-4-8`) so Claude clients recognize them; OpenAI-style responses keep
+the dot-style IDs (`claude-opus-4.8`). Both forms resolve to the same upstream
+model on input. The model list only advertises real upstream model IDs plus
+aliases explicitly configured in `gateway.model_aliases`; long context is
+represented by `max_input_tokens` and `context_tier`, not by extra generated
+model IDs.
+
+### Using with Claude Code / Claude Desktop (Anthropic clients)
+
+Point the client at the gateway with the standard Anthropic env vars:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8000   # your gateway URL
+export ANTHROPIC_AUTH_TOKEN=$GHCP_API_KEY         # sent as Authorization: Bearer
+```
+
+Claude Code decides whether to show the **1M context window** and the
+**reasoning-effort (`/effort`) menu** from its own built-in model registry — it
+does **not** read `/v1/models` unless you opt in. To make these options appear:
+
+- **1M context window** — select a `[1m]` model in the picker: `/model opus[1m]`
+  or `/model sonnet[1m]` (or pin it with
+  `export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-8[1m]`). Claude Code then
+  sends the `anthropic-beta: context-1m-2025-08-07` header, which the gateway
+  honors by routing to the upstream long-context tier. The gateway also accepts
+  the `[1m]` suffix directly on a model name (`claude-opus-4-8[1m]`).
+- **Reasoning effort** — use `/effort low|medium|high|xhigh|max`. Claude Code
+  sends `output_config: {effort: "..."}`, which the gateway maps to the upstream
+  `reasoning_effort`. The menu only appears for models Claude Code recognizes as
+  effort-capable (Opus 4.6+/4.7/4.8, Sonnet 4.6+), keyed by the official
+  dash-style ID.
+- **Populate the picker from the gateway** — set
+  `export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` (Claude Code v2.1.129+)
+  so the gateway's `/v1/models` models (already exposed with dash-style IDs and
+  full `capabilities`) are added to `/model`, each labeled "From gateway".
+
+The gateway also stubs `POST /api/event_logging/batch` (returns
+`{"status":"ok"}`) so Claude Code telemetry posts do not error.
 
 For GitHub Enterprise, set `GHCP_GITHUB_ENTERPRISE_URL=<enterprise-domain>`;
 the gateway derives `https://copilot-api.<enterprise-domain>` plus enterprise
