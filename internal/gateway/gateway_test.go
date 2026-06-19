@@ -156,6 +156,183 @@ func TestHealthAndAuth(t *testing.T) {
 	}
 }
 
+func TestListModelsExposesClaudeDesktopMetadata(t *testing.T) {
+	settings := testSettings()
+	settings.Accounts[1].Models = []string{"claude-opus-4.8"}
+	gw, err := NewGateway(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Startup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gw.Shutdown)
+	h := NewServer(gw)
+
+	rr := request(t, h, "GET", "/v1/models", nil, userHeaders)
+	if rr.Code != http.StatusOK {
+		t.Fatal(rr.Body.String())
+	}
+	body := decodeBody(t, rr)
+	model := modelByID(t, body, "claude-opus-4.8")
+	if got := intModelField(t, model, "context_window"); got != 1000000 {
+		t.Fatalf("context_window=%d", got)
+	}
+	if got := intModelField(t, model, "max_context_window_tokens"); got != 1000000 {
+		t.Fatalf("max_context_window_tokens=%d", got)
+	}
+	if got := model["reasoning_effort"]; got != "high" {
+		t.Fatalf("reasoning_effort=%v", got)
+	}
+	assertStringListContains(t, model["supported_reasoning_efforts"], "xhigh")
+	assertStringListContains(t, model["supported_reasoning_efforts"], "max")
+
+	caps := model["capabilities"].(map[string]any)
+	if got := intModelField(t, caps, "max_context_window_tokens"); got != 1000000 {
+		t.Fatalf("capabilities.max_context_window_tokens=%d", got)
+	}
+	limits := caps["limits"].(map[string]any)
+	if got := intModelField(t, limits, "max_context_window_tokens"); got != 1000000 {
+		t.Fatalf("capabilities.limits.max_context_window_tokens=%d", got)
+	}
+	supports := caps["supports"].(map[string]any)
+	if supports["reasoning_effort"] != true {
+		t.Fatalf("capabilities.supports.reasoning_effort=%v", supports["reasoning_effort"])
+	}
+
+	single := decodeBody(t, request(t, h, "GET", "/v1/models/claude-opus-4.8", nil, userHeaders))
+	if single["id"] != "claude-opus-4.8" {
+		t.Fatalf("single id=%v", single["id"])
+	}
+	if got := intModelField(t, single, "max_context_window_tokens"); got != 1000000 {
+		t.Fatalf("single max_context_window_tokens=%d", got)
+	}
+}
+
+func TestAnthropicModelsUsesOfficialSchema(t *testing.T) {
+	settings := testSettings()
+	settings.Accounts[1].Models = []string{"claude-opus-4.8"}
+	gw, err := NewGateway(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Startup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gw.Shutdown)
+	h := NewServer(gw)
+
+	headers := map[string]string{"x-api-key": "sk-user", "anthropic-version": "2023-06-01"}
+	rr := request(t, h, "GET", "/v1/models", nil, headers)
+	if rr.Code != http.StatusOK {
+		t.Fatal(rr.Body.String())
+	}
+	body := decodeBody(t, rr)
+	model := modelByID(t, body, "claude-opus-4.8")
+	if model["type"] != "model" {
+		t.Fatalf("type=%v", model["type"])
+	}
+	if _, ok := model["object"]; ok {
+		t.Fatalf("Anthropic schema should not include OpenAI object field: %v", model)
+	}
+	if got := intModelField(t, model, "max_input_tokens"); got != 1000000 {
+		t.Fatalf("max_input_tokens=%d", got)
+	}
+	caps := model["capabilities"].(map[string]any)
+	effort := caps["effort"].(map[string]any)
+	if effort["supported"] != true {
+		t.Fatalf("effort.supported=%v", effort["supported"])
+	}
+	for _, level := range []string{"low", "medium", "high", "xhigh", "max"} {
+		if effort[level].(map[string]any)["supported"] != true {
+			t.Fatalf("effort.%s=%v", level, effort[level])
+		}
+	}
+	thinking := caps["thinking"].(map[string]any)
+	if thinking["supported"] != true {
+		t.Fatalf("thinking.supported=%v", thinking["supported"])
+	}
+
+	single := decodeBody(t, request(t, h, "GET", "/v1/models/claude-opus-4.8", nil, headers))
+	if single["id"] != "claude-opus-4.8" {
+		t.Fatalf("single id=%v", single["id"])
+	}
+	if got := intModelField(t, single, "max_input_tokens"); got != 1000000 {
+		t.Fatalf("single max_input_tokens=%d", got)
+	}
+}
+
+func TestPublicModelDataAdjustsNestedCapabilities(t *testing.T) {
+	settings := testSettings()
+	gw, err := NewGateway(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{gw: gw}
+	model := s.publicModelData(ModelSpec{
+		ID: "claude-opus-4.8",
+		Capabilities: map[string]any{
+			"limits":   map[string]any{"max_context_window_tokens": 200000, "max_prompt_tokens": 200000},
+			"supports": map[string]any{"reasoning_effort": false},
+		},
+	}, "claude-opus-4.8", 123)
+	caps := model["capabilities"].(map[string]any)
+	limits := caps["limits"].(map[string]any)
+	if got := intModelField(t, limits, "max_context_window_tokens"); got != 1000000 {
+		t.Fatalf("nested max_context_window_tokens=%d", got)
+	}
+	if got := intModelField(t, limits, "max_prompt_tokens"); got != 1000000 {
+		t.Fatalf("nested max_prompt_tokens=%d", got)
+	}
+	assertStringListContains(t, caps["supported_reasoning_efforts"], "xhigh")
+}
+
+func modelByID(t *testing.T, body map[string]any, id string) map[string]any {
+	t.Helper()
+	for _, item := range body["data"].([]any) {
+		obj := item.(map[string]any)
+		if obj["id"] == id {
+			return obj
+		}
+	}
+	t.Fatalf("model %q not found in %v", id, body["data"])
+	return nil
+}
+
+func intModelField(t *testing.T, obj map[string]any, key string) int {
+	t.Helper()
+	switch v := obj[key].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	default:
+		t.Fatalf("%s has type %T value %v", key, obj[key], obj[key])
+		return 0
+	}
+}
+
+func assertStringListContains(t *testing.T, value any, want string) {
+	t.Helper()
+	switch items := value.(type) {
+	case []string:
+		for _, item := range items {
+			if item == want {
+				return
+			}
+		}
+	case []any:
+		for _, item := range items {
+			if item == want {
+				return
+			}
+		}
+	}
+	t.Fatalf("%v does not contain %q", value, want)
+}
+
 func TestEnvAPIKeyOverridesDefaultKey(t *testing.T) {
 	t.Setenv("GHCP_API_KEY", "sk-env")
 	settings, err := LoadSettings("/does/not/exist.yaml")
@@ -596,7 +773,7 @@ func TestAnthropicAuthAndModelNormalization(t *testing.T) {
 		t.Fatalf("auth error shape=%v", body)
 	}
 
-	if got := normalizeAnthropicRequestedModel("claude-sonnet-4-6-20260101", "context-1m-2025-08-07"); got != "claude-sonnet-4.6-1m" {
+	if got := normalizeAnthropicRequestedModel("claude-sonnet-4-6-20260101", "context-1m-2025-08-07"); got != "claude-sonnet-4.6" {
 		t.Fatalf("normalized=%q", got)
 	}
 	if got := normalizeAnthropicRequestedModel("claude-haiku-4-5-20251001", ""); got != "claude-haiku-4.5" {
@@ -783,6 +960,128 @@ func TestContextTierCanBeRequestedOrConfigured(t *testing.T) {
 
 	if _, err := gw.Prepare(ChatCompletionRequest{Model: "gpt-4.1", ContextTier: "huge", Messages: []ChatMessage{msg}}, principal, "bypass"); err == nil {
 		t.Fatalf("expected invalid context_tier error")
+	}
+}
+
+func TestHighCapabilityModelsGetAutomaticDefaults(t *testing.T) {
+	// Test that high-capability models get reasoning_effort and context_tier defaults
+	settings := testSettings()
+	settings.Accounts[0].Models = []string{"claude-opus-4.8", "claude-sonnet-4.6", "gpt-5.5", "gemini-3.1-pro"}
+	settings.Routes = []RouteConfig{{Model: "*", Accounts: []string{"acct_a"}, Strategy: "least_busy"}}
+	// Don't set ReasoningEfforts or ContextTiers manually - let defaults apply
+	gw, err := NewGateway(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Startup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gw.Shutdown)
+	principal := Principal{config: APIKeyConfig{Scopes: []string{"inference"}, ModelAllow: []string{"*"}, CacheNamespace: "test"}}
+	msg := ChatMessage{Role: "user", Content: "hi", Raw: map[string]any{"role": "user", "content": "hi"}}
+
+	tests := []struct {
+		model               string
+		wantReasoningEffort string
+		wantContextTier     string
+	}{
+		{"claude-opus-4.8", "high", "long_context"},     // Opus gets high reasoning
+		{"claude-sonnet-4.6", "medium", "long_context"}, // Sonnet gets medium reasoning
+		{"gpt-5.5", "medium", "long_context"},           // GPT-5 gets medium reasoning
+		{"gemini-3.1-pro", "", "long_context"},          // Gemini gets context tier but not reasoning effort
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			plan, err := gw.Prepare(ChatCompletionRequest{Model: tt.model, Messages: []ChatMessage{msg}}, principal, "bypass")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.wantReasoningEffort == "" {
+				if got := plan.Params["reasoning_effort"]; got != nil {
+					t.Errorf("%s reasoning_effort: got %v, want nil", tt.model, got)
+				}
+			} else if got := plan.Params["reasoning_effort"]; got != tt.wantReasoningEffort {
+				t.Errorf("%s reasoning_effort: got %v, want %v", tt.model, got, tt.wantReasoningEffort)
+			}
+			if got := plan.Params["context_tier"]; got != tt.wantContextTier {
+				t.Errorf("%s context_tier: got %v, want %v", tt.model, got, tt.wantContextTier)
+			}
+		})
+	}
+}
+
+func TestDefaultsCanBeOverridden(t *testing.T) {
+	// Test that user config overrides automatic defaults
+	settings := testSettings()
+	settings.Accounts[0].Models = []string{"claude-opus-4.8"}
+	settings.Routes = []RouteConfig{{Model: "*", Accounts: []string{"acct_a"}, Strategy: "least_busy"}}
+	settings.ReasoningEfforts = map[string]string{"claude-opus-4.*": "max"} // Override default "high" with "max"
+	settings.ContextTiers = map[string]string{"claude-opus-4.*": "default"} // Override default "long_context"
+	gw, err := NewGateway(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Startup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gw.Shutdown)
+	principal := Principal{config: APIKeyConfig{Scopes: []string{"inference"}, ModelAllow: []string{"*"}, CacheNamespace: "test"}}
+	msg := ChatMessage{Role: "user", Content: "hi", Raw: map[string]any{"role": "user", "content": "hi"}}
+
+	plan, err := gw.Prepare(ChatCompletionRequest{Model: "claude-opus-4.8", Messages: []ChatMessage{msg}}, principal, "bypass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := plan.Params["reasoning_effort"]; got != "max" {
+		t.Fatalf("user override reasoning_effort: got %v, want 'max'", got)
+	}
+	if got := plan.Params["context_tier"]; got != "default" {
+		t.Fatalf("user override context_tier: got %v, want 'default'", got)
+	}
+}
+
+func TestFullReasoningEffortRange(t *testing.T) {
+	// Test that all reasoning effort levels work correctly
+	settings := testSettings()
+	settings.Accounts[0].Models = []string{"claude-opus-4.8"}
+	settings.Routes = []RouteConfig{{Model: "*", Accounts: []string{"acct_a"}, Strategy: "least_busy"}}
+	gw, err := NewGateway(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Startup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gw.Shutdown)
+	principal := Principal{config: APIKeyConfig{Scopes: []string{"inference"}, ModelAllow: []string{"*"}, CacheNamespace: "test"}}
+	msg := ChatMessage{Role: "user", Content: "hi", Raw: map[string]any{"role": "user", "content": "hi"}}
+
+	efforts := []string{"none", "low", "medium", "high", "xhigh", "max"}
+	for _, effort := range efforts {
+		t.Run(effort, func(t *testing.T) {
+			plan, err := gw.Prepare(ChatCompletionRequest{
+				Model:           "claude-opus-4.8",
+				Messages:        []ChatMessage{msg},
+				ReasoningEffort: effort,
+			}, principal, "bypass")
+			if err != nil {
+				t.Fatalf("reasoning_effort %q should be valid: %v", effort, err)
+			}
+			if got := plan.Params["reasoning_effort"]; got != effort {
+				t.Errorf("reasoning_effort: got %v, want %v", got, effort)
+			}
+		})
+	}
+
+	// Test invalid reasoning effort
+	_, err = gw.Prepare(ChatCompletionRequest{
+		Model:           "claude-opus-4.8",
+		Messages:        []ChatMessage{msg},
+		ReasoningEffort: "ultra",
+	}, principal, "bypass")
+	if err == nil {
+		t.Fatal("expected error for invalid reasoning_effort 'ultra'")
 	}
 }
 

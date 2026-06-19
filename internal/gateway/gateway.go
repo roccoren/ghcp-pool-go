@@ -26,6 +26,8 @@ type Gateway struct {
 }
 
 func NewGateway(settings Settings) (*Gateway, error) {
+	applyDefaultReasoningEfforts(&settings)
+	applyDefaultContextTiers(&settings)
 	pool, err := NewPoolManager(settings)
 	if err != nil {
 		return nil, err

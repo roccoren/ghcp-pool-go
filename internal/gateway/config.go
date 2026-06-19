@@ -282,12 +282,43 @@ func defaultAPIKeyConfig(key, keyVaultSecret string) APIKeyConfig {
 
 func (s Settings) ResolveModelAlias(model string) string {
 	if s.ModelAliases == nil {
-		return model
+		return normalizeProviderModelID(model)
 	}
 	if target := s.ModelAliases[model]; target != "" {
 		return target
 	}
+	return normalizeProviderModelID(model)
+}
+
+func normalizeProviderModelID(model string) string {
+	model = strings.TrimSpace(model)
+	lower := strings.ToLower(model)
+	if strings.HasPrefix(lower, "claude-") {
+		lower = strings.ToLower(model)
+		for _, prefix := range []string{"claude-opus-", "claude-sonnet-", "claude-haiku-"} {
+			if !strings.HasPrefix(lower, prefix) {
+				continue
+			}
+			rest := strings.TrimPrefix(lower, prefix)
+			parts := strings.Split(rest, "-")
+			if len(parts) >= 2 && isDigits(parts[0]) && isDigits(parts[1]) {
+				return prefix + parts[0] + "." + parts[1]
+			}
+		}
+	}
 	return model
+}
+
+func isDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (s Settings) DisplayIDsForModel(model string) []string {
@@ -402,6 +433,8 @@ func LoadSettings(path string) (Settings, error) {
 	if !ValidCopilotSDKWebSearchModes[settings.Copilot.SDKWebSearchMode] {
 		return Settings{}, fmt.Errorf("invalid copilot sdk_web_search_mode %q; valid: off, empty, cli, native_cli", settings.Copilot.SDKWebSearchMode)
 	}
+	applyDefaultReasoningEfforts(&settings)
+	applyDefaultContextTiers(&settings)
 	settings.Copilot.EnterpriseURL = normalizeDomain(settings.Copilot.EnterpriseURL)
 	if settings.Copilot.BaseURL == "" && settings.Copilot.EnterpriseURL != "" {
 		settings.Copilot.BaseURL = copilotEnterpriseAPIBaseURL(settings.Copilot.EnterpriseURL)
@@ -557,4 +590,57 @@ func resolveModelOverride(model string, overrides map[string]string) string {
 		}
 	}
 	return best
+}
+
+// applyDefaultReasoningEfforts sets default reasoning effort for high-capability models
+// that support reasoning (Opus, Sonnet 4.6+, GPT-5+). Users can override these via config.
+// Defaults are conservative (medium) but the full range is available: none, low, medium, high, xhigh, max.
+// Opus models get "high" for best quality, while Sonnet/GPT models get "medium" for balanced performance.
+func applyDefaultReasoningEfforts(settings *Settings) {
+	if settings.ReasoningEfforts == nil {
+		settings.ReasoningEfforts = map[string]string{}
+	}
+	defaults := map[string]string{
+		// Claude Opus: Premium tier, default to high reasoning for best quality
+		"claude-opus-4.*": "high",
+
+		// Claude Sonnet: Balanced tier, default to medium reasoning
+		"claude-sonnet-4.6": "medium",
+		"claude-sonnet-4.7": "medium",
+		"claude-sonnet-4.8": "medium",
+		"claude-sonnet-4.9": "medium",
+
+		// GPT models: Default to medium reasoning
+		"gpt-5.*": "medium",
+		"gpt-6.*": "medium",
+	}
+	for pattern, effort := range defaults {
+		if _, exists := settings.ReasoningEfforts[pattern]; !exists {
+			settings.ReasoningEfforts[pattern] = effort
+		}
+	}
+}
+
+// applyDefaultContextTiers sets default long_context tier for high-capability models
+// that support 1M+ token context windows. Users can override these via config.
+func applyDefaultContextTiers(settings *Settings) {
+	if settings.ContextTiers == nil {
+		settings.ContextTiers = map[string]string{}
+	}
+	defaults := map[string]string{
+		"claude-opus-4.*":   "long_context",
+		"claude-sonnet-4.6": "long_context",
+		"claude-sonnet-4.7": "long_context",
+		"claude-sonnet-4.8": "long_context",
+		"claude-sonnet-4.9": "long_context",
+		"gpt-5.*":           "long_context",
+		"gpt-6.*":           "long_context",
+		"gemini-3.*":        "long_context",
+		"gemini-4.*":        "long_context",
+	}
+	for pattern, tier := range defaults {
+		if _, exists := settings.ContextTiers[pattern]; !exists {
+			settings.ContextTiers[pattern] = tier
+		}
+	}
 }

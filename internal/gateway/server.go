@@ -25,7 +25,10 @@ func NewServer(gw *Gateway) http.Handler {
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /readyz", s.readyz)
 	mux.HandleFunc("GET /metrics", s.metrics)
+	mux.HandleFunc("GET /models", s.listModels)
+	mux.HandleFunc("GET /models/{model_id}", s.getModel)
 	mux.HandleFunc("GET /v1/models", s.listModels)
+	mux.HandleFunc("GET /v1/models/{model_id}", s.getModel)
 	mux.HandleFunc("POST /v1/chat/completions", s.chatCompletions)
 	mux.HandleFunc("POST /v1/responses", s.responses)
 	mux.HandleFunc("GET /v1/responses/{response_id}", s.getResponse)
@@ -33,7 +36,9 @@ func NewServer(gw *Gateway) http.Handler {
 	mux.HandleFunc("POST /v1/responses/{response_id}/cancel", s.cancelResponse)
 	mux.HandleFunc("GET /v1/responses/{response_id}/input_items", s.responseInputItems)
 	mux.HandleFunc("POST /v1/messages", s.anthropicMessages)
+	mux.HandleFunc("POST /messages", s.anthropicMessages)
 	mux.HandleFunc("POST /v1/messages/count_tokens", s.anthropicCountTokens)
+	mux.HandleFunc("POST /messages/count_tokens", s.anthropicCountTokens)
 	mux.HandleFunc("POST /v1/embeddings", s.embeddings)
 	mux.HandleFunc("GET /v1beta/models", s.geminiModels)
 	mux.HandleFunc("POST /v1beta/models/{model_action...}", s.geminiModelAction)
@@ -63,6 +68,8 @@ func NewServer(gw *Gateway) http.Handler {
 	mux.HandleFunc("PUT /admin/rate-limits", s.adminSetRateLimits)
 	mux.HandleFunc("GET /admin/reasoning-efforts", s.adminReasoningEfforts)
 	mux.HandleFunc("PUT /admin/reasoning-efforts", s.adminSetReasoningEfforts)
+	mux.HandleFunc("GET /admin/context-tiers", s.adminContextTiers)
+	mux.HandleFunc("PUT /admin/context-tiers", s.adminSetContextTiers)
 	mux.HandleFunc("GET /admin/usage", s.adminUsage)
 	mux.HandleFunc("GET /admin/usage/aggregate", s.adminUsageAggregate)
 	mux.HandleFunc("GET /admin/dashboard/data", s.adminDashboardData)
@@ -109,14 +116,325 @@ func (s *server) listModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := []any{}
-	for _, model := range s.gw.Registry.VisibleModels() {
-		if p.MayUseModel(model) {
-			for _, displayID := range s.gw.Settings.DisplayIDsForModel(model) {
-				data = append(data, map[string]any{"id": displayID, "object": "model", "created": nowUnixInt(), "owned_by": "github-copilot"})
+	created := nowUnixInt()
+	for _, modelSpec := range s.gw.Registry.VisibleModelSpecs() {
+		if p.MayUseModel(modelSpec.ID) {
+			for _, displayID := range s.gw.Settings.DisplayIDsForModel(modelSpec.ID) {
+				data = append(data, s.modelDataForRequest(r, modelSpec, displayID, created))
 			}
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data}, nil)
+	resp := map[string]any{"object": "list", "type": "list", "data": data, "has_more": false}
+	if len(data) > 0 {
+		if first, ok := data[0].(map[string]any); ok {
+			resp["first_id"] = first["id"]
+		}
+		if last, ok := data[len(data)-1].(map[string]any); ok {
+			resp["last_id"] = last["id"]
+		}
+	}
+	writeJSON(w, http.StatusOK, resp, nil)
+}
+
+func (s *server) getModel(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.require(w, r, "inference")
+	if !ok {
+		return
+	}
+	requestedID := strings.TrimSpace(r.PathValue("model_id"))
+	resolvedID := s.gw.Settings.ResolveModelAlias(requestedID)
+	for _, modelSpec := range s.gw.Registry.VisibleModelSpecs() {
+		if modelSpec.ID != resolvedID || !p.MayUseModel(modelSpec.ID) {
+			continue
+		}
+		writeJSON(w, http.StatusOK, s.modelDataForRequest(r, modelSpec, requestedID, nowUnixInt()), nil)
+		return
+	}
+	writeOpenAIError(w, http.StatusNotFound, "invalid_request_error", "model not found: "+requestedID)
+}
+
+func (s *server) modelDataForRequest(r *http.Request, spec ModelSpec, displayID string, created int64) map[string]any {
+	model := s.publicModelData(spec, displayID, created)
+	if prefersAnthropicModelSchema(r) {
+		return anthropicModelData(model)
+	}
+	return model
+}
+
+func prefersAnthropicModelSchema(r *http.Request) bool {
+	return r.Header.Get("anthropic-version") != "" || r.Header.Get("anthropic-beta") != "" || r.Header.Get("x-api-key") != ""
+}
+
+func anthropicModelData(model map[string]any) map[string]any {
+	return map[string]any{
+		"id":               model["id"],
+		"type":             "model",
+		"display_name":     model["display_name"],
+		"created_at":       firstNonEmpty(stringFromAny(model["created_at"]), time.Unix(int64(intFromAny(model["created"], 0)), 0).UTC().Format(time.RFC3339)),
+		"max_input_tokens": intFromAny(firstAny(model["max_input_tokens"], model["context_window"], model["max_context_window_tokens"]), 0),
+		"max_tokens":       intFromAny(model["max_tokens"], 0),
+		"capabilities":     anthropicModelCapabilities(model),
+	}
+}
+
+func anthropicModelCapabilities(model map[string]any) map[string]any {
+	caps := anyMap(model["capabilities"])
+	supports := anyMap(caps["supports"])
+	effortCaps := anyMap(caps["effort"])
+	effortSupported := boolFromAny(effortCaps["supported"]) || boolFromAny(model["supports_reasoning_effort"]) || boolFromAny(caps["supports_reasoning_effort"])
+	thinkingCaps := anyMap(caps["thinking"])
+	thinkingSupported := boolFromAny(thinkingCaps["supported"]) || boolFromAny(model["supports_reasoning"]) || effortSupported
+	visionSupported := boolFromAny(caps["supports_vision"]) || boolFromAny(supports["vision"]) || boolFromAny(supports["image_input"])
+	claudeModel := strings.HasPrefix(strings.ToLower(stringFromAny(model["id"])), "claude-")
+	return map[string]any{
+		"batch":              capabilitySupport(claudeModel),
+		"citations":          capabilitySupport(claudeModel),
+		"code_execution":     capabilitySupport(boolFromAny(supports["code_execution"]) || boolFromAny(caps["code_execution"])),
+		"context_management": anthropicContextManagementCapability(claudeModel),
+		"effort":             anthropicEffortCapability(effortSupported),
+		"image_input":        capabilitySupport(visionSupported),
+		"pdf_input":          capabilitySupport(claudeModel),
+		"structured_outputs": capabilitySupport(boolFromAny(supports["structured_outputs"]) || boolFromAny(caps["structured_outputs"])),
+		"thinking":           anthropicThinkingCapability(thinkingSupported),
+	}
+}
+
+func capabilitySupport(supported bool) map[string]any {
+	return map[string]any{"supported": supported}
+}
+
+func anthropicContextManagementCapability(supported bool) map[string]any {
+	return map[string]any{
+		"supported":                supported,
+		"clear_thinking_20251015":  capabilitySupport(supported),
+		"clear_tool_uses_20250919": capabilitySupport(supported),
+		"compact_20260112":         capabilitySupport(supported),
+	}
+}
+
+func anthropicEffortCapability(supported bool) map[string]any {
+	out := map[string]any{"supported": supported}
+	for _, effort := range supportedReasoningEffortValues() {
+		out[effort] = capabilitySupport(supported)
+	}
+	return out
+}
+
+func anthropicThinkingCapability(supported bool) map[string]any {
+	return map[string]any{
+		"supported": supported,
+		"types": map[string]any{
+			"adaptive": capabilitySupport(supported),
+			"enabled":  capabilitySupport(supported),
+		},
+	}
+}
+
+func (s *server) publicModelData(spec ModelSpec, displayID string, created int64) map[string]any {
+	caps := cloneMap(spec.Capabilities)
+	if caps == nil {
+		caps = map[string]any{}
+	}
+	limits := anyMap(caps["limits"])
+	if limits == nil {
+		limits = map[string]any{}
+	}
+	supports := anyMap(caps["supports"])
+	if supports == nil {
+		supports = map[string]any{}
+	}
+
+	contextTier := firstNonEmpty(
+		resolveContextTier(displayID, s.gw.Settings.ContextTiers),
+		resolveContextTier(spec.ID, s.gw.Settings.ContextTiers),
+	)
+	contextWindow := firstPositiveInt(
+		intFromAny(caps["max_context_window_tokens"], 0),
+		intFromAny(limits["max_context_window_tokens"], 0),
+		intFromAny(caps["context_window"], 0),
+		intFromAny(caps["max_prompt_tokens"], 0),
+		intFromAny(limits["max_prompt_tokens"], 0),
+	)
+	if contextTier == "long_context" {
+		contextWindow = 1000000
+	}
+	if contextWindow > 0 {
+		caps["context_window"] = contextWindow
+		caps["max_context_window_tokens"] = contextWindow
+		caps["max_input_tokens"] = contextWindow
+		caps["max_prompt_tokens"] = contextWindow
+		limits["max_context_window_tokens"] = contextWindow
+		limits["max_input_tokens"] = contextWindow
+		limits["max_prompt_tokens"] = contextWindow
+	}
+
+	maxOutputTokens := firstPositiveInt(
+		intFromAny(caps["max_output_tokens"], 0),
+		intFromAny(limits["max_output_tokens"], 0),
+		intFromAny(caps["output_token_limit"], 0),
+	)
+	if maxOutputTokens > 0 {
+		caps["max_output_tokens"] = maxOutputTokens
+		limits["max_output_tokens"] = maxOutputTokens
+	}
+
+	reasoningEffort := strings.ToLower(firstNonEmpty(
+		resolveReasoningEffort(displayID, s.gw.Settings.ReasoningEfforts),
+		resolveReasoningEffort(spec.ID, s.gw.Settings.ReasoningEfforts),
+		stringFromAny(caps["default_reasoning_effort"]),
+	))
+	supportsReasoningEffort := boolFromAny(caps["supports_reasoning_effort"]) ||
+		boolFromAny(supports["reasoning_effort"]) ||
+		modelLikelySupportsReasoningEffort(spec.ID) ||
+		(reasoningEffort != "" && reasoningEffort != "none")
+	if supportsReasoningEffort {
+		efforts := supportedReasoningEffortValues()
+		caps["supports_reasoning_effort"] = true
+		caps["supports_reasoning"] = true
+		caps["supported_reasoning_efforts"] = efforts
+		caps["reasoning_efforts"] = efforts
+		caps["effort"] = anthropicEffortCapabilities(efforts)
+		caps["thinking"] = map[string]any{
+			"supported": true,
+			"types": map[string]any{
+				"adaptive": map[string]any{"supported": true},
+				"enabled":  map[string]any{"supported": true},
+			},
+		}
+		supports["reasoning_effort"] = true
+		supports["reasoning"] = true
+		if reasoningEffort == "" {
+			reasoningEffort = "medium"
+		}
+		caps["default_reasoning_effort"] = reasoningEffort
+	}
+
+	if contextTier != "" {
+		caps["context_tier"] = contextTier
+		caps["default_context_tier"] = contextTier
+		caps["supported_context_tiers"] = []string{"default", "long_context"}
+	}
+	if contextTier == "long_context" && strings.HasPrefix(strings.ToLower(spec.ID), "claude-") {
+		caps["supported_betas"] = []string{"context-1m-2025-08-07"}
+	}
+	caps["limits"] = limits
+	caps["supports"] = supports
+
+	displayName := firstNonEmpty(stringFromAny(caps["name"]), spec.Name, displayID)
+	ownedBy := publicModelOwner(spec.ID)
+	data := map[string]any{
+		"id":               displayID,
+		"object":           "model",
+		"type":             "model",
+		"name":             displayName,
+		"display_name":     displayName,
+		"created":          created,
+		"created_at":       time.Unix(created, 0).UTC().Format(time.RFC3339),
+		"max_input_tokens": 0,
+		"max_tokens":       0,
+		"owned_by":         ownedBy,
+		"provider":         "github-copilot",
+		"served_by":        "github-copilot",
+		"capabilities":     caps,
+	}
+	if contextWindow > 0 {
+		data["context_window"] = contextWindow
+		data["context_length"] = contextWindow
+		data["max_context_tokens"] = contextWindow
+		data["max_context_window_tokens"] = contextWindow
+		data["max_input_tokens"] = contextWindow
+		data["input_token_limit"] = contextWindow
+		data["max_prompt_tokens"] = contextWindow
+	}
+	if maxOutputTokens > 0 {
+		data["max_tokens"] = maxOutputTokens
+		data["max_output_tokens"] = maxOutputTokens
+		data["output_token_limit"] = maxOutputTokens
+	}
+	if contextTier != "" {
+		data["context_tier"] = contextTier
+		data["default_context_tier"] = contextTier
+		data["supported_context_tiers"] = []string{"default", "long_context"}
+	}
+	if contextTier == "long_context" && strings.HasPrefix(strings.ToLower(spec.ID), "claude-") {
+		data["anthropic_beta"] = []string{"context-1m-2025-08-07"}
+		data["supported_betas"] = []string{"context-1m-2025-08-07"}
+	}
+	if supportsReasoningEffort {
+		efforts := supportedReasoningEffortValues()
+		data["supports_reasoning_effort"] = true
+		data["supports_reasoning"] = true
+		data["reasoning_effort"] = reasoningEffort
+		data["default_reasoning_effort"] = reasoningEffort
+		data["supported_reasoning_efforts"] = efforts
+		data["reasoning_efforts"] = efforts
+		data["reasoning_effort_choices"] = append([]string{"none"}, efforts...)
+		data["supported_parameters"] = []string{"reasoning_effort", "context_tier", "max_tokens", "temperature", "top_p", "tools"}
+	}
+	return data
+}
+
+func supportedReasoningEffortValues() []string {
+	return []string{"low", "medium", "high", "xhigh", "max"}
+}
+
+func anthropicEffortCapabilities(efforts []string) map[string]any {
+	out := map[string]any{"supported": len(efforts) > 0}
+	for _, effort := range efforts {
+		out[effort] = map[string]any{"supported": true}
+	}
+	return out
+}
+
+func modelLikelySupportsReasoningEffort(model string) bool {
+	model = strings.ToLower(model)
+	return strings.HasPrefix(model, "claude-opus-4.") ||
+		strings.HasPrefix(model, "claude-sonnet-4.6") ||
+		strings.HasPrefix(model, "claude-sonnet-4.7") ||
+		strings.HasPrefix(model, "claude-sonnet-4.8") ||
+		strings.HasPrefix(model, "claude-sonnet-4.9") ||
+		strings.HasPrefix(model, "gpt-5.") ||
+		strings.HasPrefix(model, "gpt-6.")
+}
+
+func publicModelOwner(model string) string {
+	model = strings.ToLower(model)
+	switch {
+	case strings.HasPrefix(model, "claude-"):
+		return "anthropic"
+	case strings.HasPrefix(model, "gpt-"):
+		return "openai"
+	case strings.HasPrefix(model, "gemini-"):
+		return "google"
+	default:
+		return "github-copilot"
+	}
+}
+
+func firstPositiveInt(values ...int) int {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func boolFromAny(value any) bool {
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			return true
+		}
+	case float64:
+		return v != 0
+	case int:
+		return v != 0
+	}
+	return false
 }
 
 func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -846,6 +1164,33 @@ func (s *server) adminSetReasoningEfforts(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{"updated": len(payload), "reasoning_efforts": payload}, nil)
 }
 
+func (s *server) adminContextTiers(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, "admin"); !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"context_tiers": s.gw.Settings.ContextTiers}, nil)
+}
+
+func (s *server) adminSetContextTiers(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, "admin"); !ok {
+		return
+	}
+	var payload map[string]string
+	if !decodeJSON(w, r, &payload) {
+		return
+	}
+	for pattern, tier := range payload {
+		tier = strings.ToLower(tier)
+		if !ValidContextTiers[tier] {
+			writeError(w, http.StatusBadRequest, "invalid context tier '"+tier+"' for '"+pattern+"'")
+			return
+		}
+		payload[pattern] = tier
+	}
+	s.gw.Settings.ContextTiers = payload
+	writeJSON(w, http.StatusOK, map[string]any{"updated": len(payload), "context_tiers": payload}, nil)
+}
+
 func (s *server) adminUsage(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.require(w, r, "admin"); !ok {
 		return
@@ -1163,27 +1508,11 @@ func writeAnthropicErrorWithHeaders(w http.ResponseWriter, status int, errorType
 
 func normalizeAnthropicRequestedModel(model string, betaHeader string) string {
 	model = normalizeAnthropicModelAlias(model)
-	if strings.Contains(strings.ToLower(betaHeader), "context-1m") && !strings.HasSuffix(model, "-1m") {
-		model += "-1m"
-	}
 	return model
 }
 
 func normalizeAnthropicModelAlias(model string) string {
-	switch {
-	case strings.HasPrefix(model, "claude-sonnet-4-6-"):
-		return "claude-sonnet-4.6"
-	case strings.HasPrefix(model, "claude-sonnet-4-5-"):
-		return "claude-sonnet-4.5"
-	case strings.HasPrefix(model, "claude-opus-4-6-"):
-		return "claude-opus-4.6"
-	case strings.HasPrefix(model, "claude-opus-4-5-"):
-		return "claude-opus-4.5"
-	case strings.HasPrefix(model, "claude-haiku-4-5-"):
-		return "claude-haiku-4.5"
-	default:
-		return model
-	}
+	return normalizeProviderModelID(model)
 }
 
 func writeStream(w http.ResponseWriter, headers map[string]string, stream <-chan string, cancel context.CancelFunc) {

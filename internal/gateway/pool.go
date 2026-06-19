@@ -373,7 +373,7 @@ func (p *PoolManager) ConfigureRateLimits(config RateLimitConfig) {
 }
 
 func buildBackend(ctx context.Context, cfg *AccountConfig, settings Settings, homeDir string) (Backend, error) {
-	if settings.Backend == "copilot" {
+	if settings.Backend == "copilot" || settings.Backend == "copilot-cli" {
 		token, err := cfg.ResolveToken(ctx, settings.KeyVaultURL)
 		if err != nil {
 			return nil, err
@@ -386,6 +386,9 @@ func buildBackend(ctx context.Context, cfg *AccountConfig, settings Settings, ho
 				os.Getenv("GITHUB_TOKEN"),
 			)
 		}
+		if settings.Backend == "copilot-cli" {
+			return NewCopilotCLIBackendWithOptions(cfg.ID, token, homeDir, copilotCLIBackendOptions(settings.Copilot, cfg)), nil
+		}
 		options, err := copilotBackendOptions(settings.Copilot, cfg)
 		if err != nil {
 			return nil, err
@@ -393,6 +396,25 @@ func buildBackend(ctx context.Context, cfg *AccountConfig, settings Settings, ho
 		return NewCopilotBackendWithOptions(cfg.ID, token, homeDir, options), nil
 	}
 	return NewFakeBackend(cfg.ID, cfg.Models), nil
+}
+
+func copilotCLIBackendOptions(defaults CopilotConfig, cfg *AccountConfig) CopilotCLIBackendOptions {
+	sdkWebSearch := defaults.SDKWebSearch
+	if cfg.CopilotSDKWebSearch != nil {
+		sdkWebSearch = *cfg.CopilotSDKWebSearch
+	}
+	sdkWebSearchMode := defaults.SDKWebSearchMode
+	if cfg.CopilotSDKWebSearchMode != "" {
+		sdkWebSearchMode = cfg.CopilotSDKWebSearchMode
+	}
+	sdkTools := defaults.SDKTools
+	if len(cfg.CopilotSDKTools) > 0 {
+		sdkTools = cfg.CopilotSDKTools
+	}
+	return CopilotCLIBackendOptions{
+		WebSearchMode: normalizeCopilotSDKWebSearchMode(sdkWebSearchMode, sdkWebSearch),
+		CustomTools:   sdkTools,
+	}
 }
 
 func copilotBackendOptions(defaults CopilotConfig, cfg *AccountConfig) (CopilotBackendOptions, error) {

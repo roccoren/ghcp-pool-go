@@ -129,6 +129,14 @@ Choose the Copilot implementation with `GHCP_COPILOT_MODE` or
   `auth_mode` to `oauth` and sends the GitHub OAuth token directly to
   `https://api.githubcopilot.com` unless another Copilot API base URL is set.
 
+Alternatively, set `GHCP_BACKEND=copilot-cli` to use the dedicated CLI backend.
+This backend uses the Copilot SDK exclusively in `ModeCopilotCli` mode, providing
+maximum compatibility with Copilot CLI features. The CLI backend is a
+simplified alternative to the full `copilot` backend that always runs in CLI
+mode without OpenCode fallback. Configuration options like
+`GHCP_COPILOT_SDK_WEB_SEARCH_MODE` and `GHCP_COPILOT_SDK_AVAILABLE_TOOLS` are
+supported.
+
 SDK mode runs the Copilot client in multi-tenant-safe empty mode, so no SDK
 built-in tools are exposed by default. Set `GHCP_COPILOT_SDK_AVAILABLE_TOOLS`
 or `gateway.copilot.sdk_available_tools` for explicit allowlists. For SDK-only
@@ -141,15 +149,76 @@ set `GHCP_COPILOT_SDK_WEB_SEARCH_MODE=native_cli`; this exposes native
 `web_search` through the CLI-mode SDK client, while `web_fetch` is handled by
 the gateway so GitHub blob/raw URLs can be normalized before fetching.
 
-Models that support a long-context tier, such as Copilot-exposed Claude Opus
-variants, can be pinned with request field `context_tier: "long_context"` or
-configured by pattern:
+### Reasoning Effort and Context Tiers
+
+High-capability models automatically get optimal defaults for reasoning effort
+and context tier. These expose their 1M+ token context windows and advanced
+reasoning capabilities without any configuration required.
+
+**Automatic Defaults:**
+- **Claude Opus 4.x**: `reasoning_effort: high`, `context_tier: long_context` (premium quality)
+- **Claude Sonnet 4.6+**: `reasoning_effort: medium`, `context_tier: long_context` (balanced)
+- **GPT-5.x, GPT-6.x**: `reasoning_effort: medium`, `context_tier: long_context` (balanced)
+- **Gemini 3.x/4.x**: `context_tier: long_context` (context only, no reasoning effort)
+
+**Full Reasoning Effort Range:**
+Choose from `none`, `low`, `medium`, `high`, `xhigh` (extra high), `max`:
+- `low` - Fast, basic reasoning for simple tasks
+- `medium` - Balanced performance and quality (default for most models)
+- `high` - Enhanced reasoning for complex problems (default for Opus)
+- `xhigh` - Extra high reasoning for very difficult tasks
+- `max` - Maximum reasoning capability for the most challenging problems
+
+**Override via Config:**
 
 ```yaml
 gateway:
+  reasoning_efforts:
+    "claude-opus-4.*": max         # Maximum reasoning for Opus
+    "claude-sonnet-4.6": high      # Upgrade Sonnet from default "medium"
+    "gpt-5.5": low                 # Faster responses for specific model
   context_tiers:
-    "claude-opus-4.8": long_context
+    "claude-opus-4.8": long_context  # Already defaulted, shown for reference
+    "gpt-5.*": default               # Override to use default context
 ```
+
+**Override per Request:**
+
+```bash
+# Simple task with low reasoning (faster)
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer $GHCP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4.6",
+    "messages": [{"role": "user", "content": "What is 2+2?"}],
+    "reasoning_effort": "low"
+  }'
+
+# Complex analysis with maximum reasoning
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer $GHCP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-opus-4.8",
+    "messages": [{"role": "user", "content": "Design a distributed system..."}],
+    "reasoning_effort": "max",
+    "context_tier": "long_context"
+  }'
+```
+
+Valid `context_tier` values: `default`, `long_context`.
+
+`/v1/models` adapts to the client protocol. OpenAI-style requests get
+compatibility fields such as `context_window`, `max_context_window_tokens`,
+`supported_reasoning_efforts`, and nested `capabilities.limits` /
+`capabilities.supports`. Anthropic-style requests (for example, requests with
+`anthropic-version` or `x-api-key`) get the official Anthropic Models API shape:
+`type`, `display_name`, `created_at`, `max_input_tokens`, `max_tokens`, and
+`capabilities.effort.{low,medium,high,xhigh,max}.supported`. The model list only
+advertises real upstream model IDs plus aliases explicitly configured in
+`gateway.model_aliases`; long context is represented by `max_input_tokens` and
+`context_tier`, not by extra generated model IDs.
 
 For GitHub Enterprise, set `GHCP_GITHUB_ENTERPRISE_URL=<enterprise-domain>`;
 the gateway derives `https://copilot-api.<enterprise-domain>` plus enterprise

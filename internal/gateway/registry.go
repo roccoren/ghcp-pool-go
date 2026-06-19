@@ -208,6 +208,33 @@ func (r *ModelRegistry) VisibleModels() []string {
 	return models
 }
 
+func (r *ModelRegistry) VisibleModelSpecs() []ModelSpec {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	specs := []ModelSpec{}
+	seenModels := map[string]bool{}
+	for model, ids := range r.index {
+		if seenModels[model] {
+			continue
+		}
+		for id, spec := range ids {
+			if account := r.Pool.Get(id); account != nil && account.Enabled {
+				if spec.ModelPickerEnabled != nil && !*spec.ModelPickerEnabled {
+					continue
+				}
+				specs = append(specs, spec)
+				seenModels[model] = true
+				break
+			}
+		}
+	}
+	// Sort by ID for consistent ordering
+	sort.Slice(specs, func(i, j int) bool {
+		return specs[i].ID < specs[j].ID
+	})
+	return specs
+}
+
 func (r *ModelRegistry) RefreshLoop(ctx context.Context, intervalSeconds int) {
 	ticker := time.NewTicker(time.Duration(max(5, intervalSeconds)) * time.Second)
 	defer ticker.Stop()
