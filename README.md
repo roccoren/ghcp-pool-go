@@ -85,9 +85,10 @@ docker run --rm -p 8000:8000 -e GHCP_API_KEY=sk-change-me \
 
 Supported deployment environment overrides include `GHCP_HOST`, `GHCP_PORT`,
 `GHCP_BACKEND`, `GHCP_CACHE_SALT`, `GHCP_USAGE_SQLITE_PATH`,
-`GHCP_MODEL_MAP_PATH`, `GHCP_GLOBAL_RATE_LIMIT_RPM`, and
-`GHCP_PER_ACCOUNT_RATE_LIMIT_RPM`. For Azure Key Vault-backed deployments, set
-`AZURE_KEY_VAULT_URL` plus `GHCP_API_KEY_KEY_VAULT_SECRET` and/or
+`GHCP_USAGE_AZMON_ENDPOINT`, `GHCP_USAGE_AZMON_RULE_ID`,
+`GHCP_USAGE_AZMON_STREAM`, `GHCP_MODEL_MAP_PATH`, `GHCP_GLOBAL_RATE_LIMIT_RPM`,
+and `GHCP_PER_ACCOUNT_RATE_LIMIT_RPM`. For Azure Key Vault-backed deployments,
+set `AZURE_KEY_VAULT_URL` plus `GHCP_API_KEY_KEY_VAULT_SECRET` and/or
 `GHCP_COPILOT_TOKEN_KEY_VAULT_SECRET` to resolve secrets at runtime through
 managed identity. API-key secrets may contain one key or a comma/whitespace
 separated list.
@@ -96,6 +97,81 @@ For Azure Container Apps deployments that keep `GHCP_API_KEY` and
 `GHCP_COPILOT_TOKEN` in Azure Key Vault, including the minimum Azure resource
 list and a private VNet/Private Link stack, see
 [`docs/deploy-containerapp-keyvault.md`](docs/deploy-containerapp-keyvault.md).
+
+### Durable usage persistence (Azure Monitor / Log Analytics)
+
+The gateway records per-request usage in a local SQLite database
+(`GHCP_USAGE_SQLITE_PATH`, default `usage.sqlite`), which powers the admin usage
+endpoints with immediate, consistent reads. In containers, that file is
+ephemeral and is lost on every restart, scale, or redeploy.
+
+To make usage durable across the container lifecycle, set the three
+`GHCP_USAGE_AZMON_*` variables. When all three are present, every usage event is
+*also* streamed to a Log Analytics custom table through the Azure Monitor Logs
+Ingestion API. SQLite stays the fast per-replica read cache; Log Analytics
+becomes the durable, cross-replica record that survives restarts and aggregates
+correctly when multiple replicas run.
+
+| Env var | Purpose |
+| --- | --- |
+| `GHCP_USAGE_AZMON_ENDPOINT` | Data Collection Endpoint logs-ingestion URI, e.g. `https://<dce>.<region>.ingest.monitor.azure.com`. |
+| `GHCP_USAGE_AZMON_RULE_ID` | Data Collection Rule immutable ID, e.g. `dcr-0000…`. |
+| `GHCP_USAGE_AZMON_STREAM` | DCR stream name, e.g. `Custom-UsageEvent`. |
+
+The sink authenticates with the standard Azure credential chain (the
+user-assigned managed identity via `AZURE_CLIENT_ID` in Container Apps) against
+the `https://monitor.azure.com/.default` scope, so no secret is needed. It is
+non-blocking — events are buffered and flushed in batches, and are dropped under
+sustained backpressure rather than slowing request handling. When the variables
+are unset, the sink is a no-op and the gateway behaves exactly as before.
+
+Log Analytics ingestion has a few-minutes latency, so newly written events
+appear in the table after a short delay; the admin endpoints continue to read
+from local SQLite for immediate, consistent results.
+
+The Bicep template
+[`infra/containerapp-keyvault.bicep`](infra/containerapp-keyvault.bicep)
+provisions the full path (Log Analytics workspace, the `UsageEvent_CL` custom
+table, a Data Collection Endpoint, a `Direct` Data Collection Rule, and the
+`Monitoring Metrics Publisher` role for the app identity) and wires the three env
+vars automatically. Manual `az` CLI setup steps are in
+[`docs/deploy-containerapp-keyvault.md`](docs/deploy-containerapp-keyvault.md).
+
+Query the durable usage with Kusto (KQL) against the workspace. Get the
+workspace GUID once, then run any of the examples:
+
+```bash
+WS_GUID=$(az monitor log-analytics workspace show \
+  -g ghcp-pool-rg -n ghcp-usage-law --query customerId -o tsv)
+
+# Grand totals: input/output/cached/total tokens, credits, error count
+az monitor log-analytics query --workspace "$WS_GUID" --analytics-query \
+  "UsageEvent_CL
+   | summarize Calls=count(), InputTokens=sum(InputTokens), OutputTokens=sum(OutputTokens),
+               CachedTokens=sum(CachedTokens), TotalTokens=sum(TotalTokens),
+               Credits=sum(Credits), Errors=countif(Success==false)" -o table
+
+# Cache hit vs miss
+az monitor log-analytics query --workspace "$WS_GUID" --analytics-query \
+  "UsageEvent_CL
+   | summarize Calls=count(), TotalTokens=sum(TotalTokens) by CacheResult
+   | order by Calls desc" -o table
+
+# Per-model token usage
+az monitor log-analytics query --workspace "$WS_GUID" --analytics-query \
+  "UsageEvent_CL
+   | summarize Calls=count(), InputTokens=sum(InputTokens), OutputTokens=sum(OutputTokens),
+               TotalTokens=sum(TotalTokens) by Model
+   | order by TotalTokens desc" -o table
+
+# Per-account token usage and credits
+az monitor log-analytics query --workspace "$WS_GUID" --analytics-query \
+  "UsageEvent_CL
+   | summarize Calls=count(), TotalTokens=sum(TotalTokens), Credits=sum(Credits) by AccountId
+   | order by TotalTokens desc" -o table
+```
+
+Scope any query to a window with `| where TimeGenerated > ago(24h)`.
 
 Useful admin controls:
 

@@ -529,3 +529,141 @@ Key Vault secret references can fail even when RBAC permissions are correct.
 
 For this repository's Azure environment, prefer private endpoint access over
 enabling public Key Vault access.
+
+## Durable usage telemetry (Azure Monitor / Log Analytics)
+
+The gateway keeps per-request usage in a local SQLite file for immediate admin
+reads, but that file is ephemeral in a container. To persist usage across
+restarts and scale events, stream every usage event to a Log Analytics custom
+table through the Azure Monitor Logs Ingestion API, then set three env vars on
+the Container App. SQLite stays the fast read cache; Log Analytics is the
+durable, cross-replica record. See the "Durable usage persistence" section of
+the README for the runtime behavior and KQL query examples.
+
+The Bicep template `infra/containerapp-keyvault.bicep` provisions all of this and
+wires the env vars automatically. The steps below reproduce the same setup with
+the `az` CLI against an existing deployment.
+
+| Azure resource | Minimum shape | Required for |
+| --- | --- | --- |
+| Log Analytics workspace | One workspace (the private stack already creates one for Container Apps logs; a dedicated `ghcp-usage-law` keeps usage data isolated). | Stores the `UsageEvent_CL` custom table. |
+| Custom table | `UsageEvent_CL` with the usage columns. | Destination for usage events. |
+| Data Collection Endpoint | One DCE in the workspace region. | Ingestion endpoint the gateway POSTs to. |
+| Data Collection Rule | One `Direct` DCR with a `Custom-UsageEvent` stream to `UsageEvent_CL`. | Routes and transforms incoming events. |
+| Role assignment | `Monitoring Metrics Publisher` for the app identity at DCR scope. | Lets the managed identity ingest data. |
+
+### 1. Create the workspace and custom table
+
+```bash
+RG=ghcp-pool-rg
+LOCATION=eastus
+LAW=ghcp-usage-law
+
+az monitor log-analytics workspace create \
+  -g "$RG" -n "$LAW" -l "$LOCATION" --sku PerGB2018 --retention-time 30
+
+az monitor log-analytics workspace table create \
+  -g "$RG" --workspace-name "$LAW" -n UsageEvent_CL --retention-time 30 \
+  --columns \
+    TimeGenerated=datetime AccountId=string Model=string ApiEndpoint=string \
+    InputTokens=long OutputTokens=long CachedTokens=long TotalTokens=long \
+    Credits=real DurationMs=long CacheResult=string Success=boolean ErrorType=string
+```
+
+### 2. Create the Data Collection Endpoint and Rule
+
+```bash
+az extension add -n monitor-control-service -y
+
+az monitor data-collection endpoint create \
+  -g "$RG" -n ghcp-usage-dce -l "$LOCATION" --public-network-access Enabled
+
+DCE_ID=$(az monitor data-collection endpoint show -g "$RG" -n ghcp-usage-dce --query id -o tsv)
+WS_ID=$(az monitor log-analytics workspace show -g "$RG" -n "$LAW" --query id -o tsv)
+
+cat > /tmp/ghcp-usage-dcr.json <<JSON
+{
+  "dataCollectionEndpointId": "${DCE_ID}",
+  "streamDeclarations": {
+    "Custom-UsageEvent": {
+      "columns": [
+        { "name": "TimeGenerated", "type": "datetime" },
+        { "name": "AccountId", "type": "string" },
+        { "name": "Model", "type": "string" },
+        { "name": "ApiEndpoint", "type": "string" },
+        { "name": "InputTokens", "type": "long" },
+        { "name": "OutputTokens", "type": "long" },
+        { "name": "CachedTokens", "type": "long" },
+        { "name": "TotalTokens", "type": "long" },
+        { "name": "Credits", "type": "real" },
+        { "name": "DurationMs", "type": "long" },
+        { "name": "CacheResult", "type": "string" },
+        { "name": "Success", "type": "boolean" },
+        { "name": "ErrorType", "type": "string" }
+      ]
+    }
+  },
+  "destinations": {
+    "logAnalytics": [
+      { "workspaceResourceId": "${WS_ID}", "name": "ghcpUsageWorkspace" }
+    ]
+  },
+  "dataFlows": [
+    {
+      "streams": [ "Custom-UsageEvent" ],
+      "destinations": [ "ghcpUsageWorkspace" ],
+      "transformKql": "source",
+      "outputStream": "Custom-UsageEvent_CL"
+    }
+  ]
+}
+JSON
+
+az monitor data-collection rule create \
+  -g "$RG" -n ghcp-usage-dcr -l "$LOCATION" \
+  --rule-file /tmp/ghcp-usage-dcr.json --kind Direct
+```
+
+### 3. Grant the app identity ingestion rights
+
+```bash
+DCR_ID=$(az monitor data-collection rule show -g "$RG" -n ghcp-usage-dcr --query id -o tsv)
+
+# Principal ID of the app's user-assigned managed identity.
+PRINCIPAL_ID=$(az containerapp show -g "$RG" -n "$APP" \
+  --query "identity.userAssignedIdentities.*.principalId | [0]" -o tsv)
+
+az role assignment create \
+  --assignee-object-id "$PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Monitoring Metrics Publisher" \
+  --scope "$DCR_ID"
+```
+
+### 4. Wire the env vars and restart
+
+```bash
+DCE_URI=$(az monitor data-collection endpoint show -g "$RG" -n ghcp-usage-dce \
+  --query properties.logsIngestion.endpoint -o tsv)
+DCR_IMMUTABLE=$(az monitor data-collection rule show -g "$RG" -n ghcp-usage-dcr \
+  --query immutableId -o tsv)
+
+az containerapp update -g "$RG" -n "$APP" --set-env-vars \
+  "GHCP_USAGE_AZMON_ENDPOINT=$DCE_URI" \
+  "GHCP_USAGE_AZMON_RULE_ID=$DCR_IMMUTABLE" \
+  "GHCP_USAGE_AZMON_STREAM=Custom-UsageEvent"
+```
+
+Ingestion has a few-minutes latency. After the app serves traffic, confirm rows
+arrive:
+
+```bash
+WS_GUID=$(az monitor log-analytics workspace show -g "$RG" -n "$LAW" --query customerId -o tsv)
+
+az monitor log-analytics query --workspace "$WS_GUID" --analytics-query \
+  "UsageEvent_CL | sort by TimeGenerated desc | take 10" -o table
+```
+
+Deleting rows from a Log Analytics custom table uses the management `/purge`
+REST API (there is no row-level delete in KQL); the operation is asynchronous.
+

@@ -86,10 +86,15 @@ var appIdentityName = '${namePrefix}-mi'
 var appName = '${namePrefix}-app'
 var privateEndpointName = '${namePrefix}-kv-pe'
 var privateDnsZoneName = 'privatelink.vaultcore.azure.net'
+var usageTableName = 'UsageEvent_CL'
+var usageStreamName = 'Custom-UsageEvent'
+var usageDceName = '${namePrefix}-usage-dce'
+var usageDcrName = '${namePrefix}-usage-dcr'
 var resourceTags = union(tags, {
   workload: 'ghcp-pool-go'
 })
 var keyVaultSecretsUserRoleDefinitionId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
+var monitoringMetricsPublisherRoleDefinitionId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '3913510d-42f4-4e42-8a64-420c390055eb')
 
 resource vnet 'Microsoft.Network/virtualNetworks@2023-11-01' = {
   name: vnetName
@@ -165,6 +170,105 @@ resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
       name: 'PerGB2018'
     }
     retentionInDays: 30
+  }
+}
+
+resource usageTable 'Microsoft.OperationalInsights/workspaces/tables@2022-10-01' = {
+  parent: logAnalytics
+  name: usageTableName
+  properties: {
+    schema: {
+      name: usageTableName
+      columns: [
+        { name: 'TimeGenerated', type: 'datetime' }
+        { name: 'AccountId', type: 'string' }
+        { name: 'Model', type: 'string' }
+        { name: 'ApiEndpoint', type: 'string' }
+        { name: 'InputTokens', type: 'long' }
+        { name: 'OutputTokens', type: 'long' }
+        { name: 'CachedTokens', type: 'long' }
+        { name: 'TotalTokens', type: 'long' }
+        { name: 'Credits', type: 'real' }
+        { name: 'DurationMs', type: 'long' }
+        { name: 'CacheResult', type: 'string' }
+        { name: 'Success', type: 'boolean' }
+        { name: 'ErrorType', type: 'string' }
+      ]
+    }
+    retentionInDays: 30
+  }
+}
+
+resource usageDce 'Microsoft.Insights/dataCollectionEndpoints@2023-03-11' = {
+  name: usageDceName
+  location: location
+  tags: resourceTags
+  properties: {
+    networkAcls: {
+      publicNetworkAccess: 'Enabled'
+    }
+  }
+}
+
+resource usageDcr 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
+  name: usageDcrName
+  location: location
+  tags: resourceTags
+  kind: 'Direct'
+  properties: {
+    dataCollectionEndpointId: usageDce.id
+    streamDeclarations: {
+      'Custom-UsageEvent': {
+        columns: [
+          { name: 'TimeGenerated', type: 'datetime' }
+          { name: 'AccountId', type: 'string' }
+          { name: 'Model', type: 'string' }
+          { name: 'ApiEndpoint', type: 'string' }
+          { name: 'InputTokens', type: 'long' }
+          { name: 'OutputTokens', type: 'long' }
+          { name: 'CachedTokens', type: 'long' }
+          { name: 'TotalTokens', type: 'long' }
+          { name: 'Credits', type: 'real' }
+          { name: 'DurationMs', type: 'long' }
+          { name: 'CacheResult', type: 'string' }
+          { name: 'Success', type: 'boolean' }
+          { name: 'ErrorType', type: 'string' }
+        ]
+      }
+    }
+    destinations: {
+      logAnalytics: [
+        {
+          workspaceResourceId: logAnalytics.id
+          name: 'ghcpUsageWorkspace'
+        }
+      ]
+    }
+    dataFlows: [
+      {
+        streams: [
+          'Custom-UsageEvent'
+        ]
+        destinations: [
+          'ghcpUsageWorkspace'
+        ]
+        transformKql: 'source'
+        outputStream: 'Custom-UsageEvent_CL'
+      }
+    ]
+  }
+  dependsOn: [
+    usageTable
+  ]
+}
+
+resource usageDcrMetricsPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(usageDcr.id, appIdentity.id, 'Monitoring Metrics Publisher')
+  scope: usageDcr
+  properties: {
+    roleDefinitionId: monitoringMetricsPublisherRoleDefinitionId
+    principalId: appIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 
@@ -342,6 +446,18 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
               name: 'GHCP_COPILOT_TOKEN_KEY_VAULT_SECRET'
               value: copilotTokenSecretName
             }
+            {
+              name: 'GHCP_USAGE_AZMON_ENDPOINT'
+              value: usageDce.properties.logsIngestion.endpoint
+            }
+            {
+              name: 'GHCP_USAGE_AZMON_RULE_ID'
+              value: usageDcr.properties.immutableId
+            }
+            {
+              name: 'GHCP_USAGE_AZMON_STREAM'
+              value: usageStreamName
+            }
           ]
           resources: {
             cpu: json(containerCpu)
@@ -360,6 +476,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
     copilotTokenSecret
     keyVaultPrivateDnsZoneGroup
     keyVaultSecretsUser
+    usageDcrMetricsPublisher
   ]
 }
 
@@ -369,3 +486,8 @@ output keyVaultName string = keyVault.name
 output keyVaultUri string = keyVault.properties.vaultUri
 output userAssignedIdentityClientId string = appIdentity.properties.clientId
 output virtualNetworkName string = vnet.name
+output logAnalyticsWorkspaceName string = logAnalytics.name
+output usageTableName string = usageTableName
+output usageIngestionEndpoint string = usageDce.properties.logsIngestion.endpoint
+output usageDataCollectionRuleImmutableId string = usageDcr.properties.immutableId
+output usageStreamName string = usageStreamName
