@@ -209,18 +209,51 @@ ghcp_errors_total %d
 type Meter struct {
 	store   *UsageStore
 	metrics *Metrics
+	sink    UsageSink
 }
 
-func NewMeter(store *UsageStore, metrics *Metrics) *Meter {
-	return &Meter{store: store, metrics: metrics}
+func NewMeter(store *UsageStore, metrics *Metrics, sink UsageSink) *Meter {
+	if sink == nil {
+		sink = noopSink{}
+	}
+	return &Meter{store: store, metrics: metrics, sink: sink}
 }
 
 func (m *Meter) Observe(accountID *string, model string, usage Usage, cacheResult string, success bool, errorType string) {
 	if cacheResult == "hit" && usage.Credits != 0 {
 		usage.Credits = 0
 	}
+	usage = usage.Normalized()
 	_ = m.store.Record(accountID, model, usage, cacheResult, success, errorType)
+	m.sink.Emit(usageRecordFrom(accountID, model, usage, cacheResult, success, errorType))
 	m.metrics.Observe(success)
+}
+
+// Close releases the durable usage sink, flushing any buffered events.
+func (m *Meter) Close() error {
+	return m.sink.Close()
+}
+
+func usageRecordFrom(accountID *string, model string, usage Usage, cacheResult string, success bool, errorType string) UsageRecord {
+	account := ""
+	if accountID != nil {
+		account = *accountID
+	}
+	return UsageRecord{
+		TS:           nowUnix(),
+		AccountID:    account,
+		Model:        model,
+		APIEndpoint:  usage.APIEndpoint,
+		InputTokens:  usage.InputTokens,
+		OutputTokens: usage.OutputTokens,
+		CachedTokens: usage.CachedTokens,
+		TotalTokens:  usage.TotalTokens,
+		Credits:      usage.Credits,
+		DurationMS:   usage.DurationMS,
+		CacheResult:  cacheResult,
+		Success:      success,
+		ErrorType:    errorType,
+	}
 }
 
 func usageWhere(q UsageQuery) (string, []any) {

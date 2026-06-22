@@ -16,6 +16,7 @@ type Gateway struct {
 	Router        *Router
 	Cache         *CacheLayer
 	UsageStore    *UsageStore
+	UsageSink     UsageSink
 	Metrics       *Metrics
 	Meter         *Meter
 	LoginManager  *LoginManager
@@ -41,6 +42,11 @@ func NewGateway(settings Settings) (*Gateway, error) {
 	if err != nil {
 		return nil, err
 	}
+	sink, err := newUsageSink(settings.Usage.AzureMonitor)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 	metrics := &Metrics{}
 	gw := &Gateway{
 		Settings:      settings,
@@ -49,8 +55,9 @@ func NewGateway(settings Settings) (*Gateway, error) {
 		Router:        NewRouter(pool, registry, settings.Routes),
 		Cache:         NewCacheLayer(settings.Cache),
 		UsageStore:    store,
+		UsageSink:     sink,
 		Metrics:       metrics,
-		Meter:         NewMeter(store, metrics),
+		Meter:         NewMeter(store, metrics, sink),
 		Authenticator: authenticator,
 		Responses:     NewResponseStore(),
 	}
@@ -74,6 +81,7 @@ func (g *Gateway) Shutdown() {
 		g.refreshCancel()
 	}
 	g.Pool.Close()
+	_ = g.Meter.Close()
 	_ = g.UsageStore.Close()
 }
 

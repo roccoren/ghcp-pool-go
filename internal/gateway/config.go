@@ -165,7 +165,8 @@ type CacheConfig struct {
 func (c CacheConfig) enabled() bool { return c.Enabled == nil || *c.Enabled }
 
 type UsageConfig struct {
-	SQLitePath string `yaml:"sqlite_path" json:"sqlite_path"`
+	SQLitePath   string             `yaml:"sqlite_path" json:"sqlite_path"`
+	AzureMonitor AzureMonitorConfig `yaml:"azure_monitor" json:"azure_monitor"`
 }
 
 type DebugConfig struct {
@@ -420,6 +421,9 @@ func LoadSettings(path string) (Settings, error) {
 	}
 	settings.Cache.Salt = firstNonEmpty(os.Getenv("GHCP_CACHE_SALT"), settings.Cache.Salt, "change-me")
 	settings.Usage.SQLitePath = firstNonEmpty(os.Getenv("GHCP_USAGE_SQLITE_PATH"), settings.Usage.SQLitePath, "usage.sqlite")
+	settings.Usage.AzureMonitor.Endpoint = firstNonEmpty(os.Getenv("GHCP_USAGE_AZMON_ENDPOINT"), settings.Usage.AzureMonitor.Endpoint)
+	settings.Usage.AzureMonitor.RuleID = firstNonEmpty(os.Getenv("GHCP_USAGE_AZMON_RULE_ID"), settings.Usage.AzureMonitor.RuleID)
+	settings.Usage.AzureMonitor.Stream = firstNonEmpty(os.Getenv("GHCP_USAGE_AZMON_STREAM"), settings.Usage.AzureMonitor.Stream)
 	settings.Login.ClientID = firstNonEmpty(os.Getenv("GHCP_LOGIN_CLIENT_ID"), settings.Login.ClientID, defaultCopilotOAuthClientID)
 	settings.Copilot.Mode = normalizeCopilotBackendMode(settings.Copilot.Mode)
 	if !ValidCopilotBackendModes[settings.Copilot.Mode] {
