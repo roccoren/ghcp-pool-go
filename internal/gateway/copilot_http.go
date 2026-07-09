@@ -63,10 +63,22 @@ var copilotHTTPClient = &http.Client{
 var sdkWebHTTPClient = &http.Client{Timeout: 20 * time.Second}
 
 var (
-	ddgResultRE    = regexp.MustCompile(`(?is)<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>`)
-	ddgSnippetRE   = regexp.MustCompile(`(?is)<a[^>]+class="result__snippet"[^>]*>(.*?)</a>`)
-	bingResultRE   = regexp.MustCompile(`(?is)<li class="b_algo".*?<a href="([^"]+)"[^>]*>(.*?)</a>.*?(?:<p>(.*?)</p>)?`)
-	htmlTagStripRE = regexp.MustCompile(`(?is)<[^>]+>`)
+	ddgResultRE               = regexp.MustCompile(`(?is)<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>`)
+	ddgSnippetRE              = regexp.MustCompile(`(?is)<a[^>]+class="result__snippet"[^>]*>(.*?)</a>`)
+	bingResultRE              = regexp.MustCompile(`(?is)<li class="b_algo".*?<a href="([^"]+)"[^>]*>(.*?)</a>.*?(?:<p>(.*?)</p>)?`)
+	htmlTagStripRE            = regexp.MustCompile(`(?is)<[^>]+>`)
+	copilotSDKClientForParams = func(b *CopilotBackend, ctx context.Context, params map[string]any) (*sdk.Client, func(), error) {
+		return b.sdkForParams(ctx, params)
+	}
+	copilotSDKCreateSession = func(client *sdk.Client, ctx context.Context, cfg *sdk.SessionConfig) (*sdk.Session, error) {
+		return client.CreateSession(ctx, cfg)
+	}
+	copilotSDKDisconnectSession = func(session *sdk.Session) {
+		if session != nil {
+			session.Disconnect()
+		}
+	}
+	copilotSDKStreamSession = streamSDKSession
 )
 
 var copilotModelListFallbackBaseURLs = []string{
@@ -924,29 +936,29 @@ func mergeSDKUsage(base, next Usage) Usage {
 }
 
 func (b *CopilotBackend) chatStreamSDK(ctx context.Context, model string, messages []NeutralMessage, params map[string]any) (<-chan StreamItem, error) {
-	result, err := b.chatSDK(ctx, model, messages, params, false)
-	if err != nil {
-		return nil, err
-	}
-	out := make(chan StreamItem)
+	prompt := b.sdkPrompt(messages, params)
+	endpoint := sdkUsageEndpoint(params)
+	raw := make(chan StreamItem)
 	go func() {
-		defer close(out)
-		if result.Content != "" {
-			select {
-			case out <- StreamItem{Kind: "delta", Text: result.Content}:
-			case <-ctx.Done():
-				emitStreamItem(context.Background(), out, StreamItem{Kind: "error", Err: ctx.Err()})
-				return
-			}
+		defer close(raw)
+
+		client, cleanup, err := copilotSDKClientForParams(b, ctx, params)
+		if err != nil {
+			emitStreamItem(ctx, raw, StreamItem{Kind: "error", Err: fmt.Errorf("sdk backend: create sdk client: %w", err)})
+			return
 		}
-		for i, tc := range result.ToolCalls {
-			if !emitStreamItem(ctx, out, StreamItem{Kind: "tool_call", ToolCall: tc, Index: i}) {
-				return
-			}
+		defer cleanup()
+
+		session, err := copilotSDKCreateSession(client, ctx, b.sdkSessionConfig(model, params, true))
+		if err != nil {
+			emitStreamItem(ctx, raw, StreamItem{Kind: "error", Err: fmt.Errorf("sdk backend: create sdk session: %w", err)})
+			return
 		}
-		emitStreamItem(ctx, out, StreamItem{Kind: "done", Usage: result.Usage, FinishReason: result.FinishReason})
+		defer copilotSDKDisconnectSession(session)
+
+		copilotSDKStreamSession(ctx, session, prompt, endpoint, raw)
 	}()
-	return out, nil
+	return applyStreamOutputConstraints(ctx, raw, params), nil
 }
 
 func (b *CopilotBackend) sdkPrompt(messages []NeutralMessage, params map[string]any) string {
