@@ -1299,6 +1299,15 @@ func TestCopilotSDKModeEmptyModelListFails(t *testing.T) {
 	}
 }
 
+func TestCopilotEndpointHeuristicMatchesOpenCodeProvider(t *testing.T) {
+	if !copilotPrefersResponses("gpt-5") || !copilotPrefersResponses("gpt-5.1-codex") {
+		t.Fatalf("expected gpt-5 class models to prefer responses")
+	}
+	if copilotPrefersResponses("gpt-5-mini") || copilotPrefersResponses("gpt-5-mini-2025-08-07") || copilotPrefersResponses("gpt-4.1") {
+		t.Fatalf("expected mini/older models to stay chat-first")
+	}
+}
+
 func TestCopilotSDKModeBestEffortRequestsWithoutHTTP(t *testing.T) {
 	oldClient := copilotHTTPClient
 	defer func() { copilotHTTPClient = oldClient }()
