@@ -546,6 +546,20 @@ func TestEmbeddingsUnsupportedUnderSDKReturns501(t *testing.T) {
 	}
 }
 
+func TestEmbeddingsReturns501UnderSDKCLIBackend(t *testing.T) {
+	gw, h := testServer(t)
+	gw.Settings.Backend = "copilot-cli"
+
+	resp := request(t, h, "POST", "/v1/embeddings", map[string]any{
+		"model": "gpt-4.1",
+		"input": []string{"hello"},
+	}, userHeaders)
+
+	if resp.Code != http.StatusNotImplemented {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
 func TestLoginManagerUsesAccountEnterpriseURLs(t *testing.T) {
 	settings := testSettings()
 	pool, err := NewPoolManager(settings)

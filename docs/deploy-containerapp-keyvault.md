@@ -178,6 +178,8 @@ export GHCP_API_KEY_VALUE="sk-$(openssl rand -hex 24)"
 Use the currently logged-in GitHub CLI token for Copilot, after verifying that
 it can be exchanged for a Copilot token:
 
+Manual one-off token-validity check during setup — the gateway itself never calls this endpoint; it delegates all Copilot access to the SDK/CLI.
+
 ```bash
 export GHCP_COPILOT_TOKEN_VALUE="$(gh auth token)"
 
@@ -350,6 +352,8 @@ USER_A_SECRET_NAME=ghcp-copilot-token-user-a
 
 # Do not echo this value.
 export USER_A_GH_TOKEN="<user-a-github-token>"
+
+# Manual one-off token-validity check during setup — the gateway itself never calls this endpoint; it delegates all Copilot access to the SDK/CLI.
 
 curl -fsS \
   -H "Authorization: Bearer $USER_A_GH_TOKEN" \
@@ -666,4 +670,3 @@ az monitor log-analytics query --workspace "$WS_GUID" --analytics-query \
 
 Deleting rows from a Log Analytics custom table uses the management `/purge`
 REST API (there is no row-level delete in KQL); the operation is asynchronous.
-
