@@ -210,13 +210,25 @@ func TestStreamResponsesFromNeutralItems(t *testing.T) {
 	assertStringValue(t, created, "status", "in_progress")
 	outputItem := mustAnyMap(t, frames[indexes["response.output_item.done"]].payload["item"], "response.output_item.done.item")
 	assertStringValue(t, outputItem, "type", "message")
+	completedText := frames[indexes["response.output_text.done"]].payload["text"]
 	completed := mustAnyMap(t, frames[indexes["response.completed"]].payload["response"], "response.completed.response")
 	assertStringValue(t, completed, "status", "completed")
 	assertStringValue(t, completed, "stop_reason", "stop")
 	output := mustAnySlice(t, completed["output"], "response.completed.output")
-	if len(output) == 0 {
+	if len(output) != 1 {
 		t.Fatalf("output=%v", output)
 	}
+	completedItem := mustAnyMap(t, output[0], "response.completed.output[0]")
+	assertStringValue(t, completedItem, "type", "message")
+	assertStringValue(t, completedItem, "status", "completed")
+	assertStringValue(t, completedItem, "role", "assistant")
+	completedContent := mustAnySlice(t, completedItem["content"], "response.completed.output[0].content")
+	if len(completedContent) != 1 {
+		t.Fatalf("content=%v", completedContent)
+	}
+	completedPart := mustAnyMap(t, completedContent[0], "response.completed.output[0].content[0]")
+	assertStringValue(t, completedPart, "type", "output_text")
+	assertStringValue(t, completedPart, "text", completedText.(string))
 }
 
 func frameIndexesByEvent(t *testing.T, frames []sseFrame, names []string) map[string]int {
