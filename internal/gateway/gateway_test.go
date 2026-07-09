@@ -481,6 +481,24 @@ func TestLoadSettingsSDKWebSearchAndToolsFlags(t *testing.T) {
 	}
 }
 
+func TestLoadSettingsDerivesEnterpriseCopilotProviderURLs(t *testing.T) {
+	t.Setenv("GHCP_MODEL_MAP_PATH", ":memory:")
+	t.Setenv("GHCP_GITHUB_ENTERPRISE_URL", "https://ghe.example.com/org")
+	settings, err := LoadSettings("/does/not/exist.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.Copilot.EnterpriseURL != "ghe.example.com" {
+		t.Fatalf("enterprise=%q", settings.Copilot.EnterpriseURL)
+	}
+	if settings.Copilot.BaseURL != "https://copilot-api.ghe.example.com" {
+		t.Fatalf("base url=%q", settings.Copilot.BaseURL)
+	}
+	if settings.Login.DeviceCodeURL != "https://ghe.example.com/login/device/code" || settings.Login.TokenURL != "https://ghe.example.com/login/oauth/access_token" {
+		t.Fatalf("login urls=%q %q", settings.Login.DeviceCodeURL, settings.Login.TokenURL)
+	}
+}
+
 func TestCopilotBackendOptionsAllowPerAccountSDKWebSearchOverride(t *testing.T) {
 	enabled := true
 	options, err := copilotBackendOptions(CopilotConfig{
@@ -1329,6 +1347,86 @@ func TestCopilotSDKModeBestEffortRequestsWithoutHTTP(t *testing.T) {
 	}
 }
 
+func TestSDKEligibilityRequiresSinglePlainUserMessage(t *testing.T) {
+	backend := NewCopilotBackend("acct", "gh-token", "")
+	if !backend.canUseSDK([]NeutralMessage{{Role: "user", Content: "hello"}}, map[string]any{}) {
+		t.Fatalf("single plain user prompt should be SDK-eligible")
+	}
+	if !backend.canUseSDK([]NeutralMessage{{Role: "system", Content: "rules"}, {Role: "user", Content: "hello"}}, map[string]any{}) {
+		t.Fatalf("roleful chat should be SDK-eligible via prompt folding")
+	}
+	if !backend.canUseSDK([]NeutralMessage{{Role: "user", Content: "hello"}}, map[string]any{"temperature": 0.1}) {
+		t.Fatalf("sampling params should be SDK-eligible best-effort")
+	}
+	if !backend.canUseSDK([]NeutralMessage{{Role: "assistant", ToolCalls: []map[string]any{{"id": "call_1", "name": "lookup", "arguments": "{}"}}}, {Role: "tool", ToolCallID: "call_1", Content: "ok"}}, map[string]any{"tools": []map[string]any{{"type": "function", "name": "lookup"}}}) {
+		t.Fatalf("tool call replay should be SDK-eligible via prompt folding")
+	}
+	toolParams := map[string]any{"tools": []map[string]any{
+		{"type": "function", "name": "lookup", "description": "Lookup", "parameters": map[string]any{"type": "object"}},
+		{"type": "web_search_preview", "search_context_size": "low"},
+	}}
+	cfg := backend.sdkSessionConfig("gpt-4.1", toolParams, false)
+	if len(cfg.Tools) != 1 || cfg.Tools[0].Name != "lookup" {
+		t.Fatalf("sdk custom tools=%v", cfg.Tools)
+	}
+	if strings.Join(cfg.AvailableTools, ",") != "lookup" {
+		t.Fatalf("request tools should be available to SDK, got %v", cfg.AvailableTools)
+	}
+	cliWeb := NewCopilotBackendWithOptions("acct", "gh-token", "", CopilotBackendOptions{SDKWebSearchMode: "cli"})
+	cfg = cliWeb.sdkSessionConfig("gpt-4.1", toolParams, false)
+	if strings.Join(cfg.AvailableTools, ",") != "ghcp_web_search,ghcp_web_fetch,ghcp_report_intent,lookup" {
+		t.Fatalf("cli web search tools=%v", cfg.AvailableTools)
+	}
+	if !cliWeb.useSDKCLIWebSearch(toolParams) {
+		t.Fatalf("expected cli web search path")
+	}
+	if !strings.Contains(cliWeb.sdkPrompt([]NeutralMessage{{Role: "user", Content: "search"}}, toolParams), "ghcp_web_search") {
+		t.Fatalf("expected controlled cli web prompt")
+	}
+	nativeWeb := NewCopilotBackendWithOptions("acct", "gh-token", "", CopilotBackendOptions{SDKWebSearchMode: "native_cli"})
+	cfg = nativeWeb.sdkSessionConfig("gpt-4.1", toolParams, false)
+	if len(cfg.Tools) != 2 || cfg.Tools[0].Name != "web_fetch" || cfg.Tools[1].Name != "lookup" {
+		t.Fatalf("native cli custom tools=%v", cfg.Tools)
+	}
+	if strings.Join(cfg.AvailableTools, ",") != "builtin:web_search,web_fetch,lookup" {
+		t.Fatalf("native cli web search tools=%v", cfg.AvailableTools)
+	}
+	if cfg.OnPermissionRequest == nil {
+		t.Fatalf("native cli web search should approve allowed native web tool permissions")
+	}
+	if !nativeWeb.useSDKCLIWebSearch(toolParams) || !nativeWeb.useSDKNativeCLIWebSearch(toolParams) || nativeWeb.useSDKControlledCLIWebSearch(toolParams) {
+		t.Fatalf("expected native cli web search path")
+	}
+	if !isSDKNativeWebTool("web_fetch") || !isSDKNativeWebTool("builtin:web_search") || isSDKNativeWebTool("lookup") {
+		t.Fatalf("native web tool filter mismatch")
+	}
+	if !strings.Contains(nativeWeb.sdkPrompt([]NeutralMessage{{Role: "user", Content: "search"}}, toolParams), "native web_search") {
+		t.Fatalf("expected native cli web prompt")
+	}
+	cfg = backend.sdkSessionConfig("gpt-4.1", map[string]any{}, false)
+	if cfg.AvailableTools == nil || len(cfg.AvailableTools) != 0 {
+		t.Fatalf("empty SDK tool allowlist must be explicit, got %#v", cfg.AvailableTools)
+	}
+	withSearch := NewCopilotBackendWithOptions("acct", "gh-token", "", CopilotBackendOptions{SDKWebSearch: true})
+	cfg = withSearch.sdkSessionConfig("gpt-4.1", map[string]any{}, false)
+	if strings.Join(cfg.AvailableTools, ",") != "web_search" {
+		t.Fatalf("available tools=%v", cfg.AvailableTools)
+	}
+	cfg = withSearch.sdkSessionConfig("gpt-4.1", map[string]any{"tool_choice": "none", "tools": []map[string]any{{"type": "web_search_preview"}}}, false)
+	if len(cfg.AvailableTools) != 0 || len(cfg.Tools) != 0 {
+		t.Fatalf("tool_choice none should disable SDK tools, available=%v custom=%v", cfg.AvailableTools, cfg.Tools)
+	}
+	withTools := NewCopilotBackendWithOptions("acct", "gh-token", "", CopilotBackendOptions{SDKWebSearch: true, SDKTools: []string{"view", "web_search", "view"}})
+	cfg = withTools.sdkSessionConfig("gpt-4.1", map[string]any{}, false)
+	if strings.Join(cfg.AvailableTools, ",") != "view,web_search" {
+		t.Fatalf("available tools=%v", cfg.AvailableTools)
+	}
+	cfg = backend.sdkSessionConfig("claude-opus-4.8", map[string]any{"context_tier": "long_context"}, false)
+	if cfg.ContextTier != sdk.ContextTierLongContext {
+		t.Fatalf("context tier=%q", cfg.ContextTier)
+	}
+}
+
 func TestCopilotSDKModeAcceptsToolRequestsWithoutDirectHTTP(t *testing.T) {
 	oldClient := copilotHTTPClient
 	defer func() { copilotHTTPClient = oldClient }()
@@ -1632,5 +1730,50 @@ func TestRateLimits(t *testing.T) {
 	updated := request(t, h, "PUT", "/admin/rate-limits", map[string]any{"global_rpm": 10, "per_account_rpm": 5}, adminHeaders)
 	if updated.Code != 200 {
 		t.Fatal(updated.Body.String())
+	}
+}
+
+func TestUsageAndUsers(t *testing.T) {
+	gw, h := testServer(t)
+	request(t, h, "POST", "/v1/chat/completions", chatBody("gpt-4.1", "credit one"), userHeaders)
+	request(t, h, "POST", "/v1/chat/completions", chatBody("gpt-4.1", "credit one"), userHeaders)
+	usage := decodeBody(t, request(t, h, "GET", "/admin/usage?model=gpt-4.1", nil, adminHeaders))
+	credits := usage["credits"].(float64)
+	if usage["calls"].(float64) != 2 || credits < 0.009 || credits > 0.011 {
+		t.Fatalf("usage=%v", usage)
+	}
+	created := request(t, h, "POST", "/admin/users", map[string]any{"id": "u_alice", "models": []string{"gpt-4.1"}}, adminHeaders)
+	if created.Code != 200 {
+		t.Fatal(created.Body.String())
+	}
+	models := decodeBody(t, request(t, h, "GET", "/admin/users/u_alice/models", nil, adminHeaders))
+	if models["models"].([]any)[0] != "gpt-4.1" {
+		t.Fatalf("models=%v", models)
+	}
+	overrides := request(t, h, "POST", "/admin/users", map[string]any{
+		"id":                          "u_copilot",
+		"models":                      []string{"gpt-4.1"},
+		"copilot_mode":                "sdk",
+		"copilot_auth_mode":           "oauth",
+		"copilot_sdk_web_search":      true,
+		"copilot_sdk_available_tools": []string{"web_search", "view"},
+		"github_enterprise_url":       "https://ghe.example.com/org",
+	}, adminHeaders)
+	if overrides.Code != 200 {
+		t.Fatal(overrides.Body.String())
+	}
+	cfg := gw.Pool.Get("u_copilot").Config
+	if cfg.CopilotMode != "sdk" || cfg.CopilotAuthMode != "oauth" {
+		t.Fatalf("copilot overrides=%+v", cfg)
+	}
+	if cfg.CopilotSDKWebSearch == nil || !*cfg.CopilotSDKWebSearch || strings.Join(cfg.CopilotSDKTools, ",") != "web_search,view" {
+		t.Fatalf("sdk overrides=%+v tools=%v", cfg.CopilotSDKWebSearch, cfg.CopilotSDKTools)
+	}
+	if cfg.GitHubEnterpriseURL != "https://ghe.example.com/org" {
+		t.Fatalf("enterprise=%q", cfg.GitHubEnterpriseURL)
+	}
+	deleted := request(t, h, "DELETE", "/admin/users/u_alice", nil, adminHeaders)
+	if deleted.Code != 200 {
+		t.Fatalf("delete=%d %s", deleted.Code, deleted.Body.String())
 	}
 }
