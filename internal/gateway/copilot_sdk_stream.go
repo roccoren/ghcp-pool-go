@@ -71,16 +71,8 @@ func streamSDKSession(ctx context.Context, session *sdk.Session, prompt, endpoin
 		abortCtx, abortCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = session.Abort(abortCtx)
 		abortCancel()
-		select {
-		case <-idleCh:
-			return
-		case err := <-errCh:
-			emitStreamItem(ctx, out, StreamItem{Kind: "error", Err: err})
-			return
-		case <-ctx.Done():
-			emitStreamItem(context.Background(), out, StreamItem{Kind: "error", Err: fmt.Errorf("stream sdk session: %w", ctx.Err())})
-			return
-		}
+		emitStreamItem(ctx, out, reducer.doneItem())
+		return
 	case err := <-errCh:
 		emitStreamItem(ctx, out, StreamItem{Kind: "error", Err: err})
 		return
@@ -132,6 +124,10 @@ func (r *sdkStreamReducer) reduce(event sdk.SessionEvent) ([]StreamItem, bool) {
 	default:
 		return nil, false
 	}
+}
+
+func (r *sdkStreamReducer) doneItem() StreamItem {
+	return StreamItem{Kind: "done", Usage: r.usage.Normalized(), FinishReason: r.doneReason()}
 }
 
 func (r *sdkStreamReducer) reduceAssistantMessage(data *sdk.AssistantMessageData) []StreamItem {
