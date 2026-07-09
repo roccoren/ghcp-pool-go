@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	sdk "github.com/github/copilot-sdk/go"
@@ -23,9 +24,14 @@ func reduceSDKStreamEvents(events []sdk.SessionEvent, out chan<- StreamItem) {
 
 func streamSDKSession(ctx context.Context, session *sdk.Session, prompt, endpoint string, out chan<- StreamItem) {
 	reducer := newSDKStreamReducer(prompt, endpoint)
-	idleCh := make(chan struct{}, 1)
+	var mu sync.Mutex
+	terminated := false
 	toolCh := make(chan struct{}, 1)
-	errCh := make(chan error, 1)
+	doneCh := make(chan struct{})
+	var doneOnce sync.Once
+	signalDone := func() {
+		doneOnce.Do(func() { close(doneCh) })
+	}
 	signal := func(ch chan struct{}) {
 		select {
 		case ch <- struct{}{}:
@@ -33,51 +39,86 @@ func streamSDKSession(ctx context.Context, session *sdk.Session, prompt, endpoin
 		}
 	}
 
-	unsubscribe := session.On(func(event sdk.SessionEvent) {
+	handleEvent := func(event sdk.SessionEvent) {
+		mu.Lock()
+		if terminated {
+			mu.Unlock()
+			return
+		}
 		items, terminal := reducer.reduce(event)
+		if terminal {
+			terminated = true
+		}
+		mu.Unlock()
+
+		hasToolCall := false
 		for _, item := range items {
-			if item.Err != nil {
-				select {
-				case errCh <- item.Err:
-				default:
-				}
-				return
-			}
 			if item.Kind == "tool_call" {
-				signal(toolCh)
+				hasToolCall = true
 			}
 			if !emitStreamItem(ctx, out, item) {
 				return
 			}
 		}
-		if terminal {
-			signal(idleCh)
+		if hasToolCall {
+			signal(toolCh)
 		}
-	})
+		if terminal {
+			signalDone()
+		}
+	}
+
+	go func() {
+		var timer *time.Timer
+		var timerCh <-chan time.Time
+		stopTimer := func() {
+			if timer == nil {
+				return
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+		defer stopTimer()
+
+		for {
+			select {
+			case <-toolCh:
+				if timer == nil {
+					timer = time.NewTimer(50 * time.Millisecond)
+					timerCh = timer.C
+					continue
+				}
+				stopTimer()
+				timer.Reset(50 * time.Millisecond)
+			case <-timerCh:
+				abortCtx, abortCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = session.Abort(abortCtx)
+				abortCancel()
+				return
+			case <-doneCh:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	unsubscribe := session.On(handleEvent)
 	defer unsubscribe()
 
 	if _, err := session.Send(ctx, sdk.MessageOptions{Prompt: prompt}); err != nil {
-		emitStreamItem(context.Background(), out, StreamItem{Kind: "error", Err: fmt.Errorf("send sdk session prompt: %w", err)})
+		handleEvent(sdk.SessionEvent{Data: &sdk.SessionErrorData{Message: fmt.Sprintf("send sdk session prompt: %v", err), ErrorType: "query"}})
 		return
 	}
 
 	select {
-	case <-idleCh:
-		return
-	case <-toolCh:
-		settleCtx, settleCancel := context.WithTimeout(ctx, 5*time.Second)
-		waitForSDKToolSettle(settleCtx, toolCh)
-		settleCancel()
-		abortCtx, abortCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = session.Abort(abortCtx)
-		abortCancel()
-		emitStreamItem(ctx, out, reducer.doneItem())
-		return
-	case err := <-errCh:
-		emitStreamItem(ctx, out, StreamItem{Kind: "error", Err: err})
+	case <-doneCh:
 		return
 	case <-ctx.Done():
-		emitStreamItem(context.Background(), out, StreamItem{Kind: "error", Err: fmt.Errorf("stream sdk session: %w", ctx.Err())})
 		return
 	}
 }
@@ -120,14 +161,10 @@ func (r *sdkStreamReducer) reduce(event sdk.SessionEvent) ([]StreamItem, bool) {
 	case *sdk.SessionIdleData:
 		return []StreamItem{{Kind: "done", Usage: r.usage.Normalized(), FinishReason: r.doneReason()}}, true
 	case *sdk.SessionErrorData:
-		return []StreamItem{{Kind: "error", Err: fmt.Errorf("sdk session error: %s", data.Message)}}, false
+		return []StreamItem{{Kind: "error", Err: fmt.Errorf("sdk session error: %s", data.Message)}}, true
 	default:
 		return nil, false
 	}
-}
-
-func (r *sdkStreamReducer) doneItem() StreamItem {
-	return StreamItem{Kind: "done", Usage: r.usage.Normalized(), FinishReason: r.doneReason()}
 }
 
 func (r *sdkStreamReducer) reduceAssistantMessage(data *sdk.AssistantMessageData) []StreamItem {
