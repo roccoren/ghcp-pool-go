@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	sdk "github.com/github/copilot-sdk/go"
 )
 
 func TestCopilotCLIBackend_Implementation(t *testing.T) {
@@ -358,11 +360,11 @@ func TestCopilotCLIBackend_SessionConfig(t *testing.T) {
 func TestCopilotCLIBackend_ModelOptions(t *testing.T) {
 	backend := NewCopilotCLIBackend("test-account", "gho_testtoken", "")
 	tests := []struct {
-		name        string
-		model       string
-		params      map[string]any
-		wantEffort  string
-		wantTier    string
+		name       string
+		model      string
+		params     map[string]any
+		wantEffort string
+		wantTier   string
 	}{
 		{
 			name:       "no options",
@@ -467,5 +469,88 @@ func TestCopilotCLIBackend_Timeout(t *testing.T) {
 				t.Errorf("timeout = %v, want between %v and %v", timeout, tt.wantMin, tt.wantMax)
 			}
 		})
+	}
+}
+
+func TestCopilotCLIBackend_ChatStreamUsesStreamingSession(t *testing.T) {
+	// Given
+	backend := NewCopilotCLIBackendWithOptions("test-account", "gho_testtoken", "", CopilotCLIBackendOptions{WebSearchMode: "off"})
+	messages := []NeutralMessage{{Role: "system", Content: "You are terse."}, {Role: "user", Content: "List alpha beta gamma."}}
+	params := map[string]any{
+		"response_format": map[string]any{"type": "json_object"},
+		"tool_choice":     "required",
+		"tools":           []map[string]any{{"name": "calculator"}},
+	}
+	wantPrompt := backend.buildPrompt(messages, params)
+	wantEndpoint := sdkUsageEndpoint(params)
+	var cleanupCalled bool
+	var disconnectCalled bool
+	var streamCalled bool
+	originalClientForParams := copilotCLIClientForParams
+	originalCreateSession := copilotCLICreateSession
+	originalDisconnectSession := copilotCLIDisconnectSession
+	originalStreamSession := copilotCLIStreamSession
+	t.Cleanup(func() {
+		copilotCLIClientForParams = originalClientForParams
+		copilotCLICreateSession = originalCreateSession
+		copilotCLIDisconnectSession = originalDisconnectSession
+		copilotCLIStreamSession = originalStreamSession
+	})
+	copilotCLIClientForParams = func(_ *CopilotCLIBackend, _ context.Context, gotParams map[string]any) (*sdk.Client, func(), error) {
+		if gotParams["tool_choice"] != params["tool_choice"] {
+			t.Fatalf("clientForParams tool_choice = %#v, want %#v", gotParams["tool_choice"], params["tool_choice"])
+		}
+		return nil, func() { cleanupCalled = true }, nil
+	}
+	copilotCLICreateSession = func(_ *sdk.Client, _ context.Context, cfg *sdk.SessionConfig) (*sdk.Session, error) {
+		if cfg == nil {
+			t.Fatal("CreateSession config is nil")
+		}
+		if cfg.Streaming == nil || !*cfg.Streaming {
+			t.Fatalf("Streaming = %v, want true", cfg.Streaming)
+		}
+		return nil, nil
+	}
+	copilotCLIDisconnectSession = func(_ *sdk.Session) {
+		disconnectCalled = true
+	}
+	copilotCLIStreamSession = func(_ context.Context, _ *sdk.Session, prompt, endpoint string, out chan<- StreamItem) {
+		streamCalled = true
+		if prompt != wantPrompt {
+			t.Fatalf("prompt = %q, want %q", prompt, wantPrompt)
+		}
+		if endpoint != wantEndpoint {
+			t.Fatalf("endpoint = %q, want %q", endpoint, wantEndpoint)
+		}
+		out <- StreamItem{Kind: "delta", Text: "alpha "}
+		out <- StreamItem{Kind: "delta", Text: "beta "}
+		out <- StreamItem{Kind: "done", FinishReason: "stop"}
+	}
+
+	// When
+	stream, err := backend.ChatStream(context.Background(), "gpt-4.1", messages, params)
+	if err != nil {
+		t.Fatalf("ChatStream() error = %v", err)
+	}
+	items := make([]StreamItem, 0, 3)
+	for item := range stream {
+		items = append(items, item)
+	}
+
+	// Then
+	if !streamCalled {
+		t.Fatal("expected streamSDKSession to be called")
+	}
+	if !cleanupCalled {
+		t.Fatal("expected client cleanup to be called")
+	}
+	if !disconnectCalled {
+		t.Fatal("expected session disconnect to be called")
+	}
+	if len(items) != 3 {
+		t.Fatalf("item count = %d, want 3; items=%+v", len(items), items)
+	}
+	if items[0].Kind != "delta" || items[1].Kind != "delta" || items[2].Kind != "done" {
+		t.Fatalf("unexpected stream items: %+v", items)
 	}
 }
