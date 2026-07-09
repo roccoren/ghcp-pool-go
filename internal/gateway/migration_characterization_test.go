@@ -21,30 +21,18 @@ func TestCharacterizationChatCompletions(t *testing.T) {
 	}
 
 	body := decodeBody(t, rr)
-	if body["object"] != "chat.completion" {
-		t.Fatalf("object=%v", body["object"])
-	}
-	if stringFromAny(body["id"]) == "" {
-		t.Fatalf("missing id: %v", body)
-	}
-	if body["model"] != "gpt-4.1" {
-		t.Fatalf("model=%v", body["model"])
-	}
+	assertStringValue(t, body, "object", "chat.completion")
+	assertNonEmptyStringField(t, body, "id")
+	assertStringValue(t, body, "model", "gpt-4.1")
 	choices := mustAnySlice(t, body["choices"], "choices")
 	if len(choices) != 1 {
 		t.Fatalf("choices=%v", choices)
 	}
 	choice := mustAnyMap(t, choices[0], "choices[0]")
-	if choice["finish_reason"] != "stop" {
-		t.Fatalf("finish_reason=%v", choice["finish_reason"])
-	}
+	assertStringValue(t, choice, "finish_reason", "stop")
 	message := mustAnyMap(t, choice["message"], "choices[0].message")
-	if message["role"] != "assistant" {
-		t.Fatalf("message role=%v", message["role"])
-	}
-	if text := stringFromAny(message["content"]); text == "" {
-		t.Fatalf("message content=%v", message["content"])
-	}
+	assertStringValue(t, message, "role", "assistant")
+	assertNonEmptyStringField(t, message, "content")
 	assertKeysPresent(t, mustAnyMap(t, body["usage"], "usage"), "usage", "prompt_tokens", "completion_tokens", "total_tokens")
 }
 
@@ -60,34 +48,28 @@ func TestCharacterizationResponses(t *testing.T) {
 	}
 
 	body := decodeBody(t, rr)
-	if body["object"] != "response" || body["status"] != "completed" {
-		t.Fatalf("response body=%v", body)
-	}
-	if body["stop_reason"] != "stop" {
-		t.Fatalf("stop_reason=%v", body["stop_reason"])
-	}
+	assertStringValue(t, body, "object", "response")
+	assertStringValue(t, body, "status", "completed")
+	assertStringValue(t, body, "stop_reason", "stop")
 	if body["end_turn"] != true {
 		t.Fatalf("end_turn=%v", body["end_turn"])
 	}
-	if stringFromAny(body["output_text"]) == "" {
-		t.Fatalf("output_text=%v", body["output_text"])
-	}
+	assertNonEmptyStringField(t, body, "output_text")
 	output := mustAnySlice(t, body["output"], "output")
 	if len(output) == 0 {
 		t.Fatalf("output=%v", output)
 	}
 	item := mustAnyMap(t, output[0], "output[0]")
-	if item["type"] != "message" || item["status"] != "completed" || item["role"] != "assistant" {
-		t.Fatalf("output item=%v", item)
-	}
+	assertStringValue(t, item, "type", "message")
+	assertStringValue(t, item, "status", "completed")
+	assertStringValue(t, item, "role", "assistant")
 	content := mustAnySlice(t, item["content"], "output[0].content")
 	if len(content) != 1 {
 		t.Fatalf("content=%v", content)
 	}
 	part := mustAnyMap(t, content[0], "output[0].content[0]")
-	if part["type"] != "output_text" || stringFromAny(part["text"]) == "" {
-		t.Fatalf("content part=%v", part)
-	}
+	assertStringValue(t, part, "type", "output_text")
+	assertNonEmptyStringField(t, part, "text")
 	assertKeysPresent(t, mustAnyMap(t, body["usage"], "usage"), "usage", "input_tokens", "output_tokens", "total_tokens")
 	if _, ok := part["annotations"].([]any); !ok {
 		t.Fatalf("annotations=%T %v", part["annotations"], part["annotations"])
@@ -106,20 +88,16 @@ func TestCharacterizationAnthropicMessages(t *testing.T) {
 	}
 
 	body := decodeBody(t, rr)
-	if body["type"] != "message" || body["role"] != "assistant" {
-		t.Fatalf("body=%v", body)
-	}
-	if body["stop_reason"] != "end_turn" {
-		t.Fatalf("stop_reason=%v", body["stop_reason"])
-	}
+	assertStringValue(t, body, "type", "message")
+	assertStringValue(t, body, "role", "assistant")
+	assertStringValue(t, body, "stop_reason", "end_turn")
 	content := mustAnySlice(t, body["content"], "content")
 	if len(content) != 1 {
 		t.Fatalf("content=%v", content)
 	}
 	block := mustAnyMap(t, content[0], "content[0]")
-	if block["type"] != "text" || stringFromAny(block["text"]) == "" {
-		t.Fatalf("content block=%v", block)
-	}
+	assertStringValue(t, block, "type", "text")
+	assertNonEmptyStringField(t, block, "text")
 	assertKeysPresent(t, mustAnyMap(t, body["usage"], "usage"), "usage", "input_tokens", "output_tokens", "output_tokens_details")
 }
 
@@ -140,18 +118,15 @@ func TestCharacterizationChatStreamSSE(t *testing.T) {
 	if len(frames) < 5 {
 		t.Fatalf("frames=%v", frames)
 	}
+	assertUnnamedSSEFrames(t, frames)
 	if frames[len(frames)-1].data != "[DONE]" {
 		t.Fatalf("terminal frame=%+v", frames[len(frames)-1])
 	}
 	first := frames[0].payload
-	if stringFromAny(first["object"]) != "chat.completion.chunk" {
-		t.Fatalf("first frame=%v", first)
-	}
+	assertStringValue(t, first, "object", "chat.completion.chunk")
 	firstChoice := firstChoiceMap(t, first)
 	firstDelta := mustAnyMap(t, firstChoice["delta"], "first delta")
-	if firstDelta["role"] != "assistant" {
-		t.Fatalf("first delta=%v", firstDelta)
-	}
+	assertStringValue(t, firstDelta, "role", "assistant")
 
 	contentFrames := frames[1 : len(frames)-3]
 	if len(contentFrames) == 0 {
@@ -160,15 +135,11 @@ func TestCharacterizationChatStreamSSE(t *testing.T) {
 	for _, frame := range contentFrames {
 		choice := firstChoiceMap(t, frame.payload)
 		delta := mustAnyMap(t, choice["delta"], "content delta")
-		if stringFromAny(delta["content"]) == "" {
-			t.Fatalf("content frame=%v", frame.payload)
-		}
+		assertNonEmptyStringField(t, delta, "content")
 	}
 
 	finishChoice := firstChoiceMap(t, frames[len(frames)-3].payload)
-	if finishChoice["finish_reason"] != "stop" {
-		t.Fatalf("finish frame=%v", frames[len(frames)-3].payload)
-	}
+	assertStringValue(t, finishChoice, "finish_reason", "stop")
 	assertKeysPresent(t, mustAnyMap(t, frames[len(frames)-2].payload["usage"], "usage"), "usage", "prompt_tokens", "completion_tokens", "total_tokens")
 }
 
@@ -198,17 +169,13 @@ func TestCharacterizationAnthropicStreamSSE(t *testing.T) {
 	}
 
 	start := mustAnyMap(t, frames[indexes["message_start"]].payload["message"], "message_start.message")
-	if start["type"] != "message" || start["role"] != "assistant" {
-		t.Fatalf("message_start=%v", start)
-	}
+	assertStringValue(t, start, "type", "message")
+	assertStringValue(t, start, "role", "assistant")
 	delta := mustAnyMap(t, frames[indexes["content_block_delta"]].payload["delta"], "content_block_delta.delta")
-	if delta["type"] != "text_delta" || stringFromAny(delta["text"]) == "" {
-		t.Fatalf("content_block_delta=%v", delta)
-	}
+	assertStringValue(t, delta, "type", "text_delta")
+	assertNonEmptyStringField(t, delta, "text")
 	messageDelta := mustAnyMap(t, frames[indexes["message_delta"]].payload["delta"], "message_delta.delta")
-	if messageDelta["stop_reason"] != "end_turn" {
-		t.Fatalf("message_delta=%v", frames[indexes["message_delta"]].payload)
-	}
+	assertStringValue(t, messageDelta, "stop_reason", "end_turn")
 	assertKeysPresent(t, mustAnyMap(t, frames[indexes["message_delta"]].payload["usage"], "message_delta.usage"), "usage", "input_tokens", "output_tokens")
 	if frames[indexes["message_stop"]].payload["type"] != "message_stop" {
 		t.Fatalf("message_stop=%v", frames[indexes["message_stop"]].payload)
@@ -260,6 +227,32 @@ func assertKeysPresent(t *testing.T, obj map[string]any, label string, keys ...s
 		if _, ok := obj[key]; !ok {
 			t.Fatalf("%s missing key %q: %v", label, key, obj)
 		}
+	}
+}
+
+func assertUnnamedSSEFrames(t *testing.T, frames []sseFrame) {
+	t.Helper()
+	for i, frame := range frames {
+		if frame.event != "" {
+			t.Fatalf("frame[%d] event: want empty string, got %q (data=%q)", i, frame.event, frame.data)
+		}
+	}
+}
+
+func assertNonEmptyStringField(t *testing.T, obj map[string]any, key string) string {
+	t.Helper()
+	value, ok := obj[key].(string)
+	if !ok || value == "" {
+		t.Fatalf("%s: want non-empty string, got %T %v", key, obj[key], obj[key])
+	}
+	return value
+}
+
+func assertStringValue(t *testing.T, obj map[string]any, key, want string) {
+	t.Helper()
+	got, ok := obj[key].(string)
+	if !ok || got != want {
+		t.Fatalf("%s: want string %q, got %T %v", key, want, obj[key], obj[key])
 	}
 }
 
