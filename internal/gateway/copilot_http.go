@@ -19,7 +19,6 @@ import (
 )
 
 const (
-	defaultCopilotAPIBaseURL    = "https://api.individual." + "github" + "copilot.com"
 	copilotPublicAPIBaseURL     = "https://api." + "github" + "copilot.com"
 	defaultCopilotOAuthClientID = "Ov23li8tweQw6odWQebz"
 	copilotBackendModeSDK       = "sdk"
@@ -38,8 +37,6 @@ var ValidCopilotAuthModes = map[string]bool{
 	copilotAuthModeExchange: true,
 	copilotAuthModeOAuth:    true,
 }
-
-var copilotHTTPClient = &http.Client{Timeout: 5 * time.Minute}
 
 var sdkWebHTTPClient = &http.Client{Timeout: 20 * time.Second}
 
@@ -68,7 +65,6 @@ type CopilotBackend struct {
 	homeDir          string
 	mode             string
 	authMode         string
-	baseURL          string
 	sdkWebSearch     bool
 	sdkWebSearchMode string
 	sdkTools         []string
@@ -99,7 +95,6 @@ func NewCopilotBackendWithOptions(accountID, token, homeDir string, options Copi
 		homeDir:          homeDir,
 		mode:             normalizeCopilotBackendMode(options.Mode),
 		authMode:         normalizeCopilotAuthMode(defaultCopilotAuthMode(options.Mode, options.AuthMode)),
-		baseURL:          normalizeBaseURLOrEmpty(options.BaseURL),
 		sdkWebSearch:     options.SDKWebSearch,
 		sdkWebSearchMode: normalizeCopilotSDKWebSearchMode(options.SDKWebSearchMode, options.SDKWebSearch),
 		sdkTools:         normalizeStringList(options.SDKTools),
@@ -1332,25 +1327,6 @@ func toolChoiceIsNone(choice any) bool {
 
 func looksLikeCopilotBearer(token string) bool {
 	return strings.Contains(token, "proxy-ep=") || strings.HasPrefix(token, "tid=")
-}
-
-func normalizeBaseURL(base string) string {
-	base = strings.TrimSpace(base)
-	if base == "" {
-		return defaultCopilotAPIBaseURL
-	}
-	if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
-		base = "https://" + base
-	}
-	return strings.TrimRight(base, "/")
-}
-
-func normalizeBaseURLOrEmpty(base string) string {
-	base = strings.TrimSpace(base)
-	if base == "" {
-		return ""
-	}
-	return normalizeBaseURL(base)
 }
 
 func normalizeDomain(raw string) string {

@@ -134,12 +134,6 @@ func copilotModelFixture(id string, endpoints []string) map[string]any {
 	}
 }
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
-}
-
 func TestHealthAndAuth(t *testing.T) {
 	_, h := testServer(t)
 	if rr := request(t, h, "GET", "/healthz", nil, nil); rr.Code != 200 {
@@ -1255,15 +1249,6 @@ func TestResponseReplayEventsEmitsWebSearchCall(t *testing.T) {
 }
 
 func TestCopilotSDKModeListsModelsOnlyThroughSDK(t *testing.T) {
-	oldClient := copilotHTTPClient
-	defer func() {
-		copilotHTTPClient = oldClient
-	}()
-	copilotHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		t.Fatalf("sdk model discovery should not call Copilot HTTP: %s", req.URL.String())
-		return nil, nil
-	})}
-
 	backend := NewCopilotBackend("acct", "gho_oauth_token", "")
 	backend.sdkClient = sdk.NewClient(&sdk.ClientOptions{OnListModels: func(context.Context) ([]sdk.ModelInfo, error) {
 		return []sdk.ModelInfo{
@@ -1309,13 +1294,6 @@ func TestCopilotEndpointHeuristicMatchesOpenCodeProvider(t *testing.T) {
 }
 
 func TestCopilotSDKModeBestEffortRequestsWithoutHTTP(t *testing.T) {
-	oldClient := copilotHTTPClient
-	defer func() { copilotHTTPClient = oldClient }()
-	copilotHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		t.Fatalf("sdk mode should not call Copilot HTTP: %s", req.URL.String())
-		return nil, nil
-	})}
-
 	backend := NewCopilotBackend("acct", "gh-token", "")
 	cases := []struct {
 		name     string
@@ -1437,13 +1415,6 @@ func TestSDKEligibilityRequiresSinglePlainUserMessage(t *testing.T) {
 }
 
 func TestCopilotSDKModeAcceptsToolRequestsWithoutDirectHTTP(t *testing.T) {
-	oldClient := copilotHTTPClient
-	defer func() { copilotHTTPClient = oldClient }()
-	copilotHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		t.Fatalf("sdk mode should not call Copilot HTTP: %s", req.URL.String())
-		return nil, nil
-	})}
-
 	backend := NewCopilotBackend("acct", "gh-token", "")
 	params := map[string]any{
 		"tools": []map[string]any{{"type": "function", "function": map[string]any{"name": "lookup"}}},
