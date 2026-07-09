@@ -124,9 +124,9 @@ curl -sS -X POST "https://$FQDN/admin/accounts/$USER_ID/enable" \
 
 ### Device login flow
 
-The gateway defaults to the public Copilot OAuth client ID used by OpenCode, so
-admin device login works without creating your own GitHub OAuth App. For custom
-branding or stricter operations control, create or choose a GitHub OAuth App
+The gateway defaults to the public Copilot OAuth client ID, so admin device
+login works without creating your own GitHub OAuth App. For custom branding or
+stricter operations control, create or choose a GitHub OAuth App
 that supports the device authorization flow, then override the client ID:
 
 ```yaml
@@ -141,22 +141,10 @@ gateway:
 `client_id`, `scopes`, `device_code_url`, and `token_url` all have defaults, so
 the minimal public GitHub.com config no longer needs a `login:` block.
 
-To use the OpenCode-style direct provider path instead of the default SDK-first
-mode, configure:
-
-```yaml
-gateway:
-  copilot:
-    mode: opencode
-    auth_mode: oauth
-    base_url: "https://api.githubcopilot.com"
-```
-
-`mode: sdk` is the default. It uses the official SDK for authentication, model
-discovery, and eligible simple chat turns. It never calls direct Copilot APIs;
-SDK-unsupported request shapes fail explicitly instead of falling back to HTTP.
-`mode: opencode` disables SDK use and talks directly to the Copilot provider API;
-when `auth_mode` is omitted, it defaults to `oauth`.
+`mode: sdk` is the default and the only supported Copilot mode. It uses the
+official SDK for authentication, model discovery, and eligible simple chat
+turns. It never calls direct Copilot APIs; SDK-unsupported request shapes fail
+explicitly instead of falling back to HTTP.
 
 SDK mode uses the Copilot client's empty mode, so SDK built-in tools are off by
 default. To handle OpenAI/Anthropic web-search requests through the SDK without
@@ -200,20 +188,20 @@ gateway:
 ```
 
 For GitHub Enterprise or data-residency deployments, set the enterprise domain.
-The gateway derives both device-login endpoints and
-`https://copilot-api.<enterprise-domain>`:
+The gateway derives the enterprise device-login endpoints:
 
 ```yaml
 gateway:
   copilot:
-    mode: opencode
-    auth_mode: oauth
     enterprise_url: "ghe.example.com"
 ```
 
-Per-account overrides are also available as `copilot_mode`, `copilot_auth_mode`,
-`copilot_base_url`, `copilot_sdk_web_search`,
-`copilot_sdk_available_tools`, and `github_enterprise_url`.
+Per-account overrides are also available as `copilot_mode`,
+`copilot_sdk_web_search`, `copilot_sdk_available_tools`, and
+`github_enterprise_url`. `copilot_mode` must remain `sdk`.
+
+Under the SDK/CLI Copilot backends, embeddings are unsupported and
+`POST /v1/embeddings` returns HTTP 501.
 
 For the Azure Container Apps deployment in this repository, add the `login:`
 and/or `copilot:` block to the generated `/tmp/config.yaml` startup template or

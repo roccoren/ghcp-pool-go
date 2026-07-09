@@ -171,4 +171,4 @@ curl -sS "$BASE_URL/admin/routes" \
 | `403 missing scope` | 当前 API key 没有对应 scope；推理需要 `inference`，管理端需要 `admin`。 |
 | 模型不在 `/v1/models` 中 | 模型可能未被当前账号发现、账号未启用，或当前 API key 的 `model_allow` 不包含该模型。 |
 | `429` | 命中了全局或单账号 RPM 限流，按响应里的 `Retry-After` 等待后重试。 |
-| SDK 模式下某些高级请求失败 | `sdk` 模式不会自动降级到直接 API；如确需直接 provider 行为，请由管理员评估切换 `GHCP_COPILOT_MODE=opencode`。 |
+| SDK 模式下某些高级请求失败 | Copilot 仅支持 SDK/CLI 链路，不会自动降级到直接 API；请调整请求形态或改用支持该能力的后端。 |

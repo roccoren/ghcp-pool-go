@@ -485,11 +485,22 @@ func TestLoadSettingsDerivesEnterpriseCopilotProviderURLs(t *testing.T) {
 	if settings.Copilot.EnterpriseURL != "ghe.example.com" {
 		t.Fatalf("enterprise=%q", settings.Copilot.EnterpriseURL)
 	}
-	if settings.Copilot.BaseURL != "https://copilot-api.ghe.example.com" {
-		t.Fatalf("base url=%q", settings.Copilot.BaseURL)
-	}
 	if settings.Login.DeviceCodeURL != "https://ghe.example.com/login/device/code" || settings.Login.TokenURL != "https://ghe.example.com/login/oauth/access_token" {
 		t.Fatalf("login urls=%q %q", settings.Login.DeviceCodeURL, settings.Login.TokenURL)
+	}
+}
+
+func TestOpencodeModeRejected(t *testing.T) {
+	t.Setenv("GHCP_MODEL_MAP_PATH", ":memory:")
+	t.Setenv("GHCP_COPILOT_MODE", "opencode")
+
+	_, err := LoadSettings("/does/not/exist.yaml")
+
+	if err == nil {
+		t.Fatal("expected invalid copilot mode error")
+	}
+	if !strings.Contains(err.Error(), "invalid copilot mode") || !strings.Contains(err.Error(), "sdk") {
+		t.Fatalf("error=%q", err.Error())
 	}
 }
 
@@ -511,6 +522,27 @@ func TestCopilotBackendOptionsAllowPerAccountSDKWebSearchOverride(t *testing.T) 
 	}
 	if !options.SDKWebSearch || options.SDKWebSearchMode != "native_cli" || strings.Join(options.SDKTools, ",") != "grep" {
 		t.Fatalf("options=%+v", options)
+	}
+}
+
+func TestCopilotBackendOptionsRejectsOpencodeMode_whenConfiguredPerAccount(t *testing.T) {
+	_, err := copilotBackendOptions(CopilotConfig{Mode: copilotBackendModeSDK}, &AccountConfig{ID: "acct-sdk", CopilotMode: "opencode"})
+
+	if err == nil {
+		t.Fatal("expected invalid copilot mode error")
+	}
+	if !strings.Contains(err.Error(), "invalid copilot mode") || !strings.Contains(err.Error(), "sdk") {
+		t.Fatalf("error=%q", err.Error())
+	}
+}
+
+func TestEmbeddingsUnsupportedUnderSDKReturns501(t *testing.T) {
+	backend := NewCopilotBackend("acct-sdk", "gho_x", "")
+
+	_, err := backend.Embeddings(context.Background(), "text-embedding-3-small", []string{"hi"}, nil)
+
+	if !errors.Is(err, ErrEmbeddingsUnsupported) {
+		t.Fatalf("expected ErrEmbeddingsUnsupported, got %v", err)
 	}
 }
 
@@ -1284,7 +1316,7 @@ func TestCopilotSDKModeEmptyModelListFails(t *testing.T) {
 	}
 }
 
-func TestCopilotEndpointHeuristicMatchesOpenCodeProvider(t *testing.T) {
+func TestCopilotEndpointHeuristicMatchesProviderRouting(t *testing.T) {
 	if !copilotPrefersResponses("gpt-5") || !copilotPrefersResponses("gpt-5.1-codex") {
 		t.Fatalf("expected gpt-5 class models to prefer responses")
 	}

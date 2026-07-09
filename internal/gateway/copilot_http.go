@@ -19,18 +19,15 @@ import (
 )
 
 const (
-	copilotPublicAPIBaseURL     = "https://api." + "github" + "copilot.com"
 	defaultCopilotOAuthClientID = "Ov23li8tweQw6odWQebz"
 	copilotBackendModeSDK       = "sdk"
-	copilotBackendModeOpencode  = "opencode"
 	copilotAuthModeExchange     = "exchange"
 	copilotAuthModeOAuth        = "oauth"
 	copilotUserAgent            = "GitHubCopilotChat/0.39.0"
 )
 
 var ValidCopilotBackendModes = map[string]bool{
-	copilotBackendModeSDK:      true,
-	copilotBackendModeOpencode: true,
+	copilotBackendModeSDK: true,
 }
 
 var ValidCopilotAuthModes = map[string]bool{
@@ -78,7 +75,6 @@ type CopilotBackend struct {
 type CopilotBackendOptions struct {
 	Mode             string
 	AuthMode         string
-	BaseURL          string
 	SDKWebSearch     bool
 	SDKWebSearchMode string
 	SDKTools         []string
@@ -201,7 +197,7 @@ func (b *CopilotBackend) ChatStream(ctx context.Context, model string, messages 
 }
 
 func unsupportedSDKModeRequest(endpoint string) error {
-	return fmt.Errorf("copilot sdk mode does not support this request shape on endpoint %q; use sdk-compatible single-turn chat or explicit opencode mode for direct API behavior", endpoint)
+	return fmt.Errorf("copilot sdk mode does not support this request shape on endpoint %q; use an sdk-compatible request shape", endpoint)
 }
 
 func (b *CopilotBackend) Close() error {
@@ -1343,14 +1339,6 @@ func normalizeDomain(raw string) string {
 	return strings.Trim(strings.TrimPrefix(strings.TrimPrefix(raw, "https://"), "http://"), "/")
 }
 
-func copilotEnterpriseAPIBaseURL(enterpriseURL string) string {
-	domain := normalizeDomain(enterpriseURL)
-	if domain == "" {
-		return ""
-	}
-	return "https://copilot-api." + domain
-}
-
 func normalizeCopilotAuthMode(mode string) string {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	if mode == "" {
@@ -1367,12 +1355,9 @@ func normalizeCopilotBackendMode(mode string) string {
 	return mode
 }
 
-func defaultCopilotAuthMode(mode, authMode string) string {
+func defaultCopilotAuthMode(_ string, authMode string) string {
 	if strings.TrimSpace(authMode) != "" {
 		return authMode
-	}
-	if normalizeCopilotBackendMode(mode) == copilotBackendModeOpencode {
-		return copilotAuthModeOAuth
 	}
 	return copilotAuthModeExchange
 }

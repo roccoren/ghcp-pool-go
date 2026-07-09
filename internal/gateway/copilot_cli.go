@@ -27,8 +27,6 @@ var (
 )
 
 // CopilotCLIBackend is a backend that uses Copilot SDK in CLI mode exclusively.
-// Unlike CopilotBackend which supports both SDK and OpenCode modes, this backend
-// always uses ModeCopilotCli for maximum compatibility with Copilot CLI features.
 type CopilotCLIBackend struct {
 	accountID     string
 	githubToken   string

@@ -427,7 +427,7 @@ func LoadSettings(path string) (Settings, error) {
 	settings.Login.ClientID = firstNonEmpty(os.Getenv("GHCP_LOGIN_CLIENT_ID"), settings.Login.ClientID, defaultCopilotOAuthClientID)
 	settings.Copilot.Mode = normalizeCopilotBackendMode(settings.Copilot.Mode)
 	if !ValidCopilotBackendModes[settings.Copilot.Mode] {
-		return Settings{}, fmt.Errorf("invalid copilot mode %q; valid: sdk, opencode", settings.Copilot.Mode)
+		return Settings{}, fmt.Errorf("invalid copilot mode %q; valid: sdk", settings.Copilot.Mode)
 	}
 	settings.Copilot.AuthMode = normalizeCopilotAuthMode(defaultCopilotAuthMode(settings.Copilot.Mode, settings.Copilot.AuthMode))
 	if !ValidCopilotAuthModes[settings.Copilot.AuthMode] {
@@ -440,12 +440,6 @@ func LoadSettings(path string) (Settings, error) {
 	applyDefaultReasoningEfforts(&settings)
 	applyDefaultContextTiers(&settings)
 	settings.Copilot.EnterpriseURL = normalizeDomain(settings.Copilot.EnterpriseURL)
-	if settings.Copilot.BaseURL == "" && settings.Copilot.EnterpriseURL != "" {
-		settings.Copilot.BaseURL = copilotEnterpriseAPIBaseURL(settings.Copilot.EnterpriseURL)
-	}
-	if settings.Copilot.BaseURL == "" && settings.Copilot.Mode == copilotBackendModeOpencode {
-		settings.Copilot.BaseURL = copilotPublicAPIBaseURL
-	}
 	if settings.Login.Scopes == "" {
 		settings.Login.Scopes = "read:user"
 	}
