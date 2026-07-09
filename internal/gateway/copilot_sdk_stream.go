@@ -123,6 +123,95 @@ func streamSDKSession(ctx context.Context, session *sdk.Session, prompt, endpoin
 	}
 }
 
+func applyStreamOutputConstraints(ctx context.Context, in <-chan StreamItem, params map[string]any) <-chan StreamItem {
+	out := make(chan StreamItem)
+	go func() {
+		defer close(out)
+
+		accumulated := ""
+		emitted := ""
+		toolSeen := false
+
+		drain := func() {
+			for range in {
+			}
+		}
+
+		emitTerminal := func(finish string) bool {
+			usage := Usage{OutputTokens: approxTokens(emitted)}.Normalized()
+			return emitStreamItem(ctx, out, StreamItem{Kind: "done", FinishReason: finish, Usage: usage})
+		}
+
+		for item := range in {
+			switch item.Kind {
+			case "delta":
+				if toolSeen {
+					if !emitStreamItem(ctx, out, item) {
+						drain()
+						return
+					}
+					continue
+				}
+
+				accumulated += item.Text
+				constrained, stopped := applyStopSequences(accumulated, params["stop"])
+				finish := ""
+				if stopped {
+					finish = "stop"
+				}
+				if maxTokens := sdkMaxOutputTokens(params); maxTokens > 0 {
+					if truncated, ok := truncateApproxTokens(constrained, maxTokens); ok {
+						constrained = truncated
+						finish = "length"
+					}
+				}
+
+				newText := ""
+				if len(constrained) >= len(emitted) {
+					newText = constrained[len(emitted):]
+				}
+				if newText != "" {
+					if !emitStreamItem(ctx, out, StreamItem{Kind: "delta", Text: newText}) {
+						drain()
+						return
+					}
+					emitted = constrained
+				}
+				if finish != "" {
+					if !emitTerminal(finish) {
+						drain()
+						return
+					}
+					drain()
+					return
+				}
+			case "tool_call":
+				toolSeen = true
+				if !emitStreamItem(ctx, out, item) {
+					drain()
+					return
+				}
+			case "error":
+				_ = emitStreamItem(ctx, out, item)
+				return
+			case "done":
+				if !toolSeen {
+					item.Usage.OutputTokens = approxTokens(emitted)
+					item.Usage = item.Usage.Normalized()
+				}
+				_ = emitStreamItem(ctx, out, item)
+				return
+			default:
+				if !emitStreamItem(ctx, out, item) {
+					drain()
+					return
+				}
+			}
+		}
+	}()
+	return out
+}
+
 type sdkStreamReducer struct {
 	endpoint          string
 	usage             Usage

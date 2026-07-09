@@ -136,27 +136,27 @@ func (b *CopilotCLIBackend) ChatStream(ctx context.Context, model string, messag
 	clean := cleanBackendParams(params)
 	prompt := b.buildPrompt(messages, clean)
 	endpoint := sdkUsageEndpoint(clean)
-	out := make(chan StreamItem)
+	raw := make(chan StreamItem)
 	go func() {
-		defer close(out)
+		defer close(raw)
 
 		client, cleanup, err := copilotCLIClientForParams(b, ctx, clean)
 		if err != nil {
-			emitStreamItem(ctx, out, StreamItem{Kind: "error", Err: fmt.Errorf("cli backend: create sdk client: %w", err)})
+			emitStreamItem(ctx, raw, StreamItem{Kind: "error", Err: fmt.Errorf("cli backend: create sdk client: %w", err)})
 			return
 		}
 		defer cleanup()
 
 		session, err := copilotCLICreateSession(client, ctx, b.sessionConfig(model, clean, true))
 		if err != nil {
-			emitStreamItem(ctx, out, StreamItem{Kind: "error", Err: fmt.Errorf("cli backend: create sdk session: %w", err)})
+			emitStreamItem(ctx, raw, StreamItem{Kind: "error", Err: fmt.Errorf("cli backend: create sdk session: %w", err)})
 			return
 		}
 		defer copilotCLIDisconnectSession(session)
 
-		copilotCLIStreamSession(ctx, session, prompt, endpoint, out)
+		copilotCLIStreamSession(ctx, session, prompt, endpoint, raw)
 	}()
-	return out, nil
+	return applyStreamOutputConstraints(ctx, raw, clean), nil
 }
 
 // Embeddings returns an error as CLI backend does not support embeddings

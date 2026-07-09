@@ -483,8 +483,8 @@ func TestCopilotCLIBackend_ChatStreamUsesStreamingSession(t *testing.T) {
 	}
 	wantPrompt := backend.buildPrompt(messages, params)
 	wantEndpoint := sdkUsageEndpoint(params)
-	var cleanupCalled bool
-	var disconnectCalled bool
+	cleanupDone := make(chan struct{}, 1)
+	disconnectDone := make(chan struct{}, 1)
 	var streamCalled bool
 	originalClientForParams := copilotCLIClientForParams
 	originalCreateSession := copilotCLICreateSession
@@ -500,7 +500,7 @@ func TestCopilotCLIBackend_ChatStreamUsesStreamingSession(t *testing.T) {
 		if gotParams["tool_choice"] != params["tool_choice"] {
 			t.Fatalf("clientForParams tool_choice = %#v, want %#v", gotParams["tool_choice"], params["tool_choice"])
 		}
-		return nil, func() { cleanupCalled = true }, nil
+		return nil, func() { cleanupDone <- struct{}{} }, nil
 	}
 	copilotCLICreateSession = func(_ *sdk.Client, _ context.Context, cfg *sdk.SessionConfig) (*sdk.Session, error) {
 		if cfg == nil {
@@ -512,7 +512,7 @@ func TestCopilotCLIBackend_ChatStreamUsesStreamingSession(t *testing.T) {
 		return nil, nil
 	}
 	copilotCLIDisconnectSession = func(_ *sdk.Session) {
-		disconnectCalled = true
+		disconnectDone <- struct{}{}
 	}
 	copilotCLIStreamSession = func(_ context.Context, _ *sdk.Session, prompt, endpoint string, out chan<- StreamItem) {
 		streamCalled = true
@@ -541,10 +541,14 @@ func TestCopilotCLIBackend_ChatStreamUsesStreamingSession(t *testing.T) {
 	if !streamCalled {
 		t.Fatal("expected streamSDKSession to be called")
 	}
-	if !cleanupCalled {
+	select {
+	case <-cleanupDone:
+	case <-time.After(time.Second):
 		t.Fatal("expected client cleanup to be called")
 	}
-	if !disconnectCalled {
+	select {
+	case <-disconnectDone:
+	case <-time.After(time.Second):
 		t.Fatal("expected session disconnect to be called")
 	}
 	if len(items) != 3 {
