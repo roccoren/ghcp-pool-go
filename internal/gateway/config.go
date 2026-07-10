@@ -49,7 +49,6 @@ type AccountConfig struct {
 	BaseDirectory           string   `yaml:"base_directory" json:"base_directory"`
 	CopilotMode             string   `yaml:"copilot_mode" json:"copilot_mode"`
 	CopilotAuthMode         string   `yaml:"copilot_auth_mode" json:"copilot_auth_mode"`
-	CopilotBaseURL          string   `yaml:"copilot_base_url" json:"copilot_base_url"`
 	CopilotSDKWebSearch     *bool    `yaml:"copilot_sdk_web_search" json:"copilot_sdk_web_search"`
 	CopilotSDKWebSearchMode string   `yaml:"copilot_sdk_web_search_mode" json:"copilot_sdk_web_search_mode"`
 	CopilotSDKTools         []string `yaml:"copilot_sdk_available_tools" json:"copilot_sdk_available_tools"`
@@ -185,7 +184,6 @@ type LoginConfig struct {
 type CopilotConfig struct {
 	Mode             string   `yaml:"mode" json:"mode"`
 	AuthMode         string   `yaml:"auth_mode" json:"auth_mode"`
-	BaseURL          string   `yaml:"base_url" json:"base_url"`
 	EnterpriseURL    string   `yaml:"enterprise_url" json:"enterprise_url"`
 	SDKWebSearch     bool     `yaml:"sdk_web_search" json:"sdk_web_search"`
 	SDKWebSearchMode string   `yaml:"sdk_web_search_mode" json:"sdk_web_search_mode"`
@@ -389,7 +387,6 @@ func LoadSettings(path string) (Settings, error) {
 		Copilot: CopilotConfig{
 			Mode:             firstNonEmpty(os.Getenv("GHCP_COPILOT_MODE"), g.Copilot.Mode),
 			AuthMode:         firstNonEmpty(os.Getenv("GHCP_COPILOT_AUTH_MODE"), g.Copilot.AuthMode),
-			BaseURL:          firstNonEmpty(os.Getenv("GHCP_COPILOT_API_BASE_URL"), g.Copilot.BaseURL),
 			EnterpriseURL:    firstNonEmpty(os.Getenv("GHCP_GITHUB_ENTERPRISE_URL"), g.Copilot.EnterpriseURL),
 			SDKWebSearch:     envBool("GHCP_COPILOT_SDK_WEB_SEARCH", g.Copilot.SDKWebSearch),
 			SDKWebSearchMode: firstNonEmpty(os.Getenv("GHCP_COPILOT_SDK_WEB_SEARCH_MODE"), g.Copilot.SDKWebSearchMode),
@@ -427,7 +424,7 @@ func LoadSettings(path string) (Settings, error) {
 	settings.Login.ClientID = firstNonEmpty(os.Getenv("GHCP_LOGIN_CLIENT_ID"), settings.Login.ClientID, defaultCopilotOAuthClientID)
 	settings.Copilot.Mode = normalizeCopilotBackendMode(settings.Copilot.Mode)
 	if !ValidCopilotBackendModes[settings.Copilot.Mode] {
-		return Settings{}, fmt.Errorf("invalid copilot mode %q; valid: sdk, opencode", settings.Copilot.Mode)
+		return Settings{}, fmt.Errorf("invalid copilot mode %q; valid: sdk", settings.Copilot.Mode)
 	}
 	settings.Copilot.AuthMode = normalizeCopilotAuthMode(defaultCopilotAuthMode(settings.Copilot.Mode, settings.Copilot.AuthMode))
 	if !ValidCopilotAuthModes[settings.Copilot.AuthMode] {
@@ -440,12 +437,6 @@ func LoadSettings(path string) (Settings, error) {
 	applyDefaultReasoningEfforts(&settings)
 	applyDefaultContextTiers(&settings)
 	settings.Copilot.EnterpriseURL = normalizeDomain(settings.Copilot.EnterpriseURL)
-	if settings.Copilot.BaseURL == "" && settings.Copilot.EnterpriseURL != "" {
-		settings.Copilot.BaseURL = copilotEnterpriseAPIBaseURL(settings.Copilot.EnterpriseURL)
-	}
-	if settings.Copilot.BaseURL == "" && settings.Copilot.Mode == copilotBackendModeOpencode {
-		settings.Copilot.BaseURL = copilotPublicAPIBaseURL
-	}
 	if settings.Login.Scopes == "" {
 		settings.Login.Scopes = "read:user"
 	}

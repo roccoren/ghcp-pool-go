@@ -746,6 +746,10 @@ func (s *server) embeddings(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if s.gw.Settings.Backend == "copilot" || s.gw.Settings.Backend == "copilot-cli" {
+		writeError(w, http.StatusNotImplemented, ErrEmbeddingsUnsupported.Error())
+		return
+	}
 	var body EmbeddingsRequest
 	if !decodeJSON(w, r, &body) {
 		return
@@ -871,7 +875,6 @@ func (s *server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 		BaseDirectory:           baseDir,
 		CopilotMode:             stringsTrim(stringFromAny(payload["copilot_mode"])),
 		CopilotAuthMode:         stringsTrim(stringFromAny(payload["copilot_auth_mode"])),
-		CopilotBaseURL:          stringsTrim(stringFromAny(payload["copilot_base_url"])),
 		CopilotSDKWebSearch:     boolPtrFromPayload(payload["copilot_sdk_web_search"]),
 		CopilotSDKWebSearchMode: stringsTrim(stringFromAny(payload["copilot_sdk_web_search_mode"])),
 		CopilotSDKTools:         stringSliceFromAny(payload["copilot_sdk_available_tools"]),

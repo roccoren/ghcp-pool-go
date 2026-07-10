@@ -420,7 +420,7 @@ func copilotCLIBackendOptions(defaults CopilotConfig, cfg *AccountConfig) Copilo
 func copilotBackendOptions(defaults CopilotConfig, cfg *AccountConfig) (CopilotBackendOptions, error) {
 	mode := normalizeCopilotBackendMode(firstNonEmpty(cfg.CopilotMode, defaults.Mode))
 	if !ValidCopilotBackendModes[mode] {
-		return CopilotBackendOptions{}, fmt.Errorf("invalid copilot mode %q for account %q; valid: sdk, opencode", mode, cfg.ID)
+		return CopilotBackendOptions{}, fmt.Errorf("invalid copilot mode %q for account %q; valid: sdk", mode, cfg.ID)
 	}
 	authMode := normalizeCopilotAuthMode(defaultCopilotAuthMode(mode, cfg.CopilotAuthMode))
 	if cfg.CopilotAuthMode == "" && cfg.CopilotMode == "" {
@@ -428,14 +428,6 @@ func copilotBackendOptions(defaults CopilotConfig, cfg *AccountConfig) (CopilotB
 	}
 	if !ValidCopilotAuthModes[authMode] {
 		return CopilotBackendOptions{}, fmt.Errorf("invalid copilot auth mode %q for account %q; valid: exchange, oauth", authMode, cfg.ID)
-	}
-	baseURL := firstNonEmpty(cfg.CopilotBaseURL, defaults.BaseURL)
-	enterpriseURL := firstNonEmpty(cfg.GitHubEnterpriseURL, defaults.EnterpriseURL)
-	if baseURL == "" && enterpriseURL != "" {
-		baseURL = copilotEnterpriseAPIBaseURL(enterpriseURL)
-	}
-	if baseURL == "" && mode == copilotBackendModeOpencode {
-		baseURL = copilotPublicAPIBaseURL
 	}
 	sdkWebSearch := defaults.SDKWebSearch
 	if cfg.CopilotSDKWebSearch != nil {
@@ -452,7 +444,7 @@ func copilotBackendOptions(defaults CopilotConfig, cfg *AccountConfig) (CopilotB
 	if len(cfg.CopilotSDKTools) > 0 {
 		sdkTools = cfg.CopilotSDKTools
 	}
-	return CopilotBackendOptions{Mode: mode, AuthMode: authMode, BaseURL: baseURL, SDKWebSearch: sdkWebSearch, SDKWebSearchMode: sdkWebSearchMode, SDKTools: sdkTools}, nil
+	return CopilotBackendOptions{Mode: mode, AuthMode: authMode, SDKWebSearch: sdkWebSearch, SDKWebSearchMode: sdkWebSearchMode, SDKTools: sdkTools}, nil
 }
 
 func (p *PoolManager) Start(ctx context.Context) error {

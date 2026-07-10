@@ -28,7 +28,7 @@ ghcp-pool-go 是一个面向 GitHub Copilot 能力的高并发网关。它把一
 | Anthropic token count | `POST /v1/messages/count_tokens` |
 | Gemini generate/count | `GET /v1beta/models`、`POST /v1beta/models/{model}:generateContent`、`POST /v1beta/models/{model}:countTokens` |
 
-如果需要原生 Responses、Anthropic Messages、embeddings 或 SDK simple-chat 路径暂不支持的直接 provider 行为，可以把 `GHCP_COPILOT_MODE` 或 `gateway.copilot.mode` 设置为 `opencode`。该模式会走 OpenCode 风格的直接 Copilot provider API 路径，适合明确需要 API 兼容特性的场景。
+如果请求形态超出 SDK simple-chat 能力，网关会显式返回错误；不会再切换到直接 provider HTTP 路径。Copilot 现在只支持 SDK/CLI 链路。
 
 ### 账号池与运维能力
 
@@ -82,7 +82,7 @@ docker run --rm -p 8000:8000 \
 | --- | --- |
 | `GHCP_HOST` / `GHCP_PORT` | 监听地址和端口，容器默认 `0.0.0.0:8000`。 |
 | `GHCP_BACKEND` | `fake` 或 `copilot`。 |
-| `GHCP_COPILOT_MODE` | `sdk` 或 `opencode`，默认 `sdk`。 |
+| `GHCP_COPILOT_MODE` | 仅支持 `sdk`；`opencode` 会被拒绝。 |
 | `GHCP_API_KEY` / `GHCP_API_KEYS` | 客户端调用网关使用的 API key，多个 key 可用逗号或空白分隔。 |
 | `GHCP_ADMIN_API_KEY` / `GHCP_ADMIN_API_KEYS` | 可选的独立管理员 API key。 |
 | `GHCP_COPILOT_TOKEN` | 网关访问 Copilot 上游所需的 GitHub/Copilot token。 |

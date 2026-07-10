@@ -2,9 +2,69 @@ package gateway
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 )
+
+func TestCLIBackendChatStreamEmitsIncrementalDeltas(t *testing.T) {
+	t.Parallel()
+
+	// Given
+	if os.Getenv("GHCP_BACKEND") != "copilot" {
+		t.Skip("requires GHCP_BACKEND=copilot")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	backend := NewCopilotCLIBackend("stream-test", os.Getenv("GHCP_COPILOT_TOKEN"), "")
+	defer func() {
+		if err := backend.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+	stream, err := backend.ChatStream(ctx, "gpt-4.1", []NeutralMessage{{Role: "user", Content: "Count from one to six with each number as a separate word."}}, nil)
+	if err != nil {
+		t.Fatalf("ChatStream() error = %v", err)
+	}
+
+	// When
+	items := make([]StreamItem, 0, 8)
+	for item := range stream {
+		items = append(items, item)
+		if item.Kind == "done" || item.Kind == "error" {
+			break
+		}
+	}
+
+	// Then
+	deltaCount := 0
+	terminalCount := 0
+	sawDone := false
+	for _, item := range items {
+		switch item.Kind {
+		case "delta":
+			deltaCount++
+		case "done":
+			terminalCount++
+			sawDone = true
+		case "error":
+			terminalCount++
+			t.Fatalf("stream returned error item: %v", item.Err)
+		}
+	}
+	if deltaCount < 2 {
+		t.Fatalf("delta count = %d, want at least 2; items=%+v", deltaCount, items)
+	}
+	if !sawDone {
+		t.Fatalf("expected terminal done item; items=%+v", items)
+	}
+	if terminalCount != 1 {
+		t.Fatalf("terminal item count = %d, want 1; items=%+v", terminalCount, items)
+	}
+	if last := items[len(items)-1]; last.Kind != "done" {
+		t.Fatalf("last item = %+v, want done", last)
+	}
+}
 
 // TestCopilotCLIBackend_GatewayIntegration verifies the CLI backend integrates with the Gateway
 func TestCopilotCLIBackend_GatewayIntegration(t *testing.T) {
@@ -177,14 +237,14 @@ func TestCopilotCLIBackend_ConfigurationOptions(t *testing.T) {
 // TestBuildBackend_CLIBackendCreation verifies buildBackend creates CLI backend correctly
 func TestBuildBackend_CLIBackendCreation(t *testing.T) {
 	ctx := context.Background()
-	
+
 	cfg := &AccountConfig{
 		ID:                      "cli-acc",
 		Token:                   "gho_clitest",
 		CopilotSDKWebSearchMode: "cli",
 		CopilotSDKTools:         []string{"view"},
 	}
-	
+
 	settings := Settings{
 		Backend: "copilot-cli",
 		Copilot: CopilotConfig{
@@ -192,18 +252,18 @@ func TestBuildBackend_CLIBackendCreation(t *testing.T) {
 			SDKTools:         []string{"edit"},
 		},
 	}
-	
+
 	backend, err := buildBackend(ctx, cfg, settings, "")
 	if err != nil {
 		t.Fatalf("buildBackend error: %v", err)
 	}
 	defer backend.Close()
-	
+
 	cliBE, ok := backend.(*CopilotCLIBackend)
 	if !ok {
 		t.Fatalf("backend is not CopilotCLIBackend, got %T", backend)
 	}
-	
+
 	if cliBE.accountID != "cli-acc" {
 		t.Errorf("accountID = %q, want %q", cliBE.accountID, "cli-acc")
 	}

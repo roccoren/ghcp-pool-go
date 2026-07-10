@@ -11,15 +11,28 @@ import (
 	sdk "github.com/github/copilot-sdk/go"
 )
 
+var (
+	copilotCLIClientForParams = func(b *CopilotCLIBackend, ctx context.Context, params map[string]any) (*sdk.Client, func(), error) {
+		return b.clientForParams(ctx, params)
+	}
+	copilotCLICreateSession = func(client *sdk.Client, ctx context.Context, cfg *sdk.SessionConfig) (*sdk.Session, error) {
+		return client.CreateSession(ctx, cfg)
+	}
+	copilotCLIDisconnectSession = func(session *sdk.Session) {
+		if session != nil {
+			session.Disconnect()
+		}
+	}
+	copilotCLIStreamSession = streamSDKSession
+)
+
 // CopilotCLIBackend is a backend that uses Copilot SDK in CLI mode exclusively.
-// Unlike CopilotBackend which supports both SDK and OpenCode modes, this backend
-// always uses ModeCopilotCli for maximum compatibility with Copilot CLI features.
 type CopilotCLIBackend struct {
-	accountID        string
-	githubToken      string
-	homeDir          string
-	webSearchMode    string
-	customTools      []string
+	accountID     string
+	githubToken   string
+	homeDir       string
+	webSearchMode string
+	customTools   []string
 
 	mu        sync.Mutex
 	sdkClient *sdk.Client
@@ -118,29 +131,30 @@ func (b *CopilotCLIBackend) Chat(ctx context.Context, model string, messages []N
 
 // ChatStream performs a streaming chat completion
 func (b *CopilotCLIBackend) ChatStream(ctx context.Context, model string, messages []NeutralMessage, params map[string]any) (<-chan StreamItem, error) {
-	result, err := b.chatCLI(ctx, model, messages, cleanBackendParams(params), false)
-	if err != nil {
-		return nil, err
-	}
-	out := make(chan StreamItem)
+	clean := cleanBackendParams(params)
+	prompt := b.buildPrompt(messages, clean)
+	endpoint := sdkUsageEndpoint(clean)
+	raw := make(chan StreamItem)
 	go func() {
-		defer close(out)
-		if result.Content != "" {
-			select {
-			case out <- StreamItem{Kind: "delta", Text: result.Content}:
-			case <-ctx.Done():
-				emitStreamItem(context.Background(), out, StreamItem{Kind: "error", Err: ctx.Err()})
-				return
-			}
+		defer close(raw)
+
+		client, cleanup, err := copilotCLIClientForParams(b, ctx, clean)
+		if err != nil {
+			emitStreamItem(ctx, raw, StreamItem{Kind: "error", Err: fmt.Errorf("cli backend: create sdk client: %w", err)})
+			return
 		}
-		for i, tc := range result.ToolCalls {
-			if !emitStreamItem(ctx, out, StreamItem{Kind: "tool_call", ToolCall: tc, Index: i}) {
-				return
-			}
+		defer cleanup()
+
+		session, err := copilotCLICreateSession(client, ctx, b.sessionConfig(model, clean, true))
+		if err != nil {
+			emitStreamItem(ctx, raw, StreamItem{Kind: "error", Err: fmt.Errorf("cli backend: create sdk session: %w", err)})
+			return
 		}
-		emitStreamItem(ctx, out, StreamItem{Kind: "done", Usage: result.Usage, FinishReason: result.FinishReason})
+		defer copilotCLIDisconnectSession(session)
+
+		copilotCLIStreamSession(ctx, session, prompt, endpoint, raw)
 	}()
-	return out, nil
+	return applyStreamOutputConstraints(ctx, raw, clean), nil
 }
 
 // Embeddings returns an error as CLI backend does not support embeddings
@@ -183,16 +197,16 @@ func (b *CopilotCLIBackend) chatCLI(ctx context.Context, model string, messages 
 
 // chatCLIOnce performs a single CLI-mode chat attempt
 func (b *CopilotCLIBackend) chatCLIOnce(ctx context.Context, model string, messages []NeutralMessage, params map[string]any, stream bool) (ChatResult, error) {
-	client, cleanup, err := b.clientForParams(ctx, params)
+	client, cleanup, err := copilotCLIClientForParams(b, ctx, params)
 	if err != nil {
 		return ChatResult{}, err
 	}
 	defer cleanup()
-	session, err := client.CreateSession(ctx, b.sessionConfig(model, params, stream))
+	session, err := copilotCLICreateSession(client, ctx, b.sessionConfig(model, params, stream))
 	if err != nil {
 		return ChatResult{}, err
 	}
-	defer session.Disconnect()
+	defer copilotCLIDisconnectSession(session)
 	prompt := b.buildPrompt(messages, params)
 	result, err := b.sendAndCollect(ctx, session, model, prompt, params)
 	if err != nil {

@@ -26,8 +26,7 @@ The rewrite keeps the same core contract:
 
 The offline `fake` backend is fully implemented for local testing. The real
 Copilot backend starts an official `github.com/github/copilot-sdk/go` client per
-account, using SDK authentication and SDK model discovery in the default mode.
-OpenCode mode is available when direct Copilot provider API behavior is needed.
+account and reaches Copilot through the SDK/CLI path only.
 
 ## Run
 
@@ -192,26 +191,19 @@ Useful admin controls:
 
 Set `GHCP_BACKEND=copilot` plus `GHCP_COPILOT_TOKEN` to route through the
 Copilot backend. `GHCP_COPILOT_TOKEN` should be a GitHub OAuth token. In the
-default SDK mode, the token is passed to the SDK runtime and model discovery is
-performed by the SDK rather than by the direct Copilot API.
-
-Choose the Copilot implementation with `GHCP_COPILOT_MODE` or
-`gateway.copilot.mode`:
-
-- `sdk` (default): official SDK behavior for authentication, model discovery,
-  and eligible simple chat turns. This mode never calls direct Copilot APIs; SDK
-  unsupported request shapes return an error instead of falling back to HTTP.
-- `opencode`: OpenCode-inspired direct provider behavior. This defaults
-  `auth_mode` to `oauth` and sends the GitHub OAuth token directly to
-  `https://api.githubcopilot.com` unless another Copilot API base URL is set.
+SDK/CLI-only mode, the token is passed to the SDK runtime and model discovery is
+performed by the SDK.
 
 Alternatively, set `GHCP_BACKEND=copilot-cli` to use the dedicated CLI backend.
 This backend uses the Copilot SDK exclusively in `ModeCopilotCli` mode, providing
 maximum compatibility with Copilot CLI features. The CLI backend is a
 simplified alternative to the full `copilot` backend that always runs in CLI
-mode without OpenCode fallback. Configuration options like
+mode. Configuration options like
 `GHCP_COPILOT_SDK_WEB_SEARCH_MODE` and `GHCP_COPILOT_SDK_AVAILABLE_TOOLS` are
 supported.
+
+Embeddings are unsupported under the SDK/CLI Copilot backends. Requests to
+`POST /v1/embeddings` on those backends return HTTP 501.
 
 SDK mode runs the Copilot client in multi-tenant-safe empty mode, so no SDK
 built-in tools are exposed by default. Set `GHCP_COPILOT_SDK_AVAILABLE_TOOLS`
@@ -371,25 +363,19 @@ The gateway also stubs `POST /api/event_logging/batch` (returns
 `{"status":"ok"}`) so Claude Code telemetry posts do not error.
 
 For GitHub Enterprise, set `GHCP_GITHUB_ENTERPRISE_URL=<enterprise-domain>`;
-the gateway derives `https://copilot-api.<enterprise-domain>` plus enterprise
-device-login URLs. The admin device-login flow defaults to the same public
-Copilot OAuth client ID used by OpenCode and can be overridden with
+the gateway derives enterprise device-login URLs. The admin device-login flow
+defaults to the public Copilot OAuth client ID and can be overridden with
 `GHCP_LOGIN_CLIENT_ID` or `gateway.login.client_id`.
 
 Docker builds run the official SDK bundler before compiling so the Copilot CLI
 runtime is embedded in the gateway binary. Local source builds need Go 1.24+.
 
-Model metadata from SDK discovery is retained per account. In OpenCode mode,
-direct `/models` metadata such as `supported_endpoints` and
-`model_picker_enabled` is also retained. The router uses those capabilities to
-choose between Chat Completions, Responses, Anthropic Messages, and embeddings
-endpoints when a model does not support the client-requested protocol directly;
+Model metadata from SDK discovery is retained per account. The router uses
+those capabilities to choose between Chat Completions, Responses, and
+Anthropic Messages when a model does not support the client-requested protocol
+directly;
 non-picker utility models remain routable but are not advertised from
 `/v1/models`.
-
-Use OpenCode mode for direct API-compatible features such as native Responses,
-Anthropic Messages, embeddings, or request parameters that the SDK simple-chat
-path does not support.
 
 Route strategies include `round_robin`, `least_busy`, `weighted`,
 `quota_aware`, and `smart`. The `smart`/`quota_aware` scoring considers recent
