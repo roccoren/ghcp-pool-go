@@ -16,7 +16,7 @@ func TestCLIBackendChatStreamEmitsIncrementalDeltas(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	backend := NewCopilotCLIBackend("stream-test", os.Getenv("GHCP_COPILOT_TOKEN"), "")
+	backend := newCLIBackend("stream-test", os.Getenv("GHCP_COPILOT_TOKEN"), "")
 	defer func() {
 		if err := backend.Close(); err != nil {
 			t.Fatalf("Close() error = %v", err)
@@ -72,10 +72,7 @@ func TestCopilotCLIBackend_GatewayIntegration(t *testing.T) {
 	defer cancel()
 
 	// Create a CLI backend
-	backend := NewCopilotCLIBackendWithOptions("test-cli", "gho_testtoken", "", CopilotCLIBackendOptions{
-		WebSearchMode: "cli",
-		CustomTools:   []string{"view", "edit"},
-	})
+	backend := newCLIBackendWithWebSearch("test-cli", "gho_testtoken", "", "cli", []string{"view", "edit"})
 	defer backend.Close()
 
 	// Verify it implements Backend interface
@@ -85,11 +82,11 @@ func TestCopilotCLIBackend_GatewayIntegration(t *testing.T) {
 	if backend.accountID != "test-cli" {
 		t.Errorf("accountID = %q, want %q", backend.accountID, "test-cli")
 	}
-	if backend.webSearchMode != "cli" {
-		t.Errorf("webSearchMode = %q, want %q", backend.webSearchMode, "cli")
+	if backend.sdkWebSearchMode != "cli" {
+		t.Errorf("webSearchMode = %q, want %q", backend.sdkWebSearchMode, "cli")
 	}
-	if len(backend.customTools) != 2 {
-		t.Errorf("len(customTools) = %d, want 2", len(backend.customTools))
+	if len(backend.sdkTools) != 2 {
+		t.Errorf("len(customTools) = %d, want 2", len(backend.sdkTools))
 	}
 
 	// Verify embeddings are unsupported
@@ -158,7 +155,7 @@ func TestCopilotCLIBackend_PoolIntegration(t *testing.T) {
 
 	// Verify both backends are CopilotCLIBackend type
 	for i, acc := range snapshot {
-		backend, ok := acc.Backend.(*CopilotCLIBackend)
+		backend, ok := acc.Backend.(*CopilotBackend)
 		if !ok {
 			t.Errorf("account[%d] backend is not CopilotCLIBackend, got %T", i, acc.Backend)
 			continue
@@ -223,12 +220,24 @@ func TestCopilotCLIBackend_ConfigurationOptions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			options := copilotCLIBackendOptions(tt.copilotConfig, &tt.config)
-			if options.WebSearchMode != tt.wantWebSearch {
-				t.Errorf("WebSearchMode = %q, want %q", options.WebSearchMode, tt.wantWebSearch)
+			settings := Settings{Backend: "copilot-cli", Copilot: tt.copilotConfig}
+			built, err := buildBackend(context.Background(), &tt.config, settings, "")
+			if err != nil {
+				t.Fatalf("buildBackend error: %v", err)
 			}
-			if len(options.CustomTools) != tt.wantTools {
-				t.Errorf("len(CustomTools) = %d, want %d", len(options.CustomTools), tt.wantTools)
+			defer built.Close()
+			backend, ok := built.(*CopilotBackend)
+			if !ok {
+				t.Fatalf("backend is %T, want *CopilotBackend", built)
+			}
+			if !backend.cliMode {
+				t.Error("copilot-cli backend must run the SDK client in CLI mode")
+			}
+			if backend.sdkWebSearchMode != tt.wantWebSearch {
+				t.Errorf("sdkWebSearchMode = %q, want %q", backend.sdkWebSearchMode, tt.wantWebSearch)
+			}
+			if len(backend.sdkTools) != tt.wantTools {
+				t.Errorf("len(sdkTools) = %d, want %d", len(backend.sdkTools), tt.wantTools)
 			}
 		})
 	}
@@ -259,7 +268,7 @@ func TestBuildBackend_CLIBackendCreation(t *testing.T) {
 	}
 	defer backend.Close()
 
-	cliBE, ok := backend.(*CopilotCLIBackend)
+	cliBE, ok := backend.(*CopilotBackend)
 	if !ok {
 		t.Fatalf("backend is not CopilotCLIBackend, got %T", backend)
 	}
@@ -267,11 +276,11 @@ func TestBuildBackend_CLIBackendCreation(t *testing.T) {
 	if cliBE.accountID != "cli-acc" {
 		t.Errorf("accountID = %q, want %q", cliBE.accountID, "cli-acc")
 	}
-	if cliBE.webSearchMode != "cli" {
-		t.Errorf("webSearchMode = %q, want %q", cliBE.webSearchMode, "cli")
+	if cliBE.sdkWebSearchMode != "cli" {
+		t.Errorf("webSearchMode = %q, want %q", cliBE.sdkWebSearchMode, "cli")
 	}
-	if len(cliBE.customTools) != 1 || cliBE.customTools[0] != "view" {
-		t.Errorf("customTools = %v, want [view]", cliBE.customTools)
+	if len(cliBE.sdkTools) != 1 || cliBE.sdkTools[0] != "view" {
+		t.Errorf("customTools = %v, want [view]", cliBE.sdkTools)
 	}
 }
 

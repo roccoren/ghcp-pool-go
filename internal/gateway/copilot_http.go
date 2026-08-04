@@ -54,6 +54,7 @@ type CopilotBackend struct {
 	githubToken      string
 	homeDir          string
 	mode             string
+	cliMode          bool
 	sdkWebSearch     bool
 	sdkWebSearchMode string
 	sdkTools         []string
@@ -65,6 +66,9 @@ type CopilotBackend struct {
 }
 
 type CopilotBackendOptions struct {
+	// CLIMode runs the SDK client in Copilot CLI mode instead of the
+	// multi-tenant-safe empty mode.
+	CLIMode          bool
 	Mode             string
 	SDKWebSearch     bool
 	SDKWebSearchMode string
@@ -81,6 +85,7 @@ func NewCopilotBackendWithOptions(accountID, token, homeDir string, options Copi
 		githubToken:      strings.TrimSpace(token),
 		homeDir:          homeDir,
 		mode:             normalizeCopilotBackendMode(options.Mode),
+		cliMode:          options.CLIMode,
 		sdkWebSearch:     options.SDKWebSearch,
 		sdkWebSearchMode: normalizeCopilotSDKWebSearchMode(options.SDKWebSearchMode, options.SDKWebSearch),
 		sdkTools:         normalizeStringList(options.SDKTools),
@@ -97,7 +102,7 @@ func (b *CopilotBackend) Start(ctx context.Context) error {
 		return nil
 	}
 	if b.sdkClient == nil {
-		b.sdkClient = sdk.NewClient(b.sdkClientOptions(sdk.ModeEmpty, ""))
+		b.sdkClient = sdk.NewClient(b.sdkClientOptions(b.defaultSDKClientMode(), ""))
 	}
 	client := b.sdkClient
 	b.mu.Unlock()
@@ -210,7 +215,26 @@ func (b *CopilotBackend) sdkGitHubToken() string {
 }
 
 func (b *CopilotBackend) sdkConfigured() bool {
-	return b.sdkGitHubToken() != "" || b.homeDir != ""
+	// CLI mode always has a usable client: with no token the SDK falls back to
+	// the logged-in user, which is how the CLI backend was always started.
+	return b.cliMode || b.sdkGitHubToken() != "" || b.homeDir != ""
+}
+
+// defaultSDKClientMode is the client mode for this backend's long-lived client.
+// CLI mode maximizes Copilot CLI feature compatibility; empty mode exposes no
+// built-in tools and is the multi-tenant-safe default.
+func (b *CopilotBackend) defaultSDKClientMode() sdk.ClientMode {
+	if b.cliMode {
+		return sdk.ModeCopilotCli
+	}
+	return sdk.ModeEmpty
+}
+
+func (b *CopilotBackend) sdkClientName() string {
+	if b.cliMode {
+		return "ghcp-pool-go-cli"
+	}
+	return "ghcp-pool-go"
 }
 
 func (b *CopilotBackend) sdk(ctx context.Context) (*sdk.Client, error) {
@@ -811,7 +835,7 @@ func truncateApproxTokens(content string, maxTokens int) (string, bool) {
 func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, stream bool) *sdk.SessionConfig {
 	if b.useSDKControlledCLIWebSearch(params) {
 		cfg := &sdk.SessionConfig{
-			ClientName:     "ghcp-pool-go",
+			ClientName:     b.sdkClientName(),
 			Model:          model,
 			Streaming:      sdk.Bool(stream),
 			Tools:          sdkCLIWebSearchTools(),
@@ -822,7 +846,7 @@ func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, s
 	}
 	if b.useSDKNativeCLIWebSearch(params) {
 		cfg := &sdk.SessionConfig{
-			ClientName:          "ghcp-pool-go",
+			ClientName:          b.sdkClientName(),
 			Model:               model,
 			Streaming:           sdk.Bool(stream),
 			Tools:               sdkNativeCLIWebSearchTools(params),
@@ -833,7 +857,7 @@ func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, s
 		return cfg
 	}
 	cfg := &sdk.SessionConfig{
-		ClientName:              "ghcp-pool-go",
+		ClientName:              b.sdkClientName(),
 		Model:                   model,
 		Streaming:               sdk.Bool(stream),
 		Tools:                   sdkCustomToolsFromParams(params),

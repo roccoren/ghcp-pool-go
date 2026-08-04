@@ -194,13 +194,11 @@ Copilot backend. `GHCP_COPILOT_TOKEN` should be a GitHub OAuth token. In the
 SDK/CLI-only mode, the token is passed to the SDK runtime and model discovery is
 performed by the SDK.
 
-Alternatively, set `GHCP_BACKEND=copilot-cli` to use the dedicated CLI backend.
-This backend uses the Copilot SDK exclusively in `ModeCopilotCli` mode, providing
-maximum compatibility with Copilot CLI features. The CLI backend is a
-simplified alternative to the full `copilot` backend that always runs in CLI
-mode. Configuration options like
-`GHCP_COPILOT_SDK_WEB_SEARCH_MODE` and `GHCP_COPILOT_SDK_AVAILABLE_TOOLS` are
-supported.
+Alternatively, set `GHCP_BACKEND=copilot-cli` to run the same backend with the
+SDK client in `ModeCopilotCli` instead of the multi-tenant-safe empty mode,
+which maximizes Copilot CLI feature compatibility. Both values select the same
+implementation and support the same configuration, including
+`GHCP_COPILOT_SDK_WEB_SEARCH_MODE` and `GHCP_COPILOT_SDK_AVAILABLE_TOOLS`.
 
 Embeddings are unsupported under the SDK/CLI Copilot backends. Requests to
 `POST /v1/embeddings` on those backends return HTTP 501.
