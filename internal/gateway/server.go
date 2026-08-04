@@ -874,7 +874,6 @@ func (s *server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 		KeyVaultURL:             stringsTrim(stringFromAny(payload["key_vault_url"])),
 		BaseDirectory:           baseDir,
 		CopilotMode:             stringsTrim(stringFromAny(payload["copilot_mode"])),
-		CopilotAuthMode:         stringsTrim(stringFromAny(payload["copilot_auth_mode"])),
 		CopilotSDKWebSearch:     boolPtrFromPayload(payload["copilot_sdk_web_search"]),
 		CopilotSDKWebSearchMode: stringsTrim(stringFromAny(payload["copilot_sdk_web_search_mode"])),
 		CopilotSDKTools:         stringSliceFromAny(payload["copilot_sdk_available_tools"]),

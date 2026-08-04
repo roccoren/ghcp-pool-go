@@ -21,18 +21,11 @@ import (
 const (
 	defaultCopilotOAuthClientID = "Ov23li8tweQw6odWQebz"
 	copilotBackendModeSDK       = "sdk"
-	copilotAuthModeExchange     = "exchange"
-	copilotAuthModeOAuth        = "oauth"
 	copilotUserAgent            = "GitHubCopilotChat/0.39.0"
 )
 
 var ValidCopilotBackendModes = map[string]bool{
 	copilotBackendModeSDK: true,
-}
-
-var ValidCopilotAuthModes = map[string]bool{
-	copilotAuthModeExchange: true,
-	copilotAuthModeOAuth:    true,
 }
 
 var sdkWebHTTPClient = &http.Client{Timeout: 20 * time.Second}
@@ -61,7 +54,7 @@ type CopilotBackend struct {
 	githubToken      string
 	homeDir          string
 	mode             string
-	authMode         string
+	cliMode          bool
 	sdkWebSearch     bool
 	sdkWebSearchMode string
 	sdkTools         []string
@@ -73,8 +66,10 @@ type CopilotBackend struct {
 }
 
 type CopilotBackendOptions struct {
+	// CLIMode runs the SDK client in Copilot CLI mode instead of the
+	// multi-tenant-safe empty mode.
+	CLIMode          bool
 	Mode             string
-	AuthMode         string
 	SDKWebSearch     bool
 	SDKWebSearchMode string
 	SDKTools         []string
@@ -90,7 +85,7 @@ func NewCopilotBackendWithOptions(accountID, token, homeDir string, options Copi
 		githubToken:      strings.TrimSpace(token),
 		homeDir:          homeDir,
 		mode:             normalizeCopilotBackendMode(options.Mode),
-		authMode:         normalizeCopilotAuthMode(defaultCopilotAuthMode(options.Mode, options.AuthMode)),
+		cliMode:          options.CLIMode,
 		sdkWebSearch:     options.SDKWebSearch,
 		sdkWebSearchMode: normalizeCopilotSDKWebSearchMode(options.SDKWebSearchMode, options.SDKWebSearch),
 		sdkTools:         normalizeStringList(options.SDKTools),
@@ -107,7 +102,7 @@ func (b *CopilotBackend) Start(ctx context.Context) error {
 		return nil
 	}
 	if b.sdkClient == nil {
-		b.sdkClient = sdk.NewClient(b.sdkClientOptions(sdk.ModeEmpty, ""))
+		b.sdkClient = sdk.NewClient(b.sdkClientOptions(b.defaultSDKClientMode(), ""))
 	}
 	client := b.sdkClient
 	b.mu.Unlock()
@@ -178,7 +173,7 @@ func (b *CopilotBackend) Chat(ctx context.Context, model string, messages []Neut
 	endpoint := endpointFromParams(params, endpointChatCompletions)
 	clean := cleanBackendParams(params)
 	if b.canUseSDK(messages, clean) {
-		return b.chatSDK(ctx, model, messages, clean, false)
+		return b.chatSDKStructured(ctx, model, messages, clean, false)
 	}
 	return ChatResult{}, unsupportedSDKModeRequest(endpoint)
 }
@@ -190,10 +185,44 @@ func (b *CopilotBackend) Embeddings(ctx context.Context, model string, inputs []
 func (b *CopilotBackend) ChatStream(ctx context.Context, model string, messages []NeutralMessage, params map[string]any) (<-chan StreamItem, error) {
 	endpoint := endpointFromParams(params, endpointChatCompletions)
 	clean := cleanBackendParams(params)
-	if b.canUseSDK(messages, clean) {
-		return b.chatStreamSDK(ctx, model, messages, clean)
+	if !b.canUseSDK(messages, clean) {
+		return nil, unsupportedSDKModeRequest(endpoint)
 	}
-	return nil, unsupportedSDKModeRequest(endpoint)
+	if parseResponseFormat(clean).wantsJSON() {
+		return b.chatStreamStructured(ctx, model, messages, clean)
+	}
+	return b.chatStreamSDK(ctx, model, messages, clean)
+}
+
+// chatStreamStructured serves a response_format request by completing the turn
+// first and only then emitting it.
+//
+// Structured output is validated, and a non-conforming answer is repaired or
+// rejected. None of that is expressible once tokens have already reached the
+// client, so these requests trade incremental delivery for the guarantee. The
+// buffered result has already been through applySDKOutputConstraints, so the
+// streaming constraint filter is deliberately not applied on top.
+func (b *CopilotBackend) chatStreamStructured(ctx context.Context, model string, messages []NeutralMessage, params map[string]any) (<-chan StreamItem, error) {
+	result, err := b.chatSDKStructured(ctx, model, messages, params, false)
+	if err != nil {
+		return nil, err
+	}
+	out := make(chan StreamItem)
+	go func() {
+		defer close(out)
+		if result.Content != "" {
+			if !emitStreamItem(ctx, out, StreamItem{Kind: "delta", Text: result.Content}) {
+				return
+			}
+		}
+		for i, call := range result.ToolCalls {
+			if !emitStreamItem(ctx, out, StreamItem{Kind: "tool_call", ToolCall: call, Index: i}) {
+				return
+			}
+		}
+		emitStreamItem(ctx, out, StreamItem{Kind: "done", Usage: result.Usage, FinishReason: result.FinishReason})
+	}()
+	return out, nil
 }
 
 func unsupportedSDKModeRequest(endpoint string) error {
@@ -220,7 +249,26 @@ func (b *CopilotBackend) sdkGitHubToken() string {
 }
 
 func (b *CopilotBackend) sdkConfigured() bool {
-	return b.sdkGitHubToken() != "" || b.homeDir != ""
+	// CLI mode always has a usable client: with no token the SDK falls back to
+	// the logged-in user, which is how the CLI backend was always started.
+	return b.cliMode || b.sdkGitHubToken() != "" || b.homeDir != ""
+}
+
+// defaultSDKClientMode is the client mode for this backend's long-lived client.
+// CLI mode maximizes Copilot CLI feature compatibility; empty mode exposes no
+// built-in tools and is the multi-tenant-safe default.
+func (b *CopilotBackend) defaultSDKClientMode() sdk.ClientMode {
+	if b.cliMode {
+		return sdk.ModeCopilotCli
+	}
+	return sdk.ModeEmpty
+}
+
+func (b *CopilotBackend) sdkClientName() string {
+	if b.cliMode {
+		return "ghcp-pool-go-cli"
+	}
+	return "ghcp-pool-go"
 }
 
 func (b *CopilotBackend) sdk(ctx context.Context) (*sdk.Client, error) {
@@ -329,18 +377,57 @@ func (b *CopilotBackend) canUseSDK(messages []NeutralMessage, params map[string]
 	return true
 }
 
+func (b *CopilotBackend) chatSDKStructured(ctx context.Context, model string, messages []NeutralMessage, params map[string]any, stream bool) (ChatResult, error) {
+	if err := structuredOutputToolConflict(params); err != nil {
+		return ChatResult{}, err
+	}
+	spec := parseResponseFormat(params)
+	result, err := b.chatSDK(ctx, model, messages, params, stream)
+	if err != nil || !spec.wantsJSON() || len(result.ToolCalls) > 0 {
+		return result, err
+	}
+	cause := validateStructuredOutput(result.Content, spec)
+	if cause == nil {
+		return result, nil
+	}
+	repaired, repairErr := b.chatSDK(ctx, model, structuredOutputRepairMessages(messages, result.Content, cause), params, stream)
+	if repairErr != nil {
+		return ChatResult{}, repairErr
+	}
+	repaired.Usage = accumulateUsage(result.Usage, repaired.Usage)
+	if len(repaired.ToolCalls) > 0 {
+		return repaired, nil
+	}
+	if err := validateStructuredOutput(repaired.Content, spec); err != nil {
+		return ChatResult{}, err
+	}
+	return repaired, nil
+}
+
 func (b *CopilotBackend) chatSDK(ctx context.Context, model string, messages []NeutralMessage, params map[string]any, stream bool) (ChatResult, error) {
+	return retryTransientChat(ctx, params, func() (ChatResult, error) {
+		return b.chatSDKOnce(ctx, model, messages, params, stream)
+	})
+}
+
+// retryTransientChat retries attempt while it reports upstream overload.
+//
+// Kept separate from the SDK call so the retry policy is exercisable without a
+// live session; the direct-HTTP test that used to cover it went away with the
+// transport it mocked.
+func retryTransientChat(ctx context.Context, params map[string]any, attempt func() (ChatResult, error)) (ChatResult, error) {
 	var lastErr error
-	for attempt := 0; attempt < transientRetryAttempts(params); attempt++ {
-		result, err := b.chatSDKOnce(ctx, model, messages, params, stream)
+	attempts := transientRetryAttempts(params)
+	for i := 0; i < attempts; i++ {
+		result, err := attempt()
 		if err == nil {
 			return result, nil
 		}
 		lastErr = err
-		if !isTransientOverloadError(err) || attempt == transientRetryAttempts(params)-1 {
+		if !isTransientOverloadError(err) || i == attempts-1 {
 			return ChatResult{}, err
 		}
-		if !sleepTransientRetry(ctx, attempt) {
+		if !sleepTransientRetry(ctx, i) {
 			return ChatResult{}, ctx.Err()
 		}
 	}
@@ -373,8 +460,13 @@ func transientRetryAttempts(params map[string]any) int {
 	return 3
 }
 
+// transientRetryDelay is a variable so tests can collapse the backoff.
+var transientRetryDelay = func(attempt int) time.Duration {
+	return time.Duration(750*(attempt+1)) * time.Millisecond
+}
+
 func sleepTransientRetry(ctx context.Context, attempt int) bool {
-	delay := time.Duration(750*(attempt+1)) * time.Millisecond
+	delay := transientRetryDelay(attempt)
 	select {
 	case <-time.After(delay):
 		return true
@@ -713,9 +805,11 @@ func (b *CopilotBackend) sdkPrompt(messages []NeutralMessage, params map[string]
 	} else {
 		prompt = renderPrompt(messages)
 	}
-	format := anyMap(params["response_format"])
-	if typ := strings.ToLower(stringFromAny(format["type"])); strings.Contains(typ, "json") {
-		prompt = strings.TrimSpace(prompt) + "\n\nRespond with valid JSON only."
+	spec := parseResponseFormat(params)
+	_, toolRegistered := structuredOutputTool(spec)
+	toolRegistered = toolRegistered && !toolChoiceIsNone(params["tool_choice"])
+	if instruction := structuredOutputInstruction(spec, toolRegistered); instruction != "" {
+		prompt = strings.TrimSpace(prompt) + "\n\n" + instruction
 	}
 	if instruction := b.sdkToolChoiceInstruction(params); instruction != "" {
 		prompt = strings.TrimSpace(prompt) + "\n\n" + instruction
@@ -748,6 +842,7 @@ func (b *CopilotBackend) sdkToolChoiceInstruction(params map[string]any) string 
 }
 
 func applySDKOutputConstraints(result ChatResult, params map[string]any) ChatResult {
+	result, lifted := applyStructuredOutput(result, parseResponseFormat(params))
 	if len(result.ToolCalls) > 0 {
 		result.FinishReason = "tool_calls"
 		result.Usage = result.Usage.Normalized()
@@ -764,7 +859,11 @@ func applySDKOutputConstraints(result ChatResult, params map[string]any) ChatRes
 			result.FinishReason = "length"
 		}
 	}
-	result.Usage.OutputTokens = approxTokens(result.Content)
+	// A lifted tool call carries the SDK's real output-token count; approximating
+	// from the lifted JSON would discard it and under-report usage.
+	if !lifted || result.Usage.OutputTokens == 0 {
+		result.Usage.OutputTokens = approxTokens(result.Content)
+	}
 	result.Usage = result.Usage.Normalized()
 	return result
 }
@@ -821,10 +920,10 @@ func truncateApproxTokens(content string, maxTokens int) (string, bool) {
 func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, stream bool) *sdk.SessionConfig {
 	if b.useSDKControlledCLIWebSearch(params) {
 		cfg := &sdk.SessionConfig{
-			ClientName:     "ghcp-pool-go",
+			ClientName:     b.sdkClientName(),
 			Model:          model,
 			Streaming:      sdk.Bool(stream),
-			Tools:          sdkCLIWebSearchTools(),
+			Tools:          withStructuredOutputTool(sdkCLIWebSearchTools(), params),
 			AvailableTools: b.sdkAvailableToolsForParams(params),
 		}
 		b.applySDKModelOptions(cfg, params)
@@ -832,10 +931,10 @@ func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, s
 	}
 	if b.useSDKNativeCLIWebSearch(params) {
 		cfg := &sdk.SessionConfig{
-			ClientName:          "ghcp-pool-go",
+			ClientName:          b.sdkClientName(),
 			Model:               model,
 			Streaming:           sdk.Bool(stream),
-			Tools:               sdkNativeCLIWebSearchTools(params),
+			Tools:               withStructuredOutputTool(sdkNativeCLIWebSearchTools(params), params),
 			AvailableTools:      b.sdkAvailableToolsForParams(params),
 			OnPermissionRequest: sdk.PermissionHandler.ApproveAll,
 		}
@@ -843,7 +942,7 @@ func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, s
 		return cfg
 	}
 	cfg := &sdk.SessionConfig{
-		ClientName:              "ghcp-pool-go",
+		ClientName:              b.sdkClientName(),
 		Model:                   model,
 		Streaming:               sdk.Bool(stream),
 		Tools:                   sdkCustomToolsFromParams(params),
@@ -1251,10 +1350,7 @@ func sdkCustomToolsFromParams(params map[string]any) []sdk.Tool {
 		return nil
 	}
 	tools, _ := params["tools"].([]map[string]any)
-	if len(tools) == 0 {
-		return nil
-	}
-	out := make([]sdk.Tool, 0, len(tools))
+	out := make([]sdk.Tool, 0, len(tools)+1)
 	seen := map[string]bool{}
 	for _, tool := range tools {
 		if isWebSearchToolSpec(tool) {
@@ -1275,6 +1371,9 @@ func sdkCustomToolsFromParams(params map[string]any) []sdk.Tool {
 			Parameters:  sdkToolParameters(tool),
 		})
 	}
+	// Declared here rather than in SessionConfig because this function also feeds
+	// the AvailableTools allowlist, which would otherwise filter the tool out.
+	out = withStructuredOutputTool(out, params)
 	if len(out) == 0 {
 		return nil
 	}
@@ -1339,27 +1438,12 @@ func normalizeDomain(raw string) string {
 	return strings.Trim(strings.TrimPrefix(strings.TrimPrefix(raw, "https://"), "http://"), "/")
 }
 
-func normalizeCopilotAuthMode(mode string) string {
-	mode = strings.ToLower(strings.TrimSpace(mode))
-	if mode == "" {
-		return copilotAuthModeExchange
-	}
-	return mode
-}
-
 func normalizeCopilotBackendMode(mode string) string {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	if mode == "" {
 		return copilotBackendModeSDK
 	}
 	return mode
-}
-
-func defaultCopilotAuthMode(_ string, authMode string) string {
-	if strings.TrimSpace(authMode) != "" {
-		return authMode
-	}
-	return copilotAuthModeExchange
 }
 
 func usableCopilotModel(id, policyState string, capabilities map[string]any) bool {

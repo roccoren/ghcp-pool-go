@@ -386,48 +386,27 @@ func buildBackend(ctx context.Context, cfg *AccountConfig, settings Settings, ho
 				os.Getenv("GITHUB_TOKEN"),
 			)
 		}
-		if settings.Backend == "copilot-cli" {
-			return NewCopilotCLIBackendWithOptions(cfg.ID, token, homeDir, copilotCLIBackendOptions(settings.Copilot, cfg)), nil
-		}
 		options, err := copilotBackendOptions(settings.Copilot, cfg)
 		if err != nil {
 			return nil, err
+		}
+		if settings.Backend == "copilot-cli" {
+			options.CLIMode = true
+			// The CLI backend folded the legacy web-search toggle into the mode at
+			// construction, so resolve the mode with the configured toggle first and
+			// only then pin the toggle on, leaving the mode alone to decide.
+			options.SDKWebSearchMode = normalizeCopilotSDKWebSearchMode(options.SDKWebSearchMode, options.SDKWebSearch)
+			options.SDKWebSearch = true
 		}
 		return NewCopilotBackendWithOptions(cfg.ID, token, homeDir, options), nil
 	}
 	return NewFakeBackend(cfg.ID, cfg.Models), nil
 }
 
-func copilotCLIBackendOptions(defaults CopilotConfig, cfg *AccountConfig) CopilotCLIBackendOptions {
-	sdkWebSearch := defaults.SDKWebSearch
-	if cfg.CopilotSDKWebSearch != nil {
-		sdkWebSearch = *cfg.CopilotSDKWebSearch
-	}
-	sdkWebSearchMode := defaults.SDKWebSearchMode
-	if cfg.CopilotSDKWebSearchMode != "" {
-		sdkWebSearchMode = cfg.CopilotSDKWebSearchMode
-	}
-	sdkTools := defaults.SDKTools
-	if len(cfg.CopilotSDKTools) > 0 {
-		sdkTools = cfg.CopilotSDKTools
-	}
-	return CopilotCLIBackendOptions{
-		WebSearchMode: normalizeCopilotSDKWebSearchMode(sdkWebSearchMode, sdkWebSearch),
-		CustomTools:   sdkTools,
-	}
-}
-
 func copilotBackendOptions(defaults CopilotConfig, cfg *AccountConfig) (CopilotBackendOptions, error) {
 	mode := normalizeCopilotBackendMode(firstNonEmpty(cfg.CopilotMode, defaults.Mode))
 	if !ValidCopilotBackendModes[mode] {
 		return CopilotBackendOptions{}, fmt.Errorf("invalid copilot mode %q for account %q; valid: sdk", mode, cfg.ID)
-	}
-	authMode := normalizeCopilotAuthMode(defaultCopilotAuthMode(mode, cfg.CopilotAuthMode))
-	if cfg.CopilotAuthMode == "" && cfg.CopilotMode == "" {
-		authMode = defaults.AuthMode
-	}
-	if !ValidCopilotAuthModes[authMode] {
-		return CopilotBackendOptions{}, fmt.Errorf("invalid copilot auth mode %q for account %q; valid: exchange, oauth", authMode, cfg.ID)
 	}
 	sdkWebSearch := defaults.SDKWebSearch
 	if cfg.CopilotSDKWebSearch != nil {
@@ -444,7 +423,7 @@ func copilotBackendOptions(defaults CopilotConfig, cfg *AccountConfig) (CopilotB
 	if len(cfg.CopilotSDKTools) > 0 {
 		sdkTools = cfg.CopilotSDKTools
 	}
-	return CopilotBackendOptions{Mode: mode, AuthMode: authMode, SDKWebSearch: sdkWebSearch, SDKWebSearchMode: sdkWebSearchMode, SDKTools: sdkTools}, nil
+	return CopilotBackendOptions{Mode: mode, SDKWebSearch: sdkWebSearch, SDKWebSearchMode: sdkWebSearchMode, SDKTools: sdkTools}, nil
 }
 
 func (p *PoolManager) Start(ctx context.Context) error {
@@ -506,6 +485,10 @@ func (p *PoolManager) EnabledAccounts() []*Account {
 	return out
 }
 
+// Snapshot returns the pooled accounts ordered by ID.
+//
+// Accounts are stored in a map, and Go randomizes map iteration, so an
+// unordered snapshot reshuffles the admin account listings on every request.
 func (p *PoolManager) Snapshot() []*Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -513,6 +496,7 @@ func (p *PoolManager) Snapshot() []*Account {
 	for _, account := range p.Accounts {
 		out = append(out, account)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID() < out[j].ID() })
 	return out
 }
 
@@ -602,6 +586,7 @@ func isNonRetryableClientError(message string) bool {
 		strings.Contains(text, "invalid_request_error") ||
 		strings.Contains(text, "bad request") ||
 		strings.Contains(text, "does not support reasoning effort configuration") ||
+		strings.Contains(text, structuredOutputFailure) ||
 		strings.Contains(text, "copilot sdk mode does not support this request shape")
 }
 

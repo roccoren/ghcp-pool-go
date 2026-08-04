@@ -8,8 +8,32 @@ import (
 	sdk "github.com/github/copilot-sdk/go"
 )
 
+// newCLIBackend builds a CLI-mode CopilotBackend, mirroring how pool.go
+// constructs the `copilot-cli` backend.
+func newCLIBackend(accountID, token, homeDir string) *CopilotBackend {
+	return NewCopilotBackendWithOptions(accountID, token, homeDir, CopilotBackendOptions{CLIMode: true})
+}
+
+// newCLIBackendWithWebSearch mirrors pool.go: the mode is resolved with the
+// configured toggle, then the toggle is pinned on.
+func newCLIBackendWithWebSearch(accountID, token, homeDir, webSearchMode string, tools []string) *CopilotBackend {
+	return NewCopilotBackendWithOptions(accountID, token, homeDir, CopilotBackendOptions{
+		CLIMode:          true,
+		SDKWebSearch:     true,
+		SDKWebSearchMode: normalizeCopilotSDKWebSearchMode(webSearchMode, webSearchMode != ""),
+		SDKTools:         tools,
+	})
+}
+
+// cliOptions mirrors the removed CopilotCLIBackendOptions so the CLI-mode
+// table tests keep their original shape.
+type cliOptions struct {
+	WebSearchMode string
+	CustomTools   []string
+}
+
 func TestCopilotCLIBackend_Implementation(t *testing.T) {
-	backend := NewCopilotCLIBackend("test-account", "gho_testtoken", "")
+	backend := newCLIBackend("test-account", "gho_testtoken", "")
 	if backend == nil {
 		t.Fatal("NewCopilotCLIBackend returned nil")
 	}
@@ -22,49 +46,49 @@ func TestCopilotCLIBackend_Implementation(t *testing.T) {
 func TestCopilotCLIBackend_WithOptions(t *testing.T) {
 	tests := []struct {
 		name    string
-		options CopilotCLIBackendOptions
+		options cliOptions
 		wantWeb string
 	}{
 		{
 			name:    "default options",
-			options: CopilotCLIBackendOptions{},
+			options: cliOptions{},
 			wantWeb: "off",
 		},
 		{
 			name:    "cli mode",
-			options: CopilotCLIBackendOptions{WebSearchMode: "cli"},
+			options: cliOptions{WebSearchMode: "cli"},
 			wantWeb: "cli",
 		},
 		{
 			name:    "native_cli mode",
-			options: CopilotCLIBackendOptions{WebSearchMode: "native_cli"},
+			options: cliOptions{WebSearchMode: "native_cli"},
 			wantWeb: "native_cli",
 		},
 		{
 			name:    "empty mode",
-			options: CopilotCLIBackendOptions{WebSearchMode: "empty"},
+			options: cliOptions{WebSearchMode: "empty"},
 			wantWeb: "empty",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			backend := NewCopilotCLIBackendWithOptions("test-account", "gho_testtoken", "", tt.options)
-			if backend.webSearchMode != tt.wantWeb {
-				t.Errorf("webSearchMode = %q, want %q", backend.webSearchMode, tt.wantWeb)
+			backend := newCLIBackendWithWebSearch("test-account", "gho_testtoken", "", tt.options.WebSearchMode, tt.options.CustomTools)
+			if backend.sdkWebSearchMode != tt.wantWeb {
+				t.Errorf("webSearchMode = %q, want %q", backend.sdkWebSearchMode, tt.wantWeb)
 			}
 		})
 	}
 }
 
 func TestCopilotCLIBackend_Close(t *testing.T) {
-	backend := NewCopilotCLIBackend("test-account", "gho_testtoken", "")
+	backend := newCLIBackend("test-account", "gho_testtoken", "")
 	if err := backend.Close(); err != nil {
 		t.Errorf("Close() returned unexpected error: %v", err)
 	}
 }
 
 func TestCopilotCLIBackend_Embeddings(t *testing.T) {
-	backend := NewCopilotCLIBackend("test-account", "gho_testtoken", "")
+	backend := newCLIBackend("test-account", "gho_testtoken", "")
 	ctx := context.Background()
 	_, err := backend.Embeddings(ctx, "model", []string{"test"}, nil)
 	if err != ErrEmbeddingsUnsupported {
@@ -104,8 +128,8 @@ func TestCopilotCLIBackend_ClientOptions(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			backend := NewCopilotCLIBackend(tt.accountID, "gho_testtoken", tt.homeDir)
-			opts := backend.cliClientOptions(tt.suffix)
+			backend := newCLIBackend(tt.accountID, "gho_testtoken", tt.homeDir)
+			opts := backend.sdkClientOptions(backend.defaultSDKClientMode(), tt.suffix)
 			if opts.BaseDirectory != tt.wantBase {
 				t.Errorf("BaseDirectory = %q, want %q", opts.BaseDirectory, tt.wantBase)
 			}
@@ -117,7 +141,7 @@ func TestCopilotCLIBackend_ClientOptions(t *testing.T) {
 }
 
 func TestCopilotCLIBackend_PromptBuilding(t *testing.T) {
-	backend := NewCopilotCLIBackend("test-account", "gho_testtoken", "")
+	backend := newCLIBackend("test-account", "gho_testtoken", "")
 	tests := []struct {
 		name     string
 		messages []NeutralMessage
@@ -149,12 +173,12 @@ func TestCopilotCLIBackend_PromptBuilding(t *testing.T) {
 			params: map[string]any{
 				"response_format": map[string]any{"type": "json_object"},
 			},
-			want: "Return data\n\nRespond with valid JSON only.",
+			want: "Return data\n\nRespond with a single valid JSON value and nothing else. Do not wrap it in markdown code fences.",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := backend.buildPrompt(tt.messages, tt.params)
+			got := backend.sdkPrompt(tt.messages, tt.params)
 			if got != tt.want {
 				t.Errorf("buildPrompt() = %q, want %q", got, tt.want)
 			}
@@ -221,10 +245,8 @@ func TestCopilotCLIBackend_ToolChoiceInstruction(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			backend := NewCopilotCLIBackendWithOptions("test-account", "gho_testtoken", "", CopilotCLIBackendOptions{
-				WebSearchMode: tt.webSearchMode,
-			})
-			got := backend.toolChoiceInstruction(tt.params)
+			backend := newCLIBackendWithWebSearch("test-account", "gho_testtoken", "", tt.webSearchMode, nil)
+			got := backend.sdkToolChoiceInstruction(tt.params)
 			if got != tt.want {
 				t.Errorf("toolChoiceInstruction() = %q, want %q", got, tt.want)
 			}
@@ -280,11 +302,8 @@ func TestCopilotCLIBackend_AvailableTools(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			backend := NewCopilotCLIBackendWithOptions("test-account", "gho_testtoken", "", CopilotCLIBackendOptions{
-				WebSearchMode: tt.webSearchMode,
-				CustomTools:   tt.customTools,
-			})
-			got := backend.availableToolsForParams(tt.params)
+			backend := newCLIBackendWithWebSearch("test-account", "gho_testtoken", "", tt.webSearchMode, tt.customTools)
+			got := backend.sdkAvailableToolsForParams(tt.params)
 			if len(got) != len(tt.want) {
 				t.Errorf("availableToolsForParams() length = %d, want %d", len(got), len(tt.want))
 				return
@@ -336,10 +355,8 @@ func TestCopilotCLIBackend_SessionConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			backend := NewCopilotCLIBackendWithOptions("test-account", "gho_testtoken", "", CopilotCLIBackendOptions{
-				WebSearchMode: tt.webSearchMode,
-			})
-			cfg := backend.sessionConfig(tt.model, tt.params, false)
+			backend := newCLIBackendWithWebSearch("test-account", "gho_testtoken", "", tt.webSearchMode, nil)
+			cfg := backend.sdkSessionConfig(tt.model, tt.params, false)
 			if cfg.ClientName != tt.wantClient {
 				t.Errorf("ClientName = %q, want %q", cfg.ClientName, tt.wantClient)
 			}
@@ -358,7 +375,7 @@ func TestCopilotCLIBackend_SessionConfig(t *testing.T) {
 }
 
 func TestCopilotCLIBackend_ModelOptions(t *testing.T) {
-	backend := NewCopilotCLIBackend("test-account", "gho_testtoken", "")
+	backend := newCLIBackend("test-account", "gho_testtoken", "")
 	tests := []struct {
 		name       string
 		model      string
@@ -403,7 +420,7 @@ func TestCopilotCLIBackend_ModelOptions(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := backend.sessionConfig(tt.model, tt.params, false)
+			cfg := backend.sdkSessionConfig(tt.model, tt.params, false)
 			if cfg.ReasoningEffort != tt.wantEffort {
 				t.Errorf("ReasoningEffort = %q, want %q", cfg.ReasoningEffort, tt.wantEffort)
 			}
@@ -415,7 +432,7 @@ func TestCopilotCLIBackend_ModelOptions(t *testing.T) {
 }
 
 func TestCopilotCLIBackend_Timeout(t *testing.T) {
-	backend := NewCopilotCLIBackend("test-account", "gho_testtoken", "")
+	backend := newCLIBackend("test-account", "gho_testtoken", "")
 	tests := []struct {
 		name          string
 		webSearchMode string
@@ -443,7 +460,7 @@ func TestCopilotCLIBackend_Timeout(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			backend.webSearchMode = tt.webSearchMode
+			backend.sdkWebSearchMode = tt.webSearchMode
 			ctx := context.Background()
 			if tt.deadline > 0 {
 				var cancel context.CancelFunc
@@ -452,7 +469,7 @@ func TestCopilotCLIBackend_Timeout(t *testing.T) {
 			}
 			start := time.Now()
 			timeout := 60 * time.Second
-			if backend.needsCLISession(tt.params) {
+			if backend.useSDKCLIWebSearch(tt.params) {
 				timeout = 180 * time.Second
 			}
 			if deadline, ok := ctx.Deadline(); ok {
@@ -474,35 +491,34 @@ func TestCopilotCLIBackend_Timeout(t *testing.T) {
 
 func TestCopilotCLIBackend_ChatStreamUsesStreamingSession(t *testing.T) {
 	// Given
-	backend := NewCopilotCLIBackendWithOptions("test-account", "gho_testtoken", "", CopilotCLIBackendOptions{WebSearchMode: "off"})
+	backend := newCLIBackendWithWebSearch("test-account", "gho_testtoken", "", "off", nil)
 	messages := []NeutralMessage{{Role: "system", Content: "You are terse."}, {Role: "user", Content: "List alpha beta gamma."}}
 	params := map[string]any{
-		"response_format": map[string]any{"type": "json_object"},
-		"tool_choice":     "required",
-		"tools":           []map[string]any{{"name": "calculator"}},
+		"tool_choice": "required",
+		"tools":       []map[string]any{{"name": "calculator"}},
 	}
-	wantPrompt := backend.buildPrompt(messages, params)
+	wantPrompt := backend.sdkPrompt(messages, params)
 	wantEndpoint := sdkUsageEndpoint(params)
 	cleanupDone := make(chan struct{}, 1)
 	disconnectDone := make(chan struct{}, 1)
 	var streamCalled bool
-	originalClientForParams := copilotCLIClientForParams
-	originalCreateSession := copilotCLICreateSession
-	originalDisconnectSession := copilotCLIDisconnectSession
-	originalStreamSession := copilotCLIStreamSession
+	originalClientForParams := copilotSDKClientForParams
+	originalCreateSession := copilotSDKCreateSession
+	originalDisconnectSession := copilotSDKDisconnectSession
+	originalStreamSession := copilotSDKStreamSession
 	t.Cleanup(func() {
-		copilotCLIClientForParams = originalClientForParams
-		copilotCLICreateSession = originalCreateSession
-		copilotCLIDisconnectSession = originalDisconnectSession
-		copilotCLIStreamSession = originalStreamSession
+		copilotSDKClientForParams = originalClientForParams
+		copilotSDKCreateSession = originalCreateSession
+		copilotSDKDisconnectSession = originalDisconnectSession
+		copilotSDKStreamSession = originalStreamSession
 	})
-	copilotCLIClientForParams = func(_ *CopilotCLIBackend, _ context.Context, gotParams map[string]any) (*sdk.Client, func(), error) {
+	copilotSDKClientForParams = func(_ *CopilotBackend, _ context.Context, gotParams map[string]any) (*sdk.Client, func(), error) {
 		if gotParams["tool_choice"] != params["tool_choice"] {
 			t.Fatalf("clientForParams tool_choice = %#v, want %#v", gotParams["tool_choice"], params["tool_choice"])
 		}
 		return nil, func() { cleanupDone <- struct{}{} }, nil
 	}
-	copilotCLICreateSession = func(_ *sdk.Client, _ context.Context, cfg *sdk.SessionConfig) (*sdk.Session, error) {
+	copilotSDKCreateSession = func(_ *sdk.Client, _ context.Context, cfg *sdk.SessionConfig) (*sdk.Session, error) {
 		if cfg == nil {
 			t.Fatal("CreateSession config is nil")
 		}
@@ -511,10 +527,10 @@ func TestCopilotCLIBackend_ChatStreamUsesStreamingSession(t *testing.T) {
 		}
 		return nil, nil
 	}
-	copilotCLIDisconnectSession = func(_ *sdk.Session) {
+	copilotSDKDisconnectSession = func(_ *sdk.Session) {
 		disconnectDone <- struct{}{}
 	}
-	copilotCLIStreamSession = func(_ context.Context, _ *sdk.Session, prompt, endpoint string, out chan<- StreamItem) {
+	copilotSDKStreamSession = func(_ context.Context, _ *sdk.Session, prompt, endpoint string, out chan<- StreamItem) {
 		streamCalled = true
 		if prompt != wantPrompt {
 			t.Fatalf("prompt = %q, want %q", prompt, wantPrompt)
