@@ -506,6 +506,10 @@ func (p *PoolManager) EnabledAccounts() []*Account {
 	return out
 }
 
+// Snapshot returns the pooled accounts ordered by ID.
+//
+// Accounts are stored in a map, and Go randomizes map iteration, so an
+// unordered snapshot reshuffles the admin account listings on every request.
 func (p *PoolManager) Snapshot() []*Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -513,6 +517,7 @@ func (p *PoolManager) Snapshot() []*Account {
 	for _, account := range p.Accounts {
 		out = append(out, account)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID() < out[j].ID() })
 	return out
 }
 
