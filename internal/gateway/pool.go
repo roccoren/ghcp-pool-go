@@ -422,13 +422,6 @@ func copilotBackendOptions(defaults CopilotConfig, cfg *AccountConfig) (CopilotB
 	if !ValidCopilotBackendModes[mode] {
 		return CopilotBackendOptions{}, fmt.Errorf("invalid copilot mode %q for account %q; valid: sdk", mode, cfg.ID)
 	}
-	authMode := normalizeCopilotAuthMode(defaultCopilotAuthMode(mode, cfg.CopilotAuthMode))
-	if cfg.CopilotAuthMode == "" && cfg.CopilotMode == "" {
-		authMode = defaults.AuthMode
-	}
-	if !ValidCopilotAuthModes[authMode] {
-		return CopilotBackendOptions{}, fmt.Errorf("invalid copilot auth mode %q for account %q; valid: exchange, oauth", authMode, cfg.ID)
-	}
 	sdkWebSearch := defaults.SDKWebSearch
 	if cfg.CopilotSDKWebSearch != nil {
 		sdkWebSearch = *cfg.CopilotSDKWebSearch
@@ -444,7 +437,7 @@ func copilotBackendOptions(defaults CopilotConfig, cfg *AccountConfig) (CopilotB
 	if len(cfg.CopilotSDKTools) > 0 {
 		sdkTools = cfg.CopilotSDKTools
 	}
-	return CopilotBackendOptions{Mode: mode, AuthMode: authMode, SDKWebSearch: sdkWebSearch, SDKWebSearchMode: sdkWebSearchMode, SDKTools: sdkTools}, nil
+	return CopilotBackendOptions{Mode: mode, SDKWebSearch: sdkWebSearch, SDKWebSearchMode: sdkWebSearchMode, SDKTools: sdkTools}, nil
 }
 
 func (p *PoolManager) Start(ctx context.Context) error {

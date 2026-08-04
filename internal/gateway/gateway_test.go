@@ -435,9 +435,6 @@ func TestLoadSettingsDefaultsCopilotProviderLogin(t *testing.T) {
 	if settings.Copilot.Mode != copilotBackendModeSDK {
 		t.Fatalf("mode=%q", settings.Copilot.Mode)
 	}
-	if settings.Copilot.AuthMode != copilotAuthModeExchange {
-		t.Fatalf("auth mode=%q", settings.Copilot.AuthMode)
-	}
 }
 
 func TestLoadSettingsSDKWebSearchAndToolsFlags(t *testing.T) {
@@ -508,7 +505,6 @@ func TestCopilotBackendOptionsAllowPerAccountSDKWebSearchOverride(t *testing.T) 
 	enabled := true
 	options, err := copilotBackendOptions(CopilotConfig{
 		Mode:         copilotBackendModeSDK,
-		AuthMode:     copilotAuthModeExchange,
 		SDKWebSearch: false,
 		SDKTools:     []string{"view"},
 	}, &AccountConfig{
@@ -1789,7 +1785,7 @@ func TestUsageAndUsers(t *testing.T) {
 		t.Fatal(overrides.Body.String())
 	}
 	cfg := gw.Pool.Get("u_copilot").Config
-	if cfg.CopilotMode != "sdk" || cfg.CopilotAuthMode != "oauth" {
+	if cfg.CopilotMode != "sdk" {
 		t.Fatalf("copilot overrides=%+v", cfg)
 	}
 	if cfg.CopilotSDKWebSearch == nil || !*cfg.CopilotSDKWebSearch || strings.Join(cfg.CopilotSDKTools, ",") != "web_search,view" {

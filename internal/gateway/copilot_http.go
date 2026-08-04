@@ -21,18 +21,11 @@ import (
 const (
 	defaultCopilotOAuthClientID = "Ov23li8tweQw6odWQebz"
 	copilotBackendModeSDK       = "sdk"
-	copilotAuthModeExchange     = "exchange"
-	copilotAuthModeOAuth        = "oauth"
 	copilotUserAgent            = "GitHubCopilotChat/0.39.0"
 )
 
 var ValidCopilotBackendModes = map[string]bool{
 	copilotBackendModeSDK: true,
-}
-
-var ValidCopilotAuthModes = map[string]bool{
-	copilotAuthModeExchange: true,
-	copilotAuthModeOAuth:    true,
 }
 
 var sdkWebHTTPClient = &http.Client{Timeout: 20 * time.Second}
@@ -61,7 +54,6 @@ type CopilotBackend struct {
 	githubToken      string
 	homeDir          string
 	mode             string
-	authMode         string
 	sdkWebSearch     bool
 	sdkWebSearchMode string
 	sdkTools         []string
@@ -74,7 +66,6 @@ type CopilotBackend struct {
 
 type CopilotBackendOptions struct {
 	Mode             string
-	AuthMode         string
 	SDKWebSearch     bool
 	SDKWebSearchMode string
 	SDKTools         []string
@@ -90,7 +81,6 @@ func NewCopilotBackendWithOptions(accountID, token, homeDir string, options Copi
 		githubToken:      strings.TrimSpace(token),
 		homeDir:          homeDir,
 		mode:             normalizeCopilotBackendMode(options.Mode),
-		authMode:         normalizeCopilotAuthMode(defaultCopilotAuthMode(options.Mode, options.AuthMode)),
 		sdkWebSearch:     options.SDKWebSearch,
 		sdkWebSearchMode: normalizeCopilotSDKWebSearchMode(options.SDKWebSearchMode, options.SDKWebSearch),
 		sdkTools:         normalizeStringList(options.SDKTools),
@@ -1339,27 +1329,12 @@ func normalizeDomain(raw string) string {
 	return strings.Trim(strings.TrimPrefix(strings.TrimPrefix(raw, "https://"), "http://"), "/")
 }
 
-func normalizeCopilotAuthMode(mode string) string {
-	mode = strings.ToLower(strings.TrimSpace(mode))
-	if mode == "" {
-		return copilotAuthModeExchange
-	}
-	return mode
-}
-
 func normalizeCopilotBackendMode(mode string) string {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	if mode == "" {
 		return copilotBackendModeSDK
 	}
 	return mode
-}
-
-func defaultCopilotAuthMode(_ string, authMode string) string {
-	if strings.TrimSpace(authMode) != "" {
-		return authMode
-	}
-	return copilotAuthModeExchange
 }
 
 func usableCopilotModel(id, policyState string, capabilities map[string]any) bool {
