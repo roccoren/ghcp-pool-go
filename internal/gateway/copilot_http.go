@@ -173,7 +173,7 @@ func (b *CopilotBackend) Chat(ctx context.Context, model string, messages []Neut
 	endpoint := endpointFromParams(params, endpointChatCompletions)
 	clean := cleanBackendParams(params)
 	if b.canUseSDK(messages, clean) {
-		return b.chatSDK(ctx, model, messages, clean, false)
+		return b.chatSDKStructured(ctx, model, messages, clean, false)
 	}
 	return ChatResult{}, unsupportedSDKModeRequest(endpoint)
 }
@@ -185,10 +185,44 @@ func (b *CopilotBackend) Embeddings(ctx context.Context, model string, inputs []
 func (b *CopilotBackend) ChatStream(ctx context.Context, model string, messages []NeutralMessage, params map[string]any) (<-chan StreamItem, error) {
 	endpoint := endpointFromParams(params, endpointChatCompletions)
 	clean := cleanBackendParams(params)
-	if b.canUseSDK(messages, clean) {
-		return b.chatStreamSDK(ctx, model, messages, clean)
+	if !b.canUseSDK(messages, clean) {
+		return nil, unsupportedSDKModeRequest(endpoint)
 	}
-	return nil, unsupportedSDKModeRequest(endpoint)
+	if parseResponseFormat(clean).wantsJSON() {
+		return b.chatStreamStructured(ctx, model, messages, clean)
+	}
+	return b.chatStreamSDK(ctx, model, messages, clean)
+}
+
+// chatStreamStructured serves a response_format request by completing the turn
+// first and only then emitting it.
+//
+// Structured output is validated, and a non-conforming answer is repaired or
+// rejected. None of that is expressible once tokens have already reached the
+// client, so these requests trade incremental delivery for the guarantee. The
+// buffered result has already been through applySDKOutputConstraints, so the
+// streaming constraint filter is deliberately not applied on top.
+func (b *CopilotBackend) chatStreamStructured(ctx context.Context, model string, messages []NeutralMessage, params map[string]any) (<-chan StreamItem, error) {
+	result, err := b.chatSDKStructured(ctx, model, messages, params, false)
+	if err != nil {
+		return nil, err
+	}
+	out := make(chan StreamItem)
+	go func() {
+		defer close(out)
+		if result.Content != "" {
+			if !emitStreamItem(ctx, out, StreamItem{Kind: "delta", Text: result.Content}) {
+				return
+			}
+		}
+		for i, call := range result.ToolCalls {
+			if !emitStreamItem(ctx, out, StreamItem{Kind: "tool_call", ToolCall: call, Index: i}) {
+				return
+			}
+		}
+		emitStreamItem(ctx, out, StreamItem{Kind: "done", Usage: result.Usage, FinishReason: result.FinishReason})
+	}()
+	return out, nil
 }
 
 func unsupportedSDKModeRequest(endpoint string) error {
@@ -341,6 +375,33 @@ func (b *CopilotBackend) canUseSDK(messages []NeutralMessage, params map[string]
 		return false
 	}
 	return true
+}
+
+func (b *CopilotBackend) chatSDKStructured(ctx context.Context, model string, messages []NeutralMessage, params map[string]any, stream bool) (ChatResult, error) {
+	if err := structuredOutputToolConflict(params); err != nil {
+		return ChatResult{}, err
+	}
+	spec := parseResponseFormat(params)
+	result, err := b.chatSDK(ctx, model, messages, params, stream)
+	if err != nil || !spec.wantsJSON() || len(result.ToolCalls) > 0 {
+		return result, err
+	}
+	cause := validateStructuredOutput(result.Content, spec)
+	if cause == nil {
+		return result, nil
+	}
+	repaired, repairErr := b.chatSDK(ctx, model, structuredOutputRepairMessages(messages, result.Content, cause), params, stream)
+	if repairErr != nil {
+		return ChatResult{}, repairErr
+	}
+	repaired.Usage = accumulateUsage(result.Usage, repaired.Usage)
+	if len(repaired.ToolCalls) > 0 {
+		return repaired, nil
+	}
+	if err := validateStructuredOutput(repaired.Content, spec); err != nil {
+		return ChatResult{}, err
+	}
+	return repaired, nil
 }
 
 func (b *CopilotBackend) chatSDK(ctx context.Context, model string, messages []NeutralMessage, params map[string]any, stream bool) (ChatResult, error) {
@@ -744,9 +805,11 @@ func (b *CopilotBackend) sdkPrompt(messages []NeutralMessage, params map[string]
 	} else {
 		prompt = renderPrompt(messages)
 	}
-	format := anyMap(params["response_format"])
-	if typ := strings.ToLower(stringFromAny(format["type"])); strings.Contains(typ, "json") {
-		prompt = strings.TrimSpace(prompt) + "\n\nRespond with valid JSON only."
+	spec := parseResponseFormat(params)
+	_, toolRegistered := structuredOutputTool(spec)
+	toolRegistered = toolRegistered && !toolChoiceIsNone(params["tool_choice"])
+	if instruction := structuredOutputInstruction(spec, toolRegistered); instruction != "" {
+		prompt = strings.TrimSpace(prompt) + "\n\n" + instruction
 	}
 	if instruction := b.sdkToolChoiceInstruction(params); instruction != "" {
 		prompt = strings.TrimSpace(prompt) + "\n\n" + instruction
@@ -779,6 +842,7 @@ func (b *CopilotBackend) sdkToolChoiceInstruction(params map[string]any) string 
 }
 
 func applySDKOutputConstraints(result ChatResult, params map[string]any) ChatResult {
+	result, lifted := applyStructuredOutput(result, parseResponseFormat(params))
 	if len(result.ToolCalls) > 0 {
 		result.FinishReason = "tool_calls"
 		result.Usage = result.Usage.Normalized()
@@ -795,7 +859,11 @@ func applySDKOutputConstraints(result ChatResult, params map[string]any) ChatRes
 			result.FinishReason = "length"
 		}
 	}
-	result.Usage.OutputTokens = approxTokens(result.Content)
+	// A lifted tool call carries the SDK's real output-token count; approximating
+	// from the lifted JSON would discard it and under-report usage.
+	if !lifted || result.Usage.OutputTokens == 0 {
+		result.Usage.OutputTokens = approxTokens(result.Content)
+	}
 	result.Usage = result.Usage.Normalized()
 	return result
 }
@@ -855,7 +923,7 @@ func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, s
 			ClientName:     b.sdkClientName(),
 			Model:          model,
 			Streaming:      sdk.Bool(stream),
-			Tools:          sdkCLIWebSearchTools(),
+			Tools:          withStructuredOutputTool(sdkCLIWebSearchTools(), params),
 			AvailableTools: b.sdkAvailableToolsForParams(params),
 		}
 		b.applySDKModelOptions(cfg, params)
@@ -866,7 +934,7 @@ func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, s
 			ClientName:          b.sdkClientName(),
 			Model:               model,
 			Streaming:           sdk.Bool(stream),
-			Tools:               sdkNativeCLIWebSearchTools(params),
+			Tools:               withStructuredOutputTool(sdkNativeCLIWebSearchTools(params), params),
 			AvailableTools:      b.sdkAvailableToolsForParams(params),
 			OnPermissionRequest: sdk.PermissionHandler.ApproveAll,
 		}
@@ -1282,10 +1350,7 @@ func sdkCustomToolsFromParams(params map[string]any) []sdk.Tool {
 		return nil
 	}
 	tools, _ := params["tools"].([]map[string]any)
-	if len(tools) == 0 {
-		return nil
-	}
-	out := make([]sdk.Tool, 0, len(tools))
+	out := make([]sdk.Tool, 0, len(tools)+1)
 	seen := map[string]bool{}
 	for _, tool := range tools {
 		if isWebSearchToolSpec(tool) {
@@ -1306,6 +1371,9 @@ func sdkCustomToolsFromParams(params map[string]any) []sdk.Tool {
 			Parameters:  sdkToolParameters(tool),
 		})
 	}
+	// Declared here rather than in SessionConfig because this function also feeds
+	// the AvailableTools allowlist, which would otherwise filter the tool out.
+	out = withStructuredOutputTool(out, params)
 	if len(out) == 0 {
 		return nil
 	}

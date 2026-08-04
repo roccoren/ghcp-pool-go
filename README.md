@@ -215,6 +215,103 @@ set `GHCP_COPILOT_SDK_WEB_SEARCH_MODE=native_cli`; this exposes native
 `web_search` through the CLI-mode SDK client, while `web_fetch` is handled by
 the gateway so GitHub blob/raw URLs can be normalized before fetching.
 
+### Structured Output (`response_format`)
+
+The gateway supports OpenAI-style structured output on the SDK and CLI backends:
+
+```bash
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer $GHCP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-haiku-4.5",
+    "messages": [{"role": "user", "content": "Ada Lovelace, born 1815 in London."}],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "person",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "name": {"type": "string"},
+            "birth_year": {"type": "integer"},
+            "city": {"type": "string"}
+          },
+          "required": ["name", "birth_year", "city"],
+          "additionalProperties": false
+        }
+      }
+    }
+  }'
+# => {"birth_year":1815,"city":"London","name":"Ada Lovelace"}
+```
+
+Both `{"type": "json_object"}` and `{"type": "json_schema"}` are accepted, on
+`/v1/chat/completions` and on `/v1/responses` (where the same contract is spelled
+`text.format`).
+
+`stream: true` is honored but not incremental for these requests. Validation and
+repair are impossible once tokens have reached the client, so a `response_format`
+request is completed and checked first, then emitted. Requests without
+`response_format` keep full token-by-token streaming.
+
+#### Why this needs a gateway-side implementation
+
+The Copilot SDK has **no** structured-output parameter. `MessageOptions` carries
+only a prompt, `SessionConfig` exposes no output schema, and
+`AssistantMessageData.Content` is a plain string. This is a protocol-level gap,
+identical in every language binding, and unchanged from SDK v1.0.0 through
+v1.0.9-preview.3. Upstream tracks it as
+[github/copilot-sdk#41](https://github.com/github/copilot-sdk/issues/41), still
+open. Upgrading the SDK does not help, and the Copilot CLI has no equivalent
+flag either — `--output-format json` controls the CLI's own event envelope, not
+the model's answer.
+
+The gateway therefore reconstructs the contract from the primitives the SDK does
+provide, strongest first:
+
+1. **Schema as tool.** For `json_schema`, a synthetic tool named
+   `ghcp_structured_output` is declared whose JSON Schema *is* the caller's
+   schema, so the schema reaches the model natively. Its arguments become the
+   answer; the tool call itself is stripped from the response.
+2. **Extraction.** Markdown fences and surrounding prose are removed.
+3. **Validation.** The payload is validated against the caller's schema.
+4. **Repair or fail.** One corrective retry with the validation error fed back,
+   then an explicit error — never a `200` carrying non-conforming content.
+
+Because step 1 is steering rather than constrained decoding, conformance is
+enforced by validation, not guaranteed by the model. That is the strongest
+contract available on this backend.
+
+#### Behavior worth knowing
+
+| Situation | Behavior |
+| --- | --- |
+| `ghcp_structured_output` used as a caller tool name | Request rejected — the name is gateway-reserved when `json_schema` is requested |
+| `tool_choice` is `none`, `required`, `any`, or a forced function | Synthetic tool withheld; falls back to prompt + validation (weaker). A tool invisible to the client must not satisfy a caller-visible `tool_choice` |
+| Model returns a caller tool call | That takes precedence; structured output is not forced |
+| `stream: true` with `response_format` | Buffered, then emitted — see above |
+| `json_object` with a non-object top level | Rejected, matching OpenAI semantics |
+| Caller schema fails to compile | Client error, not a silent validation bypass |
+| Caller schema over 128 KB | Rejected |
+
+Schema compilation is cached in a bounded LRU (512 entries), and structured
+output failures are marked non-retryable so they are not replayed against other
+pooled accounts.
+
+#### Validating against a live backend
+
+```bash
+scripts/structured-output-smoke.sh --gh-user <user> [--model MODEL] [--backend copilot|copilot-cli]
+```
+
+Covers schema conformance, tool-call hiding, usage accounting, unfenced
+`json_object`, nested enum/array schemas, streaming, reserved-name rejection,
+and the `/v1/responses` `text.format` path. Verified green on `gpt-5-mini`,
+`claude-haiku-4.5`, and `gemini-3.5-flash`, on both the `copilot` and
+`copilot-cli` backends.
+
 ### Reasoning Effort and Context Tiers
 
 High-capability models automatically get optimal defaults for reasoning effort

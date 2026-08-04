@@ -173,7 +173,7 @@ func TestCopilotCLIBackend_PromptBuilding(t *testing.T) {
 			params: map[string]any{
 				"response_format": map[string]any{"type": "json_object"},
 			},
-			want: "Return data\n\nRespond with valid JSON only.",
+			want: "Return data\n\nRespond with a single valid JSON value and nothing else. Do not wrap it in markdown code fences.",
 		},
 	}
 	for _, tt := range tests {
@@ -494,9 +494,8 @@ func TestCopilotCLIBackend_ChatStreamUsesStreamingSession(t *testing.T) {
 	backend := newCLIBackendWithWebSearch("test-account", "gho_testtoken", "", "off", nil)
 	messages := []NeutralMessage{{Role: "system", Content: "You are terse."}, {Role: "user", Content: "List alpha beta gamma."}}
 	params := map[string]any{
-		"response_format": map[string]any{"type": "json_object"},
-		"tool_choice":     "required",
-		"tools":           []map[string]any{{"name": "calculator"}},
+		"tool_choice": "required",
+		"tools":       []map[string]any{{"name": "calculator"}},
 	}
 	wantPrompt := backend.sdkPrompt(messages, params)
 	wantEndpoint := sdkUsageEndpoint(params)

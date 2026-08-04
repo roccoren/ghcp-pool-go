@@ -586,6 +586,7 @@ func isNonRetryableClientError(message string) bool {
 		strings.Contains(text, "invalid_request_error") ||
 		strings.Contains(text, "bad request") ||
 		strings.Contains(text, "does not support reasoning effort configuration") ||
+		strings.Contains(text, structuredOutputFailure) ||
 		strings.Contains(text, "copilot sdk mode does not support this request shape")
 }
 
