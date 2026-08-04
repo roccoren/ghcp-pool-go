@@ -344,17 +344,29 @@ func (b *CopilotBackend) canUseSDK(messages []NeutralMessage, params map[string]
 }
 
 func (b *CopilotBackend) chatSDK(ctx context.Context, model string, messages []NeutralMessage, params map[string]any, stream bool) (ChatResult, error) {
+	return retryTransientChat(ctx, params, func() (ChatResult, error) {
+		return b.chatSDKOnce(ctx, model, messages, params, stream)
+	})
+}
+
+// retryTransientChat retries attempt while it reports upstream overload.
+//
+// Kept separate from the SDK call so the retry policy is exercisable without a
+// live session; the direct-HTTP test that used to cover it went away with the
+// transport it mocked.
+func retryTransientChat(ctx context.Context, params map[string]any, attempt func() (ChatResult, error)) (ChatResult, error) {
 	var lastErr error
-	for attempt := 0; attempt < transientRetryAttempts(params); attempt++ {
-		result, err := b.chatSDKOnce(ctx, model, messages, params, stream)
+	attempts := transientRetryAttempts(params)
+	for i := 0; i < attempts; i++ {
+		result, err := attempt()
 		if err == nil {
 			return result, nil
 		}
 		lastErr = err
-		if !isTransientOverloadError(err) || attempt == transientRetryAttempts(params)-1 {
+		if !isTransientOverloadError(err) || i == attempts-1 {
 			return ChatResult{}, err
 		}
-		if !sleepTransientRetry(ctx, attempt) {
+		if !sleepTransientRetry(ctx, i) {
 			return ChatResult{}, ctx.Err()
 		}
 	}
@@ -387,8 +399,13 @@ func transientRetryAttempts(params map[string]any) int {
 	return 3
 }
 
+// transientRetryDelay is a variable so tests can collapse the backoff.
+var transientRetryDelay = func(attempt int) time.Duration {
+	return time.Duration(750*(attempt+1)) * time.Millisecond
+}
+
 func sleepTransientRetry(ctx context.Context, attempt int) bool {
-	delay := time.Duration(750*(attempt+1)) * time.Millisecond
+	delay := transientRetryDelay(attempt)
 	select {
 	case <-time.After(delay):
 		return true
