@@ -300,6 +300,10 @@ Schema compilation is cached in a bounded LRU (512 entries), and structured
 output failures are marked non-retryable so they are not replayed against other
 pooled accounts.
 
+For the full design — why this lives in the gateway, the four layers, the
+behavior rules, and where the guarantee stops — see
+[`docs/structured-output-cn.md`](docs/structured-output-cn.md) (Chinese).
+
 #### Validating against a live backend
 
 ```bash
