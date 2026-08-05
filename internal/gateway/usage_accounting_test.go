@@ -133,3 +133,42 @@ func TestStreamStopSequenceTerminalReportsBothSides(t *testing.T) {
 		t.Errorf("total %d is below input+output", done.Usage.TotalTokens)
 	}
 }
+
+func TestLocalTruncationKeepsUsageInternallyConsistent(t *testing.T) {
+	// Local truncation makes the upstream total describe different content than
+	// the client received. Keeping it leaves total-prompt disagreeing with
+	// completion, which any consumer parsing the usage block will trip over.
+	in := make(chan StreamItem, 4)
+	in <- StreamItem{Kind: "delta", Text: "alpha beta gamma delta epsilon zeta"}
+	in <- StreamItem{Kind: "done", Usage: Usage{InputTokens: 16, OutputTokens: 900, TotalTokens: 916}}
+	close(in)
+
+	var done StreamItem
+	for item := range applyStreamOutputConstraints(t.Context(), in, map[string]any{"max_tokens": 2}) {
+		if item.Kind == "done" {
+			done = item
+		}
+	}
+	if done.FinishReason != "length" {
+		t.Fatalf("finish = %q, want length", done.FinishReason)
+	}
+	if got := done.Usage.TotalTokens; got != done.Usage.InputTokens+done.Usage.OutputTokens {
+		t.Errorf("total=%d but prompt=%d + completion=%d: the block must stay self-consistent after local truncation",
+			got, done.Usage.InputTokens, done.Usage.OutputTokens)
+	}
+}
+
+func TestBufferedTruncationKeepsUsageInternallyConsistent(t *testing.T) {
+	result := ChatResult{
+		Content: "alpha beta gamma delta epsilon zeta",
+		Usage:   Usage{InputTokens: 16, OutputTokens: 900, TotalTokens: 916},
+	}
+	got := applySDKOutputConstraints(result, map[string]any{"max_tokens": 2})
+	if got.FinishReason != "length" {
+		t.Fatalf("finish = %q, want length", got.FinishReason)
+	}
+	if got.Usage.TotalTokens != got.Usage.InputTokens+got.Usage.OutputTokens {
+		t.Errorf("total=%d but prompt=%d + completion=%d after local truncation",
+			got.Usage.TotalTokens, got.Usage.InputTokens, got.Usage.OutputTokens)
+	}
+}

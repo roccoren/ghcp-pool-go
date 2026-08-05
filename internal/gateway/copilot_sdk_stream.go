@@ -150,9 +150,13 @@ func applyStreamOutputConstraints(ctx context.Context, in <-chan StreamItem, par
 			}
 		}
 
+		// A terminal emitted from here means the content was cut locally, so the
+		// upstream total describes text the client never received. Drop it and let
+		// Normalized rebuild the total from what was actually emitted.
 		emitTerminal := func(finish string) bool {
 			usage := seen
 			usage.OutputTokens = approxTokens(emitted)
+			usage.TotalTokens = 0
 			return emitStreamItem(ctx, out, StreamItem{Kind: "done", FinishReason: finish, Usage: usage.Normalized()})
 		}
 
@@ -212,6 +216,9 @@ func applyStreamOutputConstraints(ctx context.Context, in <-chan StreamItem, par
 					// content was trimmed here and no longer matches it.
 					if item.Usage.OutputTokens == 0 || emitted != accumulated {
 						item.Usage.OutputTokens = approxTokens(emitted)
+					}
+					if emitted != accumulated {
+						item.Usage.TotalTokens = 0
 					}
 					item.Usage = item.Usage.Normalized()
 				}

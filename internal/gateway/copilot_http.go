@@ -863,9 +863,14 @@ func applySDKOutputConstraints(result ChatResult, params map[string]any) ChatRes
 	}
 	// The SDK's own count is authoritative. Approximate only when it is absent,
 	// or when the content was trimmed here so the upstream count no longer
-	// describes what the client receives.
+	// describes what the client receives. In that case the upstream total
+	// describes different content too, so drop it and let Normalized recompute:
+	// a usage block whose total disagrees with its own parts is unparseable.
 	if result.Usage.OutputTokens == 0 || trimmed {
 		result.Usage.OutputTokens = approxTokens(result.Content)
+	}
+	if trimmed {
+		result.Usage.TotalTokens = 0
 	}
 	result.Usage = result.Usage.Normalized()
 	return result
