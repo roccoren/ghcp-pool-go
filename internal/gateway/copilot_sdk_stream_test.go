@@ -135,14 +135,16 @@ func TestApplyStreamOutputConstraints(t *testing.T) {
 		if len(items) != 3 {
 			t.Fatalf("item count=%d items=%+v", len(items), items)
 		}
-		if got := items[0].Text + items[1].Text; got != "alpha beta gamma " {
+		// approxTokens counts characters rather than whitespace-separated words, so
+		// three tokens is less text than three words.
+		if got := items[0].Text + items[1].Text; got != "alpha beta" {
 			t.Fatalf("content=%q", got)
 		}
 		if got := items[2]; got.Kind != "done" || got.FinishReason != "length" {
 			t.Fatalf("done item=%+v", got)
 		}
-		if got := items[2].Usage.OutputTokens; got != approxTokens("alpha beta gamma") {
-			t.Fatalf("output tokens=%d want=%d", got, approxTokens("alpha beta gamma"))
+		if got := items[2].Usage.OutputTokens; got != approxTokens("alpha beta") {
+			t.Fatalf("output tokens=%d want=%d", got, approxTokens("alpha beta"))
 		}
 	})
 
@@ -174,8 +176,13 @@ func TestApplyStreamOutputConstraints(t *testing.T) {
 		if got := items[2]; got.Kind != "done" || got.FinishReason != "stop" {
 			t.Fatalf("done item=%+v", got)
 		}
-		if got := items[2].Usage.OutputTokens; got != approxTokens("alpha beta") {
-			t.Fatalf("output tokens=%d want=%d", got, approxTokens("alpha beta"))
+		// Nothing was trimmed here, so the upstream count still describes what the
+		// client received and must not be replaced by the approximation.
+		if got := items[2].Usage.OutputTokens; got != 99 {
+			t.Fatalf("output tokens=%d, want the upstream 99 preserved", got)
+		}
+		if got := items[2].Usage.TotalTokens; got != 101 {
+			t.Fatalf("total tokens=%d, want 101", got)
 		}
 	})
 

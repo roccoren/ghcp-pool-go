@@ -131,18 +131,33 @@ func applyStreamOutputConstraints(ctx context.Context, in <-chan StreamItem, par
 		accumulated := ""
 		emitted := ""
 		toolSeen := false
+		// Carries the input side and any upstream counts, so a locally triggered
+		// terminal frame does not report output tokens alone.
+		seen := Usage{}
 
+		absorb := func(u Usage) {
+			if u.InputTokens != 0 || u.TotalTokens != 0 {
+				seen = mergeSDKUsage(seen, u)
+			}
+		}
+
+		// Draining also collects the upstream usage, which arrives on the final
+		// event. A locally triggered terminal fires before that event, so without
+		// this the input side would be missing from exactly those turns.
 		drain := func() {
-			for range in {
+			for item := range in {
+				absorb(item.Usage)
 			}
 		}
 
 		emitTerminal := func(finish string) bool {
-			usage := Usage{OutputTokens: approxTokens(emitted)}.Normalized()
-			return emitStreamItem(ctx, out, StreamItem{Kind: "done", FinishReason: finish, Usage: usage})
+			usage := seen
+			usage.OutputTokens = approxTokens(emitted)
+			return emitStreamItem(ctx, out, StreamItem{Kind: "done", FinishReason: finish, Usage: usage.Normalized()})
 		}
 
 		for item := range in {
+			absorb(item.Usage)
 			switch item.Kind {
 			case "delta":
 				if toolSeen {
@@ -178,11 +193,8 @@ func applyStreamOutputConstraints(ctx context.Context, in <-chan StreamItem, par
 					emitted = constrained
 				}
 				if finish != "" {
-					if !emitTerminal(finish) {
-						drain()
-						return
-					}
 					drain()
+					emitTerminal(finish)
 					return
 				}
 			case "tool_call":
@@ -196,7 +208,11 @@ func applyStreamOutputConstraints(ctx context.Context, in <-chan StreamItem, par
 				return
 			case "done":
 				if !toolSeen {
-					item.Usage.OutputTokens = approxTokens(emitted)
+					// Only approximate when the upstream count is missing or when the
+					// content was trimmed here and no longer matches it.
+					if item.Usage.OutputTokens == 0 || emitted != accumulated {
+						item.Usage.OutputTokens = approxTokens(emitted)
+					}
 					item.Usage = item.Usage.Normalized()
 				}
 				_ = emitStreamItem(ctx, out, item)

@@ -204,11 +204,50 @@ func (b *FakeBackend) render(model string, messages []NeutralMessage, effort str
 	return content, usage
 }
 
+// approxTokens estimates a token count without pulling in a tokenizer.
+//
+// Splitting on whitespace collapses any script that does not delimit words with
+// spaces — Chinese, Japanese, Korean, Thai — to a single token regardless of
+// length, which silently zeroed out usage accounting and max_tokens for those
+// languages. Count wide scripts per rune and everything else at the usual
+// four-characters-per-token rule of thumb.
 func approxTokens(text string) int {
 	if strings.TrimSpace(text) == "" {
 		return 0
 	}
-	return max(1, len(strings.Fields(text)))
+	wide, narrow := 0, 0
+	for _, r := range text {
+		if isWideScriptRune(r) {
+			wide++
+		} else {
+			narrow++
+		}
+	}
+	return max(1, wide+(narrow+3)/4)
+}
+
+// isWideScriptRune reports whether r belongs to a script whose characters are
+// roughly one token each rather than part of a space-delimited word.
+func isWideScriptRune(r rune) bool {
+	switch {
+	case r >= 0x3040 && r <= 0x30FF: // hiragana, katakana
+		return true
+	case r >= 0x3400 && r <= 0x4DBF: // CJK extension A
+		return true
+	case r >= 0x4E00 && r <= 0x9FFF: // CJK unified ideographs
+		return true
+	case r >= 0xAC00 && r <= 0xD7AF: // hangul syllables
+		return true
+	case r >= 0xF900 && r <= 0xFAFF: // CJK compatibility ideographs
+		return true
+	case r >= 0x0E00 && r <= 0x0E7F: // thai
+		return true
+	case r >= 0xFF00 && r <= 0xFF65: // fullwidth forms
+		return true
+	case r >= 0x3000 && r <= 0x303F: // CJK punctuation
+		return true
+	}
+	return false
 }
 
 func renderPrompt(messages []NeutralMessage) string {

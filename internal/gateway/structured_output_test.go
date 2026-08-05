@@ -246,7 +246,7 @@ func TestApplyStructuredOutputLiftsSyntheticToolCall(t *testing.T) {
 			{ID: "call_1", Name: structuredOutputToolName, Arguments: `{"name":"ada","age":36}`},
 		},
 	}
-	got, _ := applyStructuredOutput(result, spec)
+	got := applyStructuredOutput(result, spec)
 	if got.Content != `{"name":"ada","age":36}` {
 		t.Errorf("Content = %q, want lifted tool arguments", got.Content)
 	}
@@ -267,7 +267,7 @@ func TestApplyStructuredOutputPreservesCallerToolCalls(t *testing.T) {
 			{ID: "call_2", Name: structuredOutputToolName, Arguments: `{"name":"ada","age":36}`},
 		},
 	}
-	got, _ := applyStructuredOutput(result, spec)
+	got := applyStructuredOutput(result, spec)
 	if len(got.ToolCalls) != 1 || got.ToolCalls[0].Name != "get_weather" {
 		t.Fatalf("ToolCalls = %v, want only the caller tool preserved", got.ToolCalls)
 	}
@@ -277,7 +277,7 @@ func TestApplyStructuredOutputPreservesCallerToolCalls(t *testing.T) {
 }
 
 func TestApplyStructuredOutputUnwrapsFencedContent(t *testing.T) {
-	got, _ := applyStructuredOutput(
+	got := applyStructuredOutput(
 		ChatResult{Content: "```json\n{\"name\":\"ada\",\"age\":36}\n```", FinishReason: "stop"},
 		responseFormatSpec{Kind: "json_object"},
 	)
@@ -288,7 +288,7 @@ func TestApplyStructuredOutputUnwrapsFencedContent(t *testing.T) {
 
 func TestApplyStructuredOutputIsNoopWithoutResponseFormat(t *testing.T) {
 	original := ChatResult{Content: "```json\n{\"a\":1}\n```", FinishReason: "stop"}
-	got, _ := applyStructuredOutput(original, responseFormatSpec{})
+	got := applyStructuredOutput(original, responseFormatSpec{})
 	if got.Content != original.Content {
 		t.Errorf("Content = %q, want untouched %q", got.Content, original.Content)
 	}
@@ -695,35 +695,16 @@ func TestStructuredOutputToolWithheldForConstrainedToolChoice(t *testing.T) {
 
 func TestApplyStructuredOutputLiftsValidEmptyObject(t *testing.T) {
 	spec := responseFormatSpec{Kind: "json_schema", Schema: map[string]any{"type": "object"}}
-	got, lifted := applyStructuredOutput(ChatResult{
+	got := applyStructuredOutput(ChatResult{
 		FinishReason: "tool_calls",
 		ToolCalls:    []ToolCall{{ID: "c1", Name: structuredOutputToolName, Arguments: `{}`}},
 	}, spec)
 
-	if !lifted {
-		t.Fatal("an empty object is a valid structured answer and must be lifted")
-	}
 	if got.Content != `{}` {
 		t.Errorf("Content = %q, want {}", got.Content)
 	}
 	if err := validateStructuredOutput(got.Content, spec); err != nil {
 		t.Errorf("{} should validate against a bare object schema: %v", err)
-	}
-}
-
-func TestApplyStructuredOutputReportsLiftForUsageAccounting(t *testing.T) {
-	spec := responseFormatSpec{Kind: "json_schema", Schema: personSchema()}
-
-	_, lifted := applyStructuredOutput(ChatResult{
-		ToolCalls: []ToolCall{{Name: structuredOutputToolName, Arguments: `{"name":"ada","age":36}`}},
-	}, spec)
-	if !lifted {
-		t.Error("lifting a synthetic tool call must be reported")
-	}
-
-	_, lifted = applyStructuredOutput(ChatResult{Content: `{"name":"ada","age":36}`}, spec)
-	if lifted {
-		t.Error("plain content is not a lift")
 	}
 }
 
