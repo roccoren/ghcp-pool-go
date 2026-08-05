@@ -17,9 +17,15 @@ type Usage struct {
 	QuotaSnapshots json.RawMessage `json:"quota_snapshots,omitempty" yaml:"quota_snapshots"`
 }
 
+// Normalized fills in a missing or stale total.
+//
+// Usage is seeded before the output count is known, so a total set at that point
+// equals the input count. Recomputing only when the total falls below the parts
+// corrects that without discarding a larger upstream total, which can legitimately
+// include tokens that appear in neither input nor output.
 func (u Usage) Normalized() Usage {
-	if u.TotalTokens == 0 {
-		u.TotalTokens = u.InputTokens + u.OutputTokens
+	if sum := u.InputTokens + u.OutputTokens; u.TotalTokens < sum {
+		u.TotalTokens = sum
 	}
 	return u
 }

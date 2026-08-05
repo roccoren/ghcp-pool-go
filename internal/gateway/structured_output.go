@@ -231,14 +231,10 @@ func structuredOutputInstruction(spec responseFormatSpec, toolRegistered bool) s
 
 // applyStructuredOutput lifts a synthetic tool call into the response content
 // and normalizes that content to a bare JSON payload.
-//
-// The boolean reports whether a synthetic tool call was lifted, so callers can
-// keep the SDK-reported token counts instead of re-approximating them.
-func applyStructuredOutput(result ChatResult, spec responseFormatSpec) (ChatResult, bool) {
+func applyStructuredOutput(result ChatResult, spec responseFormatSpec) ChatResult {
 	if !spec.wantsJSON() {
-		return result, false
+		return result
 	}
-	lifted := false
 	if len(result.ToolCalls) > 0 {
 		kept := make([]ToolCall, 0, len(result.ToolCalls))
 		for _, call := range result.ToolCalls {
@@ -248,7 +244,6 @@ func applyStructuredOutput(result ChatResult, spec responseFormatSpec) (ChatResu
 			}
 			if args := strings.TrimSpace(call.Arguments); args != "" {
 				result.Content = args
-				lifted = true
 			}
 		}
 		if len(kept) == 0 {
@@ -257,7 +252,7 @@ func applyStructuredOutput(result ChatResult, spec responseFormatSpec) (ChatResu
 		result.ToolCalls = kept
 	}
 	if len(result.ToolCalls) > 0 {
-		return result, lifted
+		return result
 	}
 	if payload, ok := extractJSONPayload(result.Content); ok {
 		result.Content = payload
@@ -265,7 +260,7 @@ func applyStructuredOutput(result ChatResult, spec responseFormatSpec) (ChatResu
 	if result.FinishReason == "tool_calls" {
 		result.FinishReason = "stop"
 	}
-	return result, lifted
+	return result
 }
 
 // validateStructuredOutput checks that content is valid JSON and, when the

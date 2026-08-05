@@ -842,7 +842,7 @@ func (b *CopilotBackend) sdkToolChoiceInstruction(params map[string]any) string 
 }
 
 func applySDKOutputConstraints(result ChatResult, params map[string]any) ChatResult {
-	result, lifted := applyStructuredOutput(result, parseResponseFormat(params))
+	result = applyStructuredOutput(result, parseResponseFormat(params))
 	if len(result.ToolCalls) > 0 {
 		result.FinishReason = "tool_calls"
 		result.Usage = result.Usage.Normalized()
@@ -853,16 +853,24 @@ func applySDKOutputConstraints(result ChatResult, params map[string]any) ChatRes
 		result.Content = content
 		result.FinishReason = "stop"
 	}
+	trimmed := stopped
 	if maxTokens := sdkMaxOutputTokens(params); maxTokens > 0 {
 		if truncated, ok := truncateApproxTokens(result.Content, maxTokens); ok {
 			result.Content = truncated
 			result.FinishReason = "length"
+			trimmed = true
 		}
 	}
-	// A lifted tool call carries the SDK's real output-token count; approximating
-	// from the lifted JSON would discard it and under-report usage.
-	if !lifted || result.Usage.OutputTokens == 0 {
+	// The SDK's own count is authoritative. Approximate only when it is absent,
+	// or when the content was trimmed here so the upstream count no longer
+	// describes what the client receives. In that case the upstream total
+	// describes different content too, so drop it and let Normalized recompute:
+	// a usage block whose total disagrees with its own parts is unparseable.
+	if result.Usage.OutputTokens == 0 || trimmed {
 		result.Usage.OutputTokens = approxTokens(result.Content)
+	}
+	if trimmed {
+		result.Usage.TotalTokens = 0
 	}
 	result.Usage = result.Usage.Normalized()
 	return result
@@ -906,15 +914,33 @@ func applyStopSequences(content string, value any) (string, bool) {
 	return content[:cut], true
 }
 
+// truncateApproxTokens trims content to roughly maxTokens, counted the same way
+// approxTokens counts, and cuts on a rune boundary so scripts without spaces are
+// not left unbounded or rejoined with spaces they never had.
 func truncateApproxTokens(content string, maxTokens int) (string, bool) {
-	if maxTokens <= 0 {
+	if maxTokens <= 0 || approxTokens(content) <= maxTokens {
 		return content, false
 	}
-	fields := strings.Fields(content)
-	if len(fields) <= maxTokens {
-		return content, false
+	runes := []rune(content)
+	wide, narrow, cut := 0, 0, len(runes)
+	for i, r := range runes {
+		if isWideScriptRune(r) {
+			wide++
+		} else {
+			narrow++
+		}
+		if wide+(narrow+3)/4 > maxTokens {
+			cut = i
+			break
+		}
 	}
-	return strings.Join(fields[:maxTokens], " "), true
+	head := string(runes[:cut])
+	// Prefer a word boundary so space-delimited text is not cut mid-word. Scripts
+	// without spaces have no boundary to find and are cut on the rune.
+	if idx := strings.LastIndexAny(head, " \t\n"); idx > 0 {
+		head = head[:idx]
+	}
+	return strings.TrimRight(head, " \t\n"), true
 }
 
 func (b *CopilotBackend) sdkSessionConfig(model string, params map[string]any, stream bool) *sdk.SessionConfig {
