@@ -24,8 +24,16 @@ type GeminiContent struct {
 
 type GeminiPart struct {
 	Text             string                  `json:"text,omitempty"`
+	InlineData       *GeminiInlineData       `json:"inlineData,omitempty"`
 	FunctionCall     *GeminiFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *GeminiFunctionResponse `json:"functionResponse,omitempty"`
+}
+
+// GeminiInlineData is Gemini's inline media block. Without it the field never
+// parsed, so images were discarded before reaching the neutral conversion.
+type GeminiInlineData struct {
+	MIMEType string `json:"mimeType,omitempty"`
+	Data     string `json:"data,omitempty"`
 }
 
 type GeminiFunctionCall struct {
@@ -305,18 +313,32 @@ func geminiContentToChatMessages(content GeminiContent) ([]ChatMessage, error) {
 
 func geminiUserContentToChat(content GeminiContent) ([]ChatMessage, error) {
 	messages := []ChatMessage{}
+	imageParts := []any{}
 	textParts := []string{}
 	flush := func() {
-		if len(textParts) == 0 {
+		if len(textParts) == 0 && len(imageParts) == 0 {
 			return
 		}
 		text := strings.Join(textParts, "\n\n")
-		messages = append(messages, ChatMessage{Role: "user", Content: text, Raw: map[string]any{"role": "user", "content": text}})
+		var payload any = text
+		if len(imageParts) > 0 {
+			parts := make([]any, 0, len(imageParts)+1)
+			if text != "" {
+				parts = append(parts, map[string]any{"type": "text", "text": text})
+			}
+			payload = append(parts, imageParts...)
+		}
+		messages = append(messages, ChatMessage{Role: "user", Content: payload, Raw: map[string]any{"role": "user", "content": payload}})
 		textParts = nil
+		imageParts = nil
 	}
 	for _, part := range content.Parts {
 		if part.Text != "" {
 			textParts = append(textParts, part.Text)
+		}
+		if part.InlineData != nil && part.InlineData.Data != "" {
+			mime := firstNonEmpty(part.InlineData.MIMEType, "image/png")
+			imageParts = append(imageParts, imageURLPart(mime, part.InlineData.Data))
 		}
 		if part.FunctionResponse != nil {
 			flush()

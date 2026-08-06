@@ -446,7 +446,11 @@ func (b *CopilotBackend) chatSDKOnce(ctx context.Context, model string, messages
 	}
 	defer session.Disconnect()
 	prompt := b.sdkPrompt(messages, params)
-	result, err := b.sendSDKAndCollect(ctx, session, model, prompt, params)
+	attachments, err := sdkAttachments(messages)
+	if err != nil {
+		return ChatResult{}, err
+	}
+	result, err := b.sendSDKAndCollect(ctx, session, model, prompt, params, attachments)
 	if err != nil {
 		return ChatResult{}, err
 	}
@@ -475,7 +479,7 @@ func sleepTransientRetry(ctx context.Context, attempt int) bool {
 	}
 }
 
-func (b *CopilotBackend) sendSDKAndCollect(ctx context.Context, session *sdk.Session, model, prompt string, params map[string]any) (ChatResult, error) {
+func (b *CopilotBackend) sendSDKAndCollect(ctx context.Context, session *sdk.Session, model, prompt string, params map[string]any, attachments []sdk.Attachment) (ChatResult, error) {
 	// Always enforce maximum timeout, even if parent context has a deadline
 	timeout := 60 * time.Second
 	if b.useSDKCLIWebSearch(params) {
@@ -559,7 +563,7 @@ func (b *CopilotBackend) sendSDKAndCollect(ctx context.Context, session *sdk.Ses
 	})
 	defer unsubscribe()
 
-	if _, err := session.Send(ctx, sdk.MessageOptions{Prompt: prompt}); err != nil {
+	if _, err := session.Send(ctx, sdk.MessageOptions{Prompt: prompt, Attachments: attachments}); err != nil {
 		return ChatResult{}, err
 	}
 
@@ -774,6 +778,10 @@ func mergeSDKUsage(base, next Usage) Usage {
 
 func (b *CopilotBackend) chatStreamSDK(ctx context.Context, model string, messages []NeutralMessage, params map[string]any) (<-chan StreamItem, error) {
 	prompt := b.sdkPrompt(messages, params)
+	attachments, err := sdkAttachments(messages)
+	if err != nil {
+		return nil, err
+	}
 	endpoint := sdkUsageEndpoint(params)
 	raw := make(chan StreamItem)
 	go func() {
@@ -793,7 +801,7 @@ func (b *CopilotBackend) chatStreamSDK(ctx context.Context, model string, messag
 		}
 		defer copilotSDKDisconnectSession(session)
 
-		copilotSDKStreamSession(ctx, session, prompt, endpoint, raw)
+		copilotSDKStreamSession(ctx, session, prompt, endpoint, raw, attachments...)
 	}()
 	return applyStreamOutputConstraints(ctx, raw, params), nil
 }

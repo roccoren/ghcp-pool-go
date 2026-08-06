@@ -96,6 +96,12 @@ type NeutralMessage struct {
 	Content    string           `json:"content"`
 	ToolCalls  []map[string]any `json:"tool_calls,omitempty"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`
+	// Attachments carries images, which the SDK takes as message attachments
+	// rather than as content blocks.
+	Attachments []MessageAttachment `json:"-"`
+	// DeclaredImages counts image blocks seen on the wire, including ones that
+	// did not convert, so a silent drop can be turned into an error.
+	DeclaredImages int `json:"-"`
 }
 
 type ChatMessage struct {
@@ -191,7 +197,12 @@ func (r ChatCompletionRequest) SamplingParams() map[string]any {
 func (r ChatCompletionRequest) NeutralMessages() []NeutralMessage {
 	out := make([]NeutralMessage, 0, len(r.Messages))
 	for _, m := range r.Messages {
-		entry := NeutralMessage{Role: m.Role, Content: m.Text()}
+		entry := NeutralMessage{
+			Role:           m.Role,
+			Content:        m.Text(),
+			Attachments:    attachmentsFromContent(m.Content),
+			DeclaredImages: countImageBlocks(m.Content),
+		}
 		if raw := m.Raw; raw != nil {
 			if tcs, ok := raw["tool_calls"].([]any); ok {
 				for _, tc := range tcs {
