@@ -784,7 +784,7 @@ func TestChatStreamBuffersStructuredOutput(t *testing.T) {
 		return nil, nil
 	}
 	copilotSDKDisconnectSession = func(*sdk.Session) {}
-	copilotSDKStreamSession = func(ctx context.Context, _ *sdk.Session, _, _ string, out chan<- StreamItem) {
+	copilotSDKStreamSession = func(ctx context.Context, _ *sdk.Session, _, _ string, out chan<- StreamItem, _ ...sdk.Attachment) {
 		streamed = true
 		emitStreamItem(ctx, out, StreamItem{Kind: "done", FinishReason: "stop"})
 	}

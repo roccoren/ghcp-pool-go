@@ -316,6 +316,45 @@ and the `/v1/responses` `text.format` path. Verified green on `gpt-5-mini`,
 `claude-haiku-4.5`, and `gemini-3.5-flash`, on both the `copilot` and
 `copilot-cli` backends.
 
+### Image input
+
+Images are forwarded to the model on all three protocols, in each protocol's own
+shape:
+
+| Protocol | Shape |
+| --- | --- |
+| OpenAI | `content[].image_url.url` |
+| Anthropic | `content[]` block with `type: image` and `source.data` |
+| Gemini | `parts[].inlineData` |
+
+```bash
+curl -sS localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer $GHCP_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-5-mini","messages":[{"role":"user","content":[
+        {"type":"text","text":"What is the dominant color?"},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,<BASE64>"}}]}]}'
+```
+
+Only inline base64 is accepted — a `data:` URI on OpenAI/Gemini, or
+`source.type: base64` on Anthropic. A remote `http(s)` image URL is rejected
+rather than fetched, since fetching it would turn any request into an outbound
+call the caller did not authorize. Payloads above 8 MiB are rejected. In every
+rejected case the request fails with an explicit error; images are never
+silently dropped.
+
+Sending an image to a model without vision support is rejected upstream with an
+actionable message rather than answered blind:
+
+```
+Image input is not supported by the current model.
+Switch to a vision-capable model to use image attachments.
+```
+
+`/v1/models` reports per-model support as `capabilities.supports_vision`. The
+gateway does not pre-check it, so a model whose capability metadata is missing
+or stale is still attempted rather than wrongly refused. The SDK runtime
+resizes images that exceed model limits.
+
 ### Reasoning Effort and Context Tiers
 
 High-capability models automatically get optimal defaults for reasoning effort

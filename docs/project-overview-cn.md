@@ -23,12 +23,18 @@ ghcp-pool-go 是一个面向 GitHub Copilot 能力的高并发网关。它把一
 | --- | --- |
 | OpenAI Chat Completions | `POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` |
-| OpenAI Embeddings | `POST /v1/embeddings` |
 | Anthropic Messages | `POST /v1/messages` |
 | Anthropic token count | `POST /v1/messages/count_tokens` |
 | Gemini generate/count | `GET /v1beta/models`、`POST /v1beta/models/{model}:generateContent`、`POST /v1beta/models/{model}:countTokens` |
 
-如果请求形态超出 SDK simple-chat 能力，网关会显式返回错误；不会再切换到直接 provider HTTP 路径。Copilot 现在只支持 SDK/CLI 链路。
+如果请求形态超出 SDK 能力，网关会显式返回错误；不会再切换到直接 provider HTTP 路径。Copilot 现在只支持 SDK/CLI 链路。
+
+`POST /v1/embeddings` 已随直连路径一并移除——SDK 不提供 embeddings 接口，该端点现在会明确返回「当前后端不支持」。
+
+三套协议均支持图像输入（内联 base64，不抓取远程 URL），用法见
+[`docs/usage-guide-cn.md`](usage-guide-cn.md) 的「图像输入」一节。
+结构化输出（`response_format`）的设计见
+[`docs/structured-output-cn.md`](structured-output-cn.md)。
 
 ### 账号池与运维能力
 
@@ -54,7 +60,6 @@ go run ./cmd/ghcp-pool
 ```bash
 export GHCP_CONFIG=/tmp/ghcp-pool-empty.yaml
 export GHCP_BACKEND=copilot
-export GHCP_COPILOT_MODE=sdk
 export GHCP_API_KEY="sk-change-me"
 export GHCP_COPILOT_TOKEN="$(gh auth token)"
 
@@ -70,7 +75,6 @@ docker build -t ghcp-pool-go .
 
 docker run --rm -p 8000:8000 \
   -e GHCP_BACKEND=copilot \
-  -e GHCP_COPILOT_MODE=sdk \
   -e GHCP_API_KEY=sk-change-me \
   -e GHCP_COPILOT_TOKEN="$(gh auth token)" \
   ghcp-pool-go
@@ -82,7 +86,7 @@ docker run --rm -p 8000:8000 \
 | --- | --- |
 | `GHCP_HOST` / `GHCP_PORT` | 监听地址和端口，容器默认 `0.0.0.0:8000`。 |
 | `GHCP_BACKEND` | `fake` 或 `copilot`。 |
-| `GHCP_COPILOT_MODE` | 仅支持 `sdk`；`opencode` 会被拒绝。 |
+| `GHCP_COPILOT_MODE` | 已废弃，无需设置。设为 `opencode` 会告警并回落到 `sdk`。 |
 | `GHCP_API_KEY` / `GHCP_API_KEYS` | 客户端调用网关使用的 API key，多个 key 可用逗号或空白分隔。 |
 | `GHCP_ADMIN_API_KEY` / `GHCP_ADMIN_API_KEYS` | 可选的独立管理员 API key。 |
 | `GHCP_COPILOT_TOKEN` | 网关访问 Copilot 上游所需的 GitHub/Copilot token。 |

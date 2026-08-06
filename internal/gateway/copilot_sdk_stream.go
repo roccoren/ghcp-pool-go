@@ -22,7 +22,7 @@ func reduceSDKStreamEvents(events []sdk.SessionEvent, out chan<- StreamItem) {
 	}
 }
 
-func streamSDKSession(ctx context.Context, session *sdk.Session, prompt, endpoint string, out chan<- StreamItem) {
+func streamSDKSession(ctx context.Context, session *sdk.Session, prompt, endpoint string, out chan<- StreamItem, attachments ...sdk.Attachment) {
 	reducer := newSDKStreamReducer(prompt, endpoint)
 	var mu sync.Mutex
 	terminated := false
@@ -110,7 +110,7 @@ func streamSDKSession(ctx context.Context, session *sdk.Session, prompt, endpoin
 	unsubscribe := session.On(handleEvent)
 	defer unsubscribe()
 
-	if _, err := session.Send(ctx, sdk.MessageOptions{Prompt: prompt}); err != nil {
+	if _, err := session.Send(ctx, sdk.MessageOptions{Prompt: prompt, Attachments: attachments}); err != nil {
 		handleEvent(sdk.SessionEvent{Data: &sdk.SessionErrorData{Message: fmt.Sprintf("send sdk session prompt: %v", err), ErrorType: "query"}})
 		return
 	}

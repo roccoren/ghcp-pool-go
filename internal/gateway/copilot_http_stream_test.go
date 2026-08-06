@@ -54,7 +54,7 @@ func TestSDKBackendChatStreamUsesStreamingSessionAndConstraints(t *testing.T) {
 	copilotSDKDisconnectSession = func(_ *sdk.Session) {
 		disconnectDone <- struct{}{}
 	}
-	copilotSDKStreamSession = func(_ context.Context, _ *sdk.Session, prompt, endpoint string, out chan<- StreamItem) {
+	copilotSDKStreamSession = func(_ context.Context, _ *sdk.Session, prompt, endpoint string, out chan<- StreamItem, _ ...sdk.Attachment) {
 		streamCalled = true
 		if prompt != wantPrompt {
 			t.Fatalf("prompt = %q, want %q", prompt, wantPrompt)

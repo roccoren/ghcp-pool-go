@@ -285,6 +285,7 @@ func anthropicMessageToChatMessages(item AnthropicMessage) []ChatMessage {
 	textParts := []string{}
 	toolCalls := []any{}
 	toolResults := []ChatMessage{}
+	imageParts := []any{}
 	for _, part := range parts {
 		block, ok := part.(map[string]any)
 		if !ok {
@@ -309,6 +310,15 @@ func anthropicMessageToChatMessages(item AnthropicMessage) []ChatMessage {
 			callID := stringFromAny(block["tool_use_id"])
 			content := coerceText(block["content"])
 			toolResults = append(toolResults, ChatMessage{Role: "tool", Content: content, Raw: map[string]any{"role": "tool", "content": content, "tool_call_id": callID}})
+		case "image", "input_image":
+			// Normalize to the OpenAI image shape so one extractor handles all
+			// protocols; without this the block fell through to coerceText and
+			// vanished.
+			if att, ok := attachmentFromBlock(block); ok {
+				imageParts = append(imageParts, imageURLPart(att.MIMEType, att.Data))
+			} else {
+				imageParts = append(imageParts, block)
+			}
 		case "redacted_thinking":
 		default:
 			if text := coerceText(block); text != "" {
@@ -317,8 +327,18 @@ func anthropicMessageToChatMessages(item AnthropicMessage) []ChatMessage {
 		}
 	}
 	out := []ChatMessage{}
-	if len(textParts) > 0 || len(toolCalls) > 0 {
-		content := stringsJoin(textParts, "\n")
+	if len(textParts) > 0 || len(toolCalls) > 0 || len(imageParts) > 0 {
+		text := stringsJoin(textParts, "\n")
+		// Images have to survive as structured parts; a plain string would drop
+		// them again on the way to the neutral message.
+		var content any = text
+		if len(imageParts) > 0 {
+			parts := make([]any, 0, len(imageParts)+1)
+			if text != "" {
+				parts = append(parts, map[string]any{"type": "text", "text": text})
+			}
+			content = append(parts, imageParts...)
+		}
 		raw := map[string]any{"role": item.Role, "content": content}
 		if len(toolCalls) > 0 {
 			raw["tool_calls"] = toolCalls
