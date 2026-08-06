@@ -342,7 +342,18 @@ call the caller did not authorize. Payloads above 8 MiB are rejected. In every
 rejected case the request fails with an explicit error; images are never
 silently dropped.
 
-The model must support vision. The SDK runtime handles resizing to model limits.
+Sending an image to a model without vision support is rejected upstream with an
+actionable message rather than answered blind:
+
+```
+Image input is not supported by the current model.
+Switch to a vision-capable model to use image attachments.
+```
+
+`/v1/models` reports per-model support as `capabilities.supports_vision`. The
+gateway does not pre-check it, so a model whose capability metadata is missing
+or stale is still attempted rather than wrongly refused. The SDK runtime
+resizes images that exceed model limits.
 
 ### Reasoning Effort and Context Tiers
 

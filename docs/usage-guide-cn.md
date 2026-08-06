@@ -124,18 +124,24 @@ curl -sS "$BASE_URL/v1beta/models/gpt-4.1:generateContent" \
   }' | jq
 ```
 
-## Embeddings
+## 图像输入
+
+三套协议都支持，只接受内联 base64（不抓取远程 URL），单张上限 8 MiB：
 
 ```bash
-curl -sS "$BASE_URL/v1/embeddings" \
-  -H "Authorization: Bearer $GHCP_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4.1",
-    "input": ["hello", "world"],
-    "dimensions": 8
-  }' | jq
+# OpenAI
+curl -sS "$BASE_URL/v1/chat/completions" \
+  -H "Authorization: Bearer $GHCP_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"gpt-5-mini","messages":[{"role":"user","content":[
+        {"type":"text","text":"这张图主色是什么？一个词回答。"},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,<BASE64>"}}]}]}' | jq
+
+# Anthropic: content 块用 {"type":"image","source":{"type":"base64","media_type":"image/png","data":"<BASE64>"}}
+# Gemini:    parts 用 {"inlineData":{"mimeType":"image/png","data":"<BASE64>"}}
 ```
+
+发给不支持 vision 的模型会被上游明确拒绝，不会「看不见图却照常回答」。
+无法转发的图像（远程 URL、非 base64、超限）一律显式报错。
 
 ## 常用参数
 
